@@ -461,7 +461,7 @@ async fn manual_pins_use_native_owner_and_survive_batch_packing_and_restart() {
     let backend = f.backend().await;
     backend.capture_motion_import("pins").await.unwrap();
     let saved = f.snapshot("pins").await;
-    assert_eq!(saved.manifest.source_namespace, "motion.schema68.export.v2");
+    assert_eq!(saved.manifest.source_namespace, "motion.schema68.export.v3");
     let pins: Vec<_> = saved
         .batches
         .iter()
@@ -516,4 +516,125 @@ async fn manual_pins_use_native_owner_and_survive_batch_packing_and_restart() {
         .collect();
     assert_eq!(pins.len(), 1);
     assert_eq!(pins[0].item_id, "b");
+}
+
+#[tokio::test]
+async fn edition_owners_and_timelines_rehearse_without_inventing_equivalence() {
+    let f = Fixture::new().await;
+    f.source().await;
+    sqlx::raw_sql("INSERT INTO editions(id,item_id,label) VALUES('edition-a','work-1','Theatrical'),('edition-b','work-1','Alternate'); INSERT INTO timelines(id,edition_id,revision,duration_ms) VALUES('timeline-a','edition-a',7,90000),('timeline-b','edition-b',3,NULL);")
+        .execute(&f.db).await.unwrap();
+    let backend = f.backend().await;
+    backend.capture_motion_import("structure").await.unwrap();
+    let snapshot = f.snapshot("structure").await;
+    let editions: Vec<_> = snapshot
+        .batches
+        .iter()
+        .flat_map(|b| &b.items)
+        .filter(|i| i.kind == "custom:motion_edition")
+        .collect();
+    assert_eq!(editions.len(), 2);
+    assert_eq!(editions[0].item_id, "motion.edition:edition-a");
+    let mutations: Vec<_> = snapshot
+        .batches
+        .iter()
+        .filter_map(|b| b.typed.as_ref())
+        .filter_map(|t| t.native.as_ref())
+        .flat_map(|n| &n.mutations)
+        .collect();
+    assert_eq!(mutations.len(), 1);
+    assert_eq!(mutations[0]["context"]["context_key"], "work-1");
+    let timelines = mutations[0]["timelines"].as_array().unwrap();
+    assert_eq!(timelines.len(), 2);
+    assert!(
+        timelines
+            .iter()
+            .all(|t| t["identity_state"] == "provisional" && t["coverage"].is_null())
+    );
+    assert_eq!(mutations[0]["versions"], json!([]));
+    assert_eq!(mutations[0]["evidence"], json!([]));
+    assert!(
+        snapshot
+            .batches
+            .iter()
+            .flat_map(|b| &b.unresolved_evidence)
+            .any(|e| e.data["table"] == "timelines" && e.data["row"]["revision"] == 7)
+    );
+    backend.stage_import("structure").await.unwrap();
+    drop(backend);
+    let backend = f.backend().await;
+    assert!(backend.validate_import("structure", None).await.is_err());
+    let ImportReceipt::ValidatedStaging {
+        activation_supported,
+        proposed_typed_mappings,
+        ..
+    } = backend.validate_motion_import("structure").await.unwrap()
+    else {
+        panic!("expected validation")
+    };
+    assert!(!activation_supported);
+    let mapped: Vec<_> = proposed_typed_mappings
+        .iter()
+        .filter(|m| m["owner"] == "identity")
+        .collect();
+    assert_eq!(mapped.len(), 1);
+    assert_eq!(mapped[0]["result"]["context_id"], "motion.work:work-1");
+    assert_eq!(
+        mapped[0]["result"]["timelines"],
+        json!([
+            {"timeline_id":"timeline-a","edition_item_id":"motion.edition:edition-a","revision":1,"identity_state":"provisional","coverage":null},
+            {"timeline_id":"timeline-b","edition_item_id":"motion.edition:edition-b","revision":1,"identity_state":"provisional","coverage":null}
+        ])
+    );
+    assert_eq!(mapped[0]["result"]["versions"], json!([]));
+}
+
+#[tokio::test]
+async fn structural_key_collision_and_timeline_overflow_abort_capture() {
+    let f = Fixture::new().await;
+    f.source().await;
+    sqlx::raw_sql("INSERT INTO editions(id,item_id,label) VALUES('a','work-1','Edition'); INSERT INTO items(id,title,kind) VALUES('motion.edition:a','Collision','video'); INSERT INTO item_origins VALUES('motion.edition:a','Collision');")
+        .execute(&f.db).await.unwrap();
+    let backend = f.backend().await;
+    assert!(
+        backend
+            .capture_motion_import("collision")
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("collides")
+    );
+    sqlx::query("DELETE FROM item_origins WHERE item_id='motion.edition:a'")
+        .execute(&f.db)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM items WHERE id='motion.edition:a'")
+        .execute(&f.db)
+        .await
+        .unwrap();
+    for n in 0..65 {
+        sqlx::query("INSERT INTO timelines(id,edition_id) VALUES(?,'a')")
+            .bind(format!("t{n:03}"))
+            .execute(&f.db)
+            .await
+            .unwrap();
+    }
+    assert!(
+        backend
+            .capture_motion_import("overflow")
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("timeline mutation bound")
+    );
+    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM catabolic_import_snapshots")
+        .fetch_one(&f.db)
+        .await
+        .unwrap();
+    assert_eq!(count, 0);
+    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM catabolic_motion_exports")
+        .fetch_one(&f.db)
+        .await
+        .unwrap();
+    assert_eq!(count, 0);
 }

@@ -238,3 +238,29 @@ Kyoto Clippy job: `74d8070dd9584010a2171a755116130a` (`-D warnings`).
 Source and executable receipts are in `qualification/catabolic-motion-pins.json`.
 This does not qualify activation, application routing, tags, physical/structural
 mapping, real libraries, or playback with Catabolic as the primary backend.
+
+## Edition owners and provisional timelines
+
+Export v3 creates separate native edition items and imports timeline ownership
+through Catabolic's typed identity owner. Work IDs and timeline IDs remain stable;
+edition item IDs use the explicit `motion.edition:` prefix. A single editorial
+context per work preserves the boundary needed for later version segmentation.
+No version, equivalence assertion or coverage is synthesized from duration.
+Source revisions, labels and ordering remain in immutable unresolved evidence.
+This is an intermediate mapping; work/edition relationships and exact file/version
+bindings still block activation.
+
+No new Motion state transition is introduced: the adapter translates retained
+rows, while the production native identity owner enforces ownership, revision,
+context and import admission rules. Tests compare exact resulting timeline IDs,
+owners, provisional state and native revision 1 after restart. Collision and
+65-timeline fixtures verify transaction rollback without saved source/provenance.
+The initial test fixture used a stale three-column edition insert; explicit
+column inserts corrected it. Native validation also rejected the nonstandard
+`edition` media kind; the mapping now uses the supported custom vocabulary
+`custom:motion_edition`. Both failures are retained in the qualification history.
+
+Kyoto compile: `b9ef54604aa14d3890fe3b23895a2c1f` (no-run policy).
+Kyoto Clippy: `9da481a3de2943d79ad28371f321fd49`.
+See `qualification/catabolic-motion-structure.json` for exact source and test
+binary receipts. This does not qualify application routing or primary cutover.

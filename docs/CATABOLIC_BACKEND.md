@@ -99,7 +99,7 @@ source-capture provenance. Copying a snapshot through `prepare-import` does not
 copy that authority. The production core checks the exact namespace, digest and
 supported exporter version before the adapter constructs any owner grants.
 
-Export namespace `motion.schema68.export.v2` also imports current provider
+Export namespace v2 introduced imports of current provider
 identities protected by Motion's manual match state as native pins. The core
 uses the same identity-withdrawal policy as the running application and excludes
 retired aliases. Other identities stay evidence. Only the current source head
@@ -108,7 +108,17 @@ revision 1; no earlier decisions or removal history are invented. Existing v1
 snapshots remain immutable and can still be validated. Pin grants are rebuilt
 only from the trusted retained export.
 
-Tags/exclusions, identity evidence, structural decisions, timelines, physical
+Current export namespace `motion.schema68.export.v3` adds edition item owners
+(`motion.edition:<source-id>`, kind `custom:motion_edition`) and preserves timeline IDs. Each work has one
+editorial context; its timelines remain provisional with unknown coverage until
+version/file mappings are qualified. Source labels, duration, ordering and
+revision values remain retained evidence. Native timeline revisions start at 1.
+Key collisions and groups exceeding the native 64-timeline mutation bound abort
+capture atomically. The adapter rebuilds exact context grants from the trusted
+snapshot and never grants declared or verified equivalence. Existing v1/v2
+snapshots remain supported without recapture.
+
+Tags/exclusions, identity evidence, work/edition relationships, timeline evidence, physical
 occurrences, source bindings and artwork references remain explicit unresolved
 evidence until their native mappings are implemented. Direct relational
 application references retain their key/reference columns; unrelated payloads

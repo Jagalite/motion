@@ -7,13 +7,16 @@ use crate::{
 use anyhow::{Context, ensure};
 use catabolic_core::catalog_metadata::SourceKind;
 use catabolic_store::{
+    catalog_identity_mutation::{
+        ContextChange, IdentityAuthority, IdentityMutation, TimelineChange, TimelineState,
+    },
     catalog_import::{
         self, EvidenceKind, ImportBatch, ImportItem, ImportReceipt, SnapshotManifest,
         UnresolvedEvidence,
     },
     catalog_import_typed::{
         ImportedContribution, ImportedMetadata, ImportedPin, ImportedPinRevision,
-        ImportedSourceKind, TypedAuthority, TypedBatch,
+        ImportedSourceKind, NativeIdentityBatch, TypedAuthority, TypedBatch,
     },
     catalog_metadata_store::{MetadataAccess, MetadataAuthority},
     catalog_pins::{PinAuthority, PinDecision},
@@ -22,7 +25,8 @@ use serde_json::{Value, json};
 use sqlx::{Row, SqliteConnection};
 use std::collections::{BTreeMap, BTreeSet};
 
-const SOURCE: &str = "motion.schema68.export.v2";
+const SOURCE: &str = "motion.schema68.export.v3";
+const PIN_SOURCE: &str = "motion.schema68.export.v2";
 const PREVIOUS_SOURCE: &str = "motion.schema68.export.v1";
 // Dedicated catalog facts not yet represented by a qualified typed mapping.
 // Artifact bytes remain Motion-owned; their catalog references are retained here.
@@ -114,7 +118,7 @@ impl NativeCatalog {
         ensure!(
             matches!(
                 snapshot.manifest.source_namespace.as_str(),
-                SOURCE | PREVIOUS_SOURCE
+                SOURCE | PIN_SOURCE | PREVIOUS_SOURCE
             ),
             "unsupported Motion export mapper"
         );
@@ -133,6 +137,25 @@ impl NativeCatalog {
         let mut grants = TypedAuthority::default();
         for batch in snapshot.batches {
             if let Some(typed) = batch.typed {
+                if let Some(native) = &typed.native {
+                    for raw in &native.mutations {
+                        let mutation: IdentityMutation = serde_json::from_value(raw.clone())?;
+                        ensure!(
+                            mutation.context.authority_namespace == HOST_NAMESPACE,
+                            "unexpected Motion editorial authority"
+                        );
+                        grants
+                            .identity
+                            .get_or_insert_with(|| IdentityAuthority {
+                                authority_namespace: HOST_NAMESPACE.into(),
+                                context_keys: BTreeSet::new(),
+                                allow_declared_evidence: false,
+                                allow_verified_evidence: false,
+                            })
+                            .context_keys
+                            .insert(mutation.context.context_key);
+                    }
+                }
                 for pin in &typed.pins {
                     grants
                         .pins
@@ -350,6 +373,7 @@ async fn capture(
             )?;
         }
     }
+    capture_structure(db, &mut batches).await?;
     for &(table, kind) in EVIDENCE_TABLES {
         for (index, row) in rows(db, table, None).await?.into_iter().enumerate() {
             evidence(
@@ -490,4 +514,98 @@ async fn rows(
         .into_iter()
         .map(|v| Ok(serde_json::from_str(&v)?))
         .collect()
+}
+
+/// Editions live in a separate source keyspace, but are native item owners.
+/// Keep all source rows as evidence until relationships, versions and references
+/// are qualified. A duration observation alone does not establish equivalence.
+async fn capture_structure(
+    db: &mut SqliteConnection,
+    batches: &mut Vec<ImportBatch>,
+) -> anyhow::Result<()> {
+    let editions = rows(db, "editions", None).await?;
+    let timelines = rows(db, "timelines", None).await?;
+    let mut owners = BTreeMap::new();
+    let mut contexts: BTreeMap<String, Vec<TimelineChange>> = BTreeMap::new();
+    for edition in editions {
+        let source = edition["id"].as_str().context("invalid edition ID")?;
+        let work = edition["item_id"]
+            .as_str()
+            .context("invalid edition work")?;
+        let destination = format!("motion.edition:{source}");
+        ensure!(
+            !batches
+                .iter()
+                .flat_map(|b| &b.items)
+                .any(|i| i.item_id == destination || i.source_id == destination),
+            "Motion edition key collides with a source item"
+        );
+        owners.insert(source.to_owned(), (work.to_owned(), destination.clone()));
+        append(
+            batches,
+            ImportBatch {
+                items: vec![ImportItem {
+                    source_id: destination.clone(),
+                    item_id: destination,
+                    kind: "custom:motion_edition".into(),
+                    legacy_metadata: json!({}),
+                }],
+                ..empty()
+            },
+        )?;
+    }
+    for timeline in timelines {
+        let edition = timeline["edition_id"]
+            .as_str()
+            .context("invalid timeline edition")?;
+        let (work, owner) = owners
+            .get(edition)
+            .context("timeline edition absent from captured source")?;
+        contexts
+            .entry(work.clone())
+            .or_default()
+            .push(TimelineChange {
+                timeline_id: timeline["id"]
+                    .as_str()
+                    .context("invalid timeline ID")?
+                    .into(),
+                edition_item_id: owner.clone(),
+                expected_revision: None,
+                identity_state: TimelineState::Provisional,
+                coverage: None,
+            });
+    }
+    for (work, timelines) in contexts {
+        ensure!(
+            timelines.len() <= 64,
+            "Motion work exceeds native timeline mutation bound"
+        );
+        let mutation = IdentityMutation {
+            contract_version: 1,
+            profile: "default".into(),
+            context: ContextChange {
+                id: format!("motion.work:{work}"),
+                authority_namespace: HOST_NAMESPACE.into(),
+                context_key: work,
+                expected_revision: None,
+            },
+            timelines,
+            versions: vec![],
+            evidence: vec![],
+        };
+        append(
+            batches,
+            ImportBatch {
+                typed: Some(TypedBatch {
+                    native: Some(NativeIdentityBatch {
+                        mutations: vec![serde_json::to_value(mutation)?],
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                ..empty()
+            },
+        )?;
+    }
+    Ok(())
 }
