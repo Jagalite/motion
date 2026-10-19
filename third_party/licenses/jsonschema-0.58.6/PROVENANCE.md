@@ -1,0 +1,5 @@
+Upstream license omitted from one or more published crate archives.
+
+Source: https://raw.githubusercontent.com/Stranger6667/jsonschema/55ac1664384793c5d3b20745d3f9c169dfe2c06f/LICENSE
+SHA-256: 117829c3ca21efb132d81a44b55363d395ab8eea18526873bc828da4c0e5f038
+Revision: 55ac1664384793c5d3b20745d3f9c169dfe2c06f

@@ -3,6 +3,8 @@ pub mod access;
 pub mod access_admin;
 pub mod artwork;
 pub mod catalog;
+pub mod catalog_backend;
+pub mod catalog_source;
 pub mod color;
 pub mod components;
 pub mod delivery;

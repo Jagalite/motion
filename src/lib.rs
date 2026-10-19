@@ -3,6 +3,7 @@ pub mod api;
 pub mod artifact_leases;
 pub mod artwork;
 pub mod catalog;
+pub use motion_catalog_backend as catalog_backend;
 pub mod components;
 pub mod config;
 pub mod curation;

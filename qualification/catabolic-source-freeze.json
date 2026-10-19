@@ -1,0 +1,409 @@
+{
+  "application_test_results": {
+    "backend": {
+      "binary_sha256": "face2235289fa54dc7d91676975e059c506ea2f7750e56e4333cb51e6d9c4939",
+      "exit_code": 0,
+      "result": [
+        "ok",
+        "3",
+        "0",
+        "0"
+      ]
+    },
+    "persistence": {
+      "binary_sha256": "fec6cb14cb0b4dbe76ced0aded987f457dd18c42486381a2562d0b5f8bc181a5",
+      "exit_code": 0,
+      "result": [
+        "ok",
+        "16",
+        "0",
+        "0"
+      ]
+    },
+    "search": {
+      "binary_sha256": "986243880c93e8bbd29bbf9de437d4052705b11e3657c0b3b14bbb1402ac6d7e",
+      "exit_code": 0,
+      "result": [
+        "ok",
+        "3",
+        "0",
+        "0"
+      ]
+    },
+    "v2": {
+      "binary_sha256": "bfd0ce86fc05bde321e157b1ff06e5c76e57f4b4bdde1e2b0525b4d66c7ed934",
+      "exit_code": 0,
+      "result": [
+        "ok",
+        "21",
+        "0",
+        "0"
+      ]
+    },
+    "workflows": {
+      "binary_sha256": "4e5cf34a5e3de9f206a02237d5180b0528f41f3d24ef892c5708475084c5c3ca",
+      "exit_code": 0,
+      "result": [
+        "ok",
+        "27",
+        "0",
+        "0"
+      ]
+    }
+  },
+  "artifact_sha256": {
+    "artifacts/catabolic-integration/freeze-application-backend.log": "946380a8d2c6bfc0738e8a56e7616cd96d37ff2b0150968872e11be49b93d8d1",
+    "artifacts/catabolic-integration/freeze-application-persistence.log": "18a0323dd0f35f472d7c49bf2a1897fa125404498db3988762a204e63e227d9c",
+    "artifacts/catabolic-integration/freeze-application-search.log": "d367d48e7b2590e27ffc3bad29e80c7d381b43bdf8cece60b9ff93e3fbdab79a",
+    "artifacts/catabolic-integration/freeze-application-tests.json": "e8b03b65ed5d9dde933d9f2904c779ae01e329428e4a366fc59b99c1e4f6cc3e",
+    "artifacts/catabolic-integration/freeze-application-v2.log": "2174382b00b015af224659b3bda002825f4c363c379b80ebf64871bf69e30ef2",
+    "artifacts/catabolic-integration/freeze-application-workflows.log": "da5a65ef738068995b24a60fb3e821c43954cb3398253a39140e12f5465d4671",
+    "artifacts/catabolic-integration/freeze-application_compile-job.json": "9f74e8b43cf30e853bf90eea8bfaf5880c43a7ff40b34525fa7524159770bb74",
+    "artifacts/catabolic-integration/freeze-cli-smoke.json": "eba232a7468eb178528e7efec3d5c7f5e68626b8978c60d4b690002be30ac921",
+    "artifacts/catabolic-integration/freeze-clippy-job.json": "271aa7b68076a521636f6d69336d232f3c5a13a6d7f5e0e6d7bfe42793648e00",
+    "artifacts/catabolic-integration/freeze-core_native_compile-job.json": "8276e31d7dcf718e9280fe7efabf2653bafa47dcfa431dcdc1553641704b68fa",
+    "artifacts/catabolic-integration/freeze-final-core.log": "e031c140fc2fb8a7f8733d2516be31d7ba090a0798e0257d362eab91001d4151",
+    "artifacts/catabolic-integration/freeze-final-export.log": "71c155ef1c01b0b8ad79d60056a7a2e04af55fe61e8b15879655cefa6e0a0839",
+    "artifacts/catabolic-integration/freeze-final-model.log": "96dea7dc7e521f7d13458204ce6be68db701d6cc89f11bc5476d8a3fbe01bb30",
+    "artifacts/catabolic-integration/freeze-final-native.json": "e59e37a44d808063ec730953e418d1a1cc8e41fa60570641e2b4d49f8f3a3cf1",
+    "artifacts/catabolic-integration/freeze-final-native.log": "1cc3acfeed17840dd7c1aab057f1273c4ae67560d9e453ff1a2f5be2e742fdac",
+    "artifacts/catabolic-integration/freeze-final-worker.log": "ee1fc38d398cbf7a8c49c3a98712439d7f8c6374b55f0add9065620e8e064376",
+    "artifacts/catabolic-integration/freeze-final_guard_rollback_test_clippy-job.json": "624d3b2f7c90311a33a2499754414ac8e1fa9dab19bd2cc6f6354a21b1ebcf9a",
+    "artifacts/catabolic-integration/freeze-final_guard_rollback_test_compile-job.json": "40db7bbe823b73eb0be15a5fa383183ceaf99e61a2bd7ed1d11efb26d5f7bd68",
+    "artifacts/catabolic-integration/freeze_cli_smoke.py": "9ad940259fbeadb5b55ce68b902ffd742406368fa0753ff3387cdb8f0a08830f",
+    "target/debug/motion-catalog": "9117ba17677dbeb4e310f2e0a2cdf05d501704e8c516ab54c82cb9f32938d543"
+  },
+  "base_commit": "d2d091aeac3ae127778243496447bfde6042adcd",
+  "catabolic_commit": "6969f08c5d9b207afe8eec819555759be136644d",
+  "cli_smoke": "passed; independent connection cannot write while frozen; restart control access and matching abandon; stale abandon and import ID reuse refused",
+  "cutover": "not_implemented",
+  "initial_compile_failure": {
+    "job": "cfee2f46a9394dc886d4a224d07ed910",
+    "reason": "New model needed Hash on its state and static check names. Fixed before final compilation."
+  },
+  "kyoto_jobs": {
+    "application_compile": {
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "playscale",
+        "--bin",
+        "motion-catalog",
+        "--test",
+        "catabolic_backend",
+        "--test",
+        "catalog_persistence",
+        "--test",
+        "catalog_workflows",
+        "--test",
+        "search",
+        "--test",
+        "v2_catalog",
+        "-j",
+        "1",
+        "--config",
+        "profile.dev.debug=0",
+        "--config",
+        "profile.test.debug=0",
+        "--no-run"
+      ],
+      "deferral_count": 1,
+      "exit_code": 0,
+      "id": "2704a0ce415e407d821a5e4d5470e6b2",
+      "policy_message": "Test/benchmark execution is disabled by shared policy; this job compiles only (--no-run). Tests/benchmarks will not run.",
+      "status": "succeeded"
+    },
+    "clippy": {
+      "command": [
+        "cargo",
+        "clippy",
+        "--locked",
+        "-p",
+        "motion-catalog-backend",
+        "-p",
+        "playscale-core",
+        "-p",
+        "playscale",
+        "--lib",
+        "--bin",
+        "motion-catalog",
+        "--test",
+        "catalog_source_model",
+        "--test",
+        "catalog_backend",
+        "--test",
+        "native",
+        "--test",
+        "motion_export",
+        "--test",
+        "catabolic_backend",
+        "-j",
+        "1",
+        "--config",
+        "profile.dev.debug=0",
+        "--config",
+        "profile.test.debug=0",
+        "--",
+        "-D",
+        "warnings",
+        "-A",
+        "clippy::too_many_arguments",
+        "-A",
+        "clippy::result_large_err"
+      ],
+      "deferral_count": 0,
+      "exit_code": 0,
+      "id": "3e933b6ce90a4e71a90ba0a442e3d7ce",
+      "policy_message": null,
+      "status": "succeeded"
+    },
+    "core_native_compile": {
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "motion-catalog-backend",
+        "-p",
+        "playscale-core",
+        "--lib",
+        "--test",
+        "catalog_source_model",
+        "--test",
+        "catalog_backend",
+        "--test",
+        "motion_export",
+        "--test",
+        "native",
+        "-j",
+        "1",
+        "--config",
+        "profile.dev.debug=0",
+        "--config",
+        "profile.test.debug=0",
+        "--no-run"
+      ],
+      "deferral_count": 0,
+      "exit_code": 0,
+      "id": "076e24b9d52b4c34a9b0b95b2536b331",
+      "policy_message": "Test/benchmark execution is disabled by shared policy; this job compiles only (--no-run). Tests/benchmarks will not run.",
+      "status": "succeeded"
+    },
+    "final_guard_rollback_test_clippy": {
+      "command": [
+        "cargo",
+        "clippy",
+        "--locked",
+        "-p",
+        "motion-catalog-backend",
+        "--test",
+        "motion_export",
+        "-j",
+        "1",
+        "--config",
+        "profile.dev.debug=0",
+        "--config",
+        "profile.test.debug=0",
+        "--",
+        "-D",
+        "warnings",
+        "-A",
+        "clippy::too_many_arguments",
+        "-A",
+        "clippy::result_large_err"
+      ],
+      "deferral_count": 0,
+      "exit_code": 0,
+      "id": "27838a5ccbb64998a2ab6ab0ea04d2cf",
+      "policy_message": null,
+      "status": "succeeded"
+    },
+    "final_guard_rollback_test_compile": {
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "motion-catalog-backend",
+        "--test",
+        "motion_export",
+        "-j",
+        "1",
+        "--config",
+        "profile.dev.debug=0",
+        "--config",
+        "profile.test.debug=0",
+        "--no-run"
+      ],
+      "deferral_count": 0,
+      "exit_code": 0,
+      "id": "154ab43e080e471e8c3da5f2e32ba3cb",
+      "policy_message": "Test/benchmark execution is disabled by shared policy; this job compiles only (--no-run). Tests/benchmarks will not run.",
+      "status": "succeeded"
+    }
+  },
+  "manifest_sha256": "c1639302971c60a0134f9d8e7ad364db666dd82b665d3f51cd81323927c2eb60",
+  "model": {
+    "bounds": "two migration IDs; invalid empty ID; revisions/epochs 0..5; stale and duplicate events",
+    "skipped_checks": 0,
+    "states": 13,
+    "termination": "GraphExhausted",
+    "transition_properties": 5,
+    "transitions": 390
+  },
+  "native_core_test_results": {
+    "core": {
+      "binary_sha256": "308a473069f9a08c6b01b2f970402d36c134f76629d1ba1a212ab4b5ec0485f8",
+      "exit_code": 0,
+      "result": [
+        "ok",
+        "3",
+        "0",
+        "0"
+      ]
+    },
+    "export": {
+      "binary_sha256": "2a9ad506ea14ba234774f877642d71364d13b3f3bd57fece582deafcc41cd323",
+      "exit_code": 0,
+      "result": [
+        "ok",
+        "10",
+        "0",
+        "0"
+      ]
+    },
+    "model": {
+      "binary_sha256": "17c8cc4fe7fa221cc332e5c9c5ee578eeb3411e1a74a4443d185bb847ef05069",
+      "exit_code": 0,
+      "result": [
+        "ok",
+        "2",
+        "0",
+        "0"
+      ]
+    },
+    "native": {
+      "binary_sha256": "d49b66d59e145a2e2a1537c2ce73005ad15e4f137e7f93489631363cb0470081",
+      "exit_code": 0,
+      "result": [
+        "ok",
+        "13",
+        "0",
+        "0"
+      ]
+    },
+    "worker": {
+      "binary_sha256": "d7c37abe9dd4f97ba156b8507b4c4baa0a7fbe2c05592779591c5e2efdc9c099",
+      "exit_code": 0,
+      "result": [
+        "ok",
+        "1",
+        "0",
+        "0"
+      ]
+    }
+  },
+  "not_qualified": [
+    "complete semantic typed mappings",
+    "completed application-reference audit",
+    "large-catalog migration partitioning",
+    "native worker drain and activation/restart handshake",
+    "server routes and scoped user grants",
+    "real scans and playback",
+    "full repository regression suite",
+    "packaging and other platforms"
+  ],
+  "source_freeze": "implemented with production-core transitions, transactional SQL guards and current-export epoch validation",
+  "source_schema": 69,
+  "source_scope": "Changed application/core/native-adapter source and tests, migrations, dependency manifests, SQLite vendor and Cargo configuration; remaining tracked source is from base_commit. Documentation and CI scripts are outside this code manifest.",
+  "source_sha256": {
+    ".cargo/config.toml": "5ecd88fdfa10f12e43a304fcbb6cacca129d777ef9810b70269f6a4bebd321e9",
+    "Cargo.lock": "0c798fbc634e99b198acba44dc73a804cb19b657097e1f04a38d73d239edc9f8",
+    "Cargo.toml": "7e15b5922304908cc870f81ed11ff5eb129ea0eee0bd6b174dd7ab9da221f0b5",
+    "crates/catalog-backend/Cargo.toml": "7a79de06742267746fb3c662f24372bef1382d4d7ca43cda5237103b6f51b4b8",
+    "crates/catalog-backend/src/lib.rs": "ddd961413f269fb66afe00bd3e9be8d7caade95e901c4f443eeb5b5a7dfc9211",
+    "crates/catalog-backend/src/migration.rs": "40f60c382fa8ad35b2883c7e91fb4cbb009d2ad1de6a57441d3dcd697310127b",
+    "crates/catalog-backend/src/motion_export.rs": "edd6d2b35e2902524344c7d7b93ff482057ce474ebf72068bf28fc0084eee6d7",
+    "crates/catalog-backend/src/source_freeze.rs": "c9ee762749b289a7d85e227cf2f294d49250144b1c10f9a1571d964ae3bbbddf",
+    "crates/catalog-backend/tests/motion_export.rs": "c0cd05139570d323bf552b498aeff7525a6afbe04bd6d0a0cf77215e34867534",
+    "crates/catalog-backend/tests/native.rs": "29a5ef831255032462daff92f39576c8d3b50976a0999e12341b85ae69ccd4c3",
+    "crates/core/src/catalog_backend.rs": "55098b19b037e9c6b6f91fc45782c9d48a659154109d99d02f2673aadd84919e",
+    "crates/core/src/catalog_source.rs": "e0db72693e76976cd99917bab82b95e4f2644feb8291e2f63832fa07c1fa3432",
+    "crates/core/src/lib.rs": "2a9c54e033b45518258bbdf190887691fbd78bc92f5911da25d8a0e9bb87531d",
+    "crates/core/tests/catalog_backend.rs": "87a5e9bee2b2c07051725946d4c21550c5f11d27435d9f20a099cfac2481d7bd",
+    "crates/core/tests/catalog_source_model.rs": "ed0b8ead304f66a0a87aa20b5054fd9fb1d222a6ed1268707ee2ac236abc0728",
+    "migrations/0066_catabolic_command_journal.sql": "6d694b35c8ad13c09c075f62366fc303407f1cbc066f9ac25979a9dfb695c4aa",
+    "migrations/0067_catabolic_import_snapshots.sql": "0db75fb5d08149e824076bc104cde14f0584de208e86ae121bb6c828bc17febd",
+    "migrations/0068_catabolic_motion_exports.sql": "ca48753389206136a2e0e8b07c77b963c6e93ca50758f20b1188c57a1e02dcea",
+    "migrations/0069_catabolic_source_freeze.sql": "575800458570730a7e1824a589a3eb40493d8e8aa16171675e52824de9165829",
+    "rust-toolchain.toml": "2ad6f15416572b4836585087f1d4abc53b8fa2dbd616f8dacfaa587ed6714228",
+    "src/bin/motion-catalog.rs": "64f2282028b3ae6c7e73868d6d5ea557014e57c86fde1d40c7c4a333002ba7ec",
+    "src/db.rs": "92ec9073c8cb59efd8e46a0e0fed8746e5d824063b34f3ed5c1d5a10f24ad40d",
+    "src/lib.rs": "092b1e087d5ca81135cfb7a8d8729afed20a702b477b78398fb926768b37612f",
+    "tests/catabolic_backend.rs": "6f7f3a2095fa39ba932ae6f6b3cc2cef9261b08d2c4c8cb11a562c66e6d4b8bb",
+    "vendor/sqlx-sqlite-0.8.6/.cargo_vcs_info.json": "54ee9a389f28a4fc4196cc8c97735648ed6c62a6937b37d09bc4e77472de71ce",
+    "vendor/sqlx-sqlite-0.8.6/Cargo.toml": "2676c961891866577476921af731a6c80f16afe4d312a46f559336619f7e22a4",
+    "vendor/sqlx-sqlite-0.8.6/Cargo.toml.orig": "79fc5f273fff999f5d7bfc0a0994d5e115dfd5723f079599fe9f89ea47272575",
+    "vendor/sqlx-sqlite-0.8.6/LICENSE-APACHE": "9be39331309bc958aab10457c1a8459c038ae95662f26dfcf6c9088e2b3d653f",
+    "vendor/sqlx-sqlite-0.8.6/LICENSE-MIT": "44b1600a26039a75b28e1ce154a5dd163b16549f50e34fa577d9efe9c1bae179",
+    "vendor/sqlx-sqlite-0.8.6/MOTION_PATCH.md": "f55f2f4c2767f9d624b3f88f251659670d162bb2f7a8d12904226e957924550d",
+    "vendor/sqlx-sqlite-0.8.6/src/any.rs": "ca3e3119fbdb2254362227330859bd6eff8abda1076bd2996fe7a89b76fb966b",
+    "vendor/sqlx-sqlite-0.8.6/src/arguments.rs": "6b848a4a3da506d7289f128d02039251e2e6b9d64d615cc3afb181fbfdb94193",
+    "vendor/sqlx-sqlite-0.8.6/src/column.rs": "20da4ff78604da4488136afe944b7a2528cacd57335cfd6ada9c78503dab3d37",
+    "vendor/sqlx-sqlite-0.8.6/src/connection/collation.rs": "144ab46d49f2eb107cbc7bf6dfc0e57cf26b0a67714bd22c7e3f6c095c710659",
+    "vendor/sqlx-sqlite-0.8.6/src/connection/describe.rs": "dd49e2d75b77ac0d9e709cf93d1b4a36a8beafe877b69ecd320884468218e3e0",
+    "vendor/sqlx-sqlite-0.8.6/src/connection/establish.rs": "11713a58a8b02d64dde678f6df4c744bbc914e896e7c89994638ce96f91d88ce",
+    "vendor/sqlx-sqlite-0.8.6/src/connection/execute.rs": "a13e43653c539e38559bb7c53a07ed34994659298b1c9be540c4c02dd8bbec51",
+    "vendor/sqlx-sqlite-0.8.6/src/connection/executor.rs": "97d156d8829ce67650ad1064a3cb5c8a8882890dfaef4c15ab3d5d8b0d62bfc9",
+    "vendor/sqlx-sqlite-0.8.6/src/connection/explain.rs": "cb3148fba4f5894f0c27bc1b3b01b4e216b92668c34c976bc3b7da0df3c3a863",
+    "vendor/sqlx-sqlite-0.8.6/src/connection/handle.rs": "f40e0ec66cf4a030969635889941fa82040647af3c45f1e7ce0cd7af1eea6d57",
+    "vendor/sqlx-sqlite-0.8.6/src/connection/intmap.rs": "b2521cd9f5108e68f8a85728f3a883ac31db6e5ba46a36f75c1e213ac4a00d52",
+    "vendor/sqlx-sqlite-0.8.6/src/connection/mod.rs": "257459ec82510c6e90d0a56fa168dbf4cb162c246229d5c1d8b8d0ea3de593ff",
+    "vendor/sqlx-sqlite-0.8.6/src/connection/preupdate_hook.rs": "e2bf7e49f5eafbc546295dc8fc9f4872da233c2c59af6e814d0ec68eecead14f",
+    "vendor/sqlx-sqlite-0.8.6/src/connection/serialize.rs": "6971ace77a53d3cc6e371eae3ac93f2c577da28e89e58ea6c24e58d5f37ac63a",
+    "vendor/sqlx-sqlite-0.8.6/src/connection/worker.rs": "f1c9fc4d8015c0694b0961cc79789ec4e2073be0d941ff4352c03c09d2380dce",
+    "vendor/sqlx-sqlite-0.8.6/src/database.rs": "d0171864f61f25f27e65abc678e92f141e848d9fe10956b1b345258bee2062b3",
+    "vendor/sqlx-sqlite-0.8.6/src/error.rs": "fd16dc2ea81c3c4f081136f24c3e911057751ec742b2e2685932a09f0215a0be",
+    "vendor/sqlx-sqlite-0.8.6/src/lib.rs": "405c0ddff6812130ed9ca32247f0dbf041f449f55a637a4c440694328b5751c3",
+    "vendor/sqlx-sqlite-0.8.6/src/logger.rs": "65893f829b323161e0c81798262992a555d565af72e35fd3b398c74294f0e0ba",
+    "vendor/sqlx-sqlite-0.8.6/src/migrate.rs": "02a0b9b81a7b4a313927b295d3722b7947176d16024f76873733a9b950da073e",
+    "vendor/sqlx-sqlite-0.8.6/src/options/auto_vacuum.rs": "0669bc62f9d0600e106443eeb1521635032ac48c123cbc232540fa3822aaaafd",
+    "vendor/sqlx-sqlite-0.8.6/src/options/connect.rs": "25912e8b528d872a22c1e7a264a1d52d964111f0b88b2acfdd77966464bff767",
+    "vendor/sqlx-sqlite-0.8.6/src/options/journal_mode.rs": "73fd87ed1e830a127a5765ca5f7c22c717e5dec45c0c39fd33256348a4e1e695",
+    "vendor/sqlx-sqlite-0.8.6/src/options/locking_mode.rs": "41e10ca2b5cb8f53306676aa29c884d4bc22be8cc0c9b2540aa191ed1c25ecb4",
+    "vendor/sqlx-sqlite-0.8.6/src/options/mod.rs": "6a9f98f89820c0147e7ca2a89e61bc99bc0940febbbae2a2ad2fb8d7a825fb00",
+    "vendor/sqlx-sqlite-0.8.6/src/options/parse.rs": "d94008fcdd7e03e2df1c6c0d788cc55cde42e772a83efb6e5f4839249154e156",
+    "vendor/sqlx-sqlite-0.8.6/src/options/synchronous.rs": "08b2ca83c2ed6781040d3cf49871cd45fc16321aad9c78ac0ab63ab0e2117d81",
+    "vendor/sqlx-sqlite-0.8.6/src/query_result.rs": "228e6a059828ca9413881334ec891d33b8ef08062743917929447722ef8bf4bb",
+    "vendor/sqlx-sqlite-0.8.6/src/regexp.rs": "39c0a673cf67ca749732567021649340318c0f1ba3f25cc44ddc8c2e86c4342c",
+    "vendor/sqlx-sqlite-0.8.6/src/row.rs": "5e424bed7cc0c96c47b5e4d1afce2fd5b56a973886cbb8dba744f043472bae51",
+    "vendor/sqlx-sqlite-0.8.6/src/statement/handle.rs": "fc01828d31322b9e590c9d4bffbf3d11c98335cc6703999c1f39f304fd02c119",
+    "vendor/sqlx-sqlite-0.8.6/src/statement/mod.rs": "470987bd5ae2e72d65ea8a31be72f10ca01060485205a53665be678fbf89b0cb",
+    "vendor/sqlx-sqlite-0.8.6/src/statement/unlock_notify.rs": "3c57283b3a1e3ad8a77263f59f2fcd50046db01c425d286d2ce346f4a89639de",
+    "vendor/sqlx-sqlite-0.8.6/src/statement/virtual.rs": "f34b04422dbf420b056bbe3a6f95fdb94040f73d50080208989f6452f14ffa3d",
+    "vendor/sqlx-sqlite-0.8.6/src/testing/mod.rs": "ec81b9d67afdeea9ff35c6e6847c138a9e6db7a6f493e75b05b12f4564372954",
+    "vendor/sqlx-sqlite-0.8.6/src/transaction.rs": "6dae9e4478c9bfb6ebeab5e6cacc810771bbc1d1ad481e59310e537962e88e53",
+    "vendor/sqlx-sqlite-0.8.6/src/type_checking.rs": "5d16aa012fdb423d3cc97acb046f220f432a98da22269b40b4908e934265dc21",
+    "vendor/sqlx-sqlite-0.8.6/src/type_info.rs": "648170984482d66f22e48f5229dc959355a7bc4a34725e58c43eb2335ff9e19a",
+    "vendor/sqlx-sqlite-0.8.6/src/types/bool.rs": "b13c6cc948066618de8adee3751d62c834fe095e35d0b080107a9be226b59c7a",
+    "vendor/sqlx-sqlite-0.8.6/src/types/bytes.rs": "cb4535fec074141746feaee24455cac93f1e37992ddebbfc2e53074a8766076d",
+    "vendor/sqlx-sqlite-0.8.6/src/types/chrono.rs": "cbad293e17e1734795a71338711ed0352df1a47f8b73bc337a009d0e5c701d29",
+    "vendor/sqlx-sqlite-0.8.6/src/types/float.rs": "6af25a42c15ebf9ef0617907c72f9f912c9a842fb222fede0fd8a1596e0d2c65",
+    "vendor/sqlx-sqlite-0.8.6/src/types/int.rs": "fc0dd473fa0c63ccdfcf101c4d79772f162710b84f8a82f48bb92cded891db64",
+    "vendor/sqlx-sqlite-0.8.6/src/types/json.rs": "e981276c51b748c0e1eb6860407ba57817528af4a3ac11d4e74c65cf30b336c5",
+    "vendor/sqlx-sqlite-0.8.6/src/types/mod.rs": "82afc7e421a685cf14d21eeb9a058f335c594e99d861c4ccf0158b03276a7292",
+    "vendor/sqlx-sqlite-0.8.6/src/types/str.rs": "0415a1f8911378891e5ac64c9eb9713772292b7e63ca08a399f4ac1c65e35733",
+    "vendor/sqlx-sqlite-0.8.6/src/types/text.rs": "bc676ff0451fe4329fcd445bb364b0857b6b3bb24fa3abe4f702d6e9efe87fa3",
+    "vendor/sqlx-sqlite-0.8.6/src/types/time.rs": "bf23083c1710ce52d0058fb2407605c40a97c23c720e9ddc6d7bd8326922c9d7",
+    "vendor/sqlx-sqlite-0.8.6/src/types/uint.rs": "338b56d53d744da17cec74ee2cc87a5a82104731886b3f3caa949b3963bdbb46",
+    "vendor/sqlx-sqlite-0.8.6/src/types/uuid.rs": "5b0e23a51696d1b7f08e469d8af1013541915f610c93d8ddad60ec9676e9a76b",
+    "vendor/sqlx-sqlite-0.8.6/src/value.rs": "e03d4f63306c17f7dd8d52646bc368d485859811d3ce7a8b3e437a0a8a18ecfe"
+  },
+  "total_distinct_tests": 99,
+  "whitespace_check": {
+    "first_party": "passed",
+    "vendored_upstream": "three existing trailing-whitespace lines in src/connection/serialize.rs retained byte-for-byte from verified sqlx-sqlite archive"
+  }
+}

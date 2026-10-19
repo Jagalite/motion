@@ -1,0 +1,6 @@
+[env]
+# Preserve Catabolic's qualified SQLite function surface in the host.
+LIBSQLITE3_FLAGS = "-DSQLITE_ENABLE_MATH_FUNCTIONS -USQLITE_SOUNDEX"
+
+[net]
+git-fetch-with-cli = true

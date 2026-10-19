@@ -215,6 +215,22 @@ pub async fn connect(path: &Path) -> anyhow::Result<SqlitePool> {
     connect_with(path, &sqlx::migrate!("./migrations")).await
 }
 
+/// Operator-only connection for inspecting or abandoning a persisted source
+/// freeze. Frozen application databases cannot run upgrade/background hooks.
+pub async fn connect_catalog_control(path: &Path) -> anyhow::Result<SqlitePool> {
+    let db = open(path).await?;
+    if catalog_source_frozen(&db).await? {
+        return Ok(db);
+    }
+    db.close().await;
+    connect(path).await
+}
+async fn catalog_source_frozen(db: &SqlitePool) -> anyhow::Result<bool> {
+    Ok(crate::catalog_backend::source_freeze::admission(db)
+        .await?
+        .is_some_and(|state| !state.writes_allowed()))
+}
+
 /// A verified copy of the database taken before pending migrations were applied.
 #[derive(Debug, Clone, Serialize)]
 pub struct UpgradeBackup {
@@ -231,6 +247,10 @@ pub async fn connect_with(
     migrator: &sqlx::migrate::Migrator,
 ) -> anyhow::Result<SqlitePool> {
     let db = open(path).await?;
+    anyhow::ensure!(
+        !catalog_source_frozen(&db).await?,
+        "Motion catalog source is frozen; use the catalog control CLI to reconcile migration"
+    );
     let backup = prepare_upgrade(&db, path, migrator).await?;
     if let Err(error) = migrator.run(&db).await {
         db.close().await;
