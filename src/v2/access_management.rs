@@ -113,6 +113,7 @@ impl UserInput {
     }
 }
 pub(super) async fn validate_grant(
+    app: &App,
     conn: &mut sqlx::SqliteConnection,
     grant: &Grant,
     policy: &Policy,
@@ -147,16 +148,33 @@ pub(super) async fn validate_grant(
     if identity::existing_profiles(conn, &grant.profile_ids).await? != grant.profile_ids {
         return Err(AccessError::UnknownProfile.into());
     }
-    let known: BTreeSet<String> = sqlx::query_scalar(
-        "SELECT id FROM catalog_libraries WHERE id IN (SELECT value FROM json_each(?))",
-    )
-    .bind(json(&policy.library_ids))
-    .fetch_all(conn)
-    .await?
-    .into_iter()
-    .collect();
-    if known != policy.library_ids {
-        return Err(AccessError::UnknownLibrary.into());
+    if let Some(native) = &app.native_catalog {
+        if !native
+            .validate_library_definitions(conn, &policy.library_ids)
+            .await
+            .map_err(Problem::internal)?
+        {
+            return Err(AccessError::UnknownLibrary.into());
+        }
+    } else {
+        if super::playback::native_bound(conn).await? {
+            return Err(Problem::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "native_owner_unavailable",
+                "Native catalog ownership is not admitted",
+            ));
+        }
+        let known: BTreeSet<String> = sqlx::query_scalar(
+            "SELECT id FROM catalog_libraries WHERE id IN (SELECT value FROM json_each(?))",
+        )
+        .bind(json(&policy.library_ids))
+        .fetch_all(conn)
+        .await?
+        .into_iter()
+        .collect();
+        if known != policy.library_ids {
+            return Err(AccessError::UnknownLibrary.into());
+        }
     }
     Ok(())
 }
@@ -225,7 +243,7 @@ pub async fn create_user(
     }
     super::signin::require_fresh(&mut tx, &caller, &headers, "user.admin", "new").await?;
     let user = body.value.user(new_id(), 1)?;
-    validate_grant(&mut tx, &user.grant, &user.policy).await?;
+    validate_grant(&app, &mut tx, &user.grant, &user.policy).await?;
     sqlx::query("INSERT INTO access_users(id,name,revision,disabled,profile_ids,permissions,policy,created_at) VALUES (?,?,1,?,?,?,?,?)").bind(&user.id).bind(&user.name).bind(user.disabled).bind(json(&user.grant.profile_ids)).bind(json(&user.grant.permissions)).bind(json(&user.policy)).bind(now()).execute(&mut *tx).await?;
     let response = serde_json::to_value(user_body(&user)).map_err(Problem::internal)?;
     scope
@@ -370,7 +388,7 @@ pub async fn replace_user(
         .await?
         .ok_or_else(Problem::not_found)?;
     let mut next = body.value.user(id.clone(), previous.revision)?;
-    validate_grant(&mut tx, &next.grant, &next.policy).await?;
+    validate_grant(&app, &mut tx, &next.grant, &next.policy).await?;
     if let Revised::Next(revision) = core::revise(previous.revision, expected, next != previous)? {
         next.revision = revision;
         let ids: Vec<String> =
@@ -877,7 +895,7 @@ pub async fn create_invitation(
         profile_ids: input.profile_ids.into_iter().collect(),
         permissions: input.permissions.into_iter().collect(),
     };
-    validate_grant(&mut tx, &grant, &input.policy).await?;
+    validate_grant(&app, &mut tx, &grant, &input.policy).await?;
     admin::authorize_grant(&user, expected, &grant, &input.policy)?;
     let email =
         match input.email.as_deref().filter(|v| !v.trim().is_empty()) {

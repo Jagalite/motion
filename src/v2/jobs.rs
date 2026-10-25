@@ -15,6 +15,9 @@ use playscale_core::{
 };
 use serde_json::{Value, json};
 
+mod native;
+mod native_control;
+
 pub fn routes() -> Router<App> {
     Router::new()
         .route("/jobs", get(list))
@@ -64,6 +67,9 @@ pub async fn list(
     caller: Caller,
     Query(q): Query<PageQuery>,
 ) -> Result<Response, Problem> {
+    if app.native_catalog.is_some() {
+        return native::list(&app, &caller, q).await;
+    }
     let mut tx = app.db.begin().await?;
     let limit = q.limit()?;
     let rows:Vec<Row>=sqlx::query_as("SELECT * FROM api_jobs WHERE id>? AND (? OR (requester_id!='legacy' AND requester_id=?)) ORDER BY id LIMIT ?")
@@ -78,6 +84,9 @@ pub async fn get_job(
     caller: Caller,
     Path(id): Path<String>,
 ) -> Result<Response, Problem> {
+    if app.native_catalog.is_some() {
+        return native::get(&app, &caller, &id).await;
+    }
     let mut tx = app.db.begin().await?;
     let row = row(&mut tx, &id, &caller.principal).await?;
     tx.commit().await?;
@@ -107,6 +116,11 @@ async fn control(
     retry: bool,
 ) -> Result<Response, Problem> {
     // Permission is selected after loading the durable job kind.
+    // The bounded native adapter never falls through to the frozen legacy
+    // job union. Its retained native preparation, not a kind or hint, admits it.
+    if app.native_catalog.is_some() {
+        return native_control::control(&app, &caller, &id, &headers, retry).await;
+    }
     let key = idempotency_key(&headers)?;
     let _guard = app.jobs.lock().await;
     let mut tx = begin_write(&app.db).await?;

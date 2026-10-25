@@ -4,6 +4,7 @@
 //! the decided effects inside one SQLite transaction.
 mod access_management;
 pub mod admin;
+mod admin_reads;
 pub mod auth;
 pub mod catalog;
 pub mod content;
@@ -775,7 +776,343 @@ pub fn timestamp(unix: i64) -> String {
     )
 }
 
-pub fn router() -> Router<App> {
+/// Native mode is a positive capability allowlist. Unknown routes must never
+/// reach handlers that still read or mutate the frozen legacy catalog.
+async fn native_catalog_gate(
+    axum::extract::State(app): axum::extract::State<App>,
+    request: Request,
+    next: Next,
+) -> Response {
+    if app.native_catalog.is_none() {
+        // A missing retained owner never turns an already-bound catalog back
+        // into a legacy server. This applies even to individually supported
+        // routes: their adapters would otherwise see None and take old paths.
+        let bound = sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(SELECT 1 FROM catabolic_binding WHERE id=1)",
+        )
+        .fetch_one(&app.db)
+        .await;
+        if !matches!(bound, Ok(false)) {
+            return Problem::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "native_runtime_unavailable",
+                "The native catalog owner is not admitted; legacy fallback is disabled",
+            )
+            .into_response();
+        }
+    }
+    if app.native_catalog.is_some()
+        && !native_route_supported(request.method().as_str(), request.uri().path())
+    {
+        return Problem::new(StatusCode::SERVICE_UNAVAILABLE, "native_route_unavailable",
+            "This operation requires a native catalog adapter that is not yet available; legacy fallback is disabled").into_response();
+    }
+    next.run(request).await
+}
+fn native_route_supported(method: &str, path: &str) -> bool {
+    let path = path.strip_prefix("/api/v2").unwrap_or(path);
+    if path.starts_with("/auth/") || path == "/me" {
+        return true;
+    }
+    if matches!(
+        path,
+        "/system/health" | "/system/capabilities" | "/openapi.json"
+    ) {
+        return matches!(method, "GET" | "HEAD");
+    }
+    // Each hint reauthorizes under a current writer and native owner scope.
+    if path == "/events" {
+        return method == "GET";
+    }
+    if matches!(path, "/sources" | "/libraries") {
+        return matches!(method, "GET" | "HEAD" | "POST");
+    }
+    if path
+        .strip_prefix("/sources/")
+        .is_some_and(catalog::valid_id)
+    {
+        return matches!(method, "GET" | "HEAD" | "DELETE");
+    }
+    if path
+        .strip_prefix("/libraries/")
+        .is_some_and(catalog::valid_id)
+    {
+        return matches!(method, "GET" | "HEAD" | "PUT");
+    }
+    // Saved filters store a validated, inert AST. This does not admit smart
+    // collection evaluation or turn referenced strings into catalog grants.
+    if path == "/catalog/filters" {
+        return matches!(method, "GET" | "POST");
+    }
+    if path
+        .strip_prefix("/catalog/filters/")
+        .is_some_and(catalog::valid_id)
+    {
+        return matches!(method, "GET" | "PUT" | "DELETE");
+    }
+    // Manual collections resolve members through the retained native owner.
+    // Smart evaluation and queue execution remain separately closed.
+    if path == "/collections" {
+        return matches!(method, "GET" | "POST");
+    }
+    if path
+        .strip_prefix("/collections/")
+        .is_some_and(catalog::valid_id)
+    {
+        return matches!(method, "GET" | "PUT" | "DELETE");
+    }
+    // Playlist membership is current typed timeline identity, not playback.
+    if path == "/playlists" {
+        return matches!(method, "GET" | "POST");
+    }
+    if path
+        .strip_prefix("/playlists/")
+        .is_some_and(catalog::valid_id)
+    {
+        return matches!(method, "GET" | "PUT" | "DELETE");
+    }
+    // Application-owned administration still uses fresh authorization and
+    // exact native library references. Read-only diagnostics/auth routes are
+    // individually selected below, never admitted by an admin prefix.
+    if matches!(path, "/users" | "/access/setup") {
+        return matches!(method, "GET" | "POST");
+    }
+    if path == "/admin/metrics" {
+        return method == "GET";
+    }
+    if admin_reads::supported(method, path) {
+        return true;
+    }
+    if path.strip_prefix("/users/").is_some_and(catalog::valid_id) {
+        return matches!(method, "GET" | "PUT");
+    }
+    if path == "/devices" {
+        return method == "GET";
+    }
+    if path == "/profiles" {
+        return matches!(method, "GET" | "POST");
+    }
+    if let Some(id) = path.strip_prefix("/profiles/") {
+        if catalog::valid_id(id) {
+            return matches!(method, "GET" | "PUT" | "DELETE");
+        }
+    }
+    if let Some(tail) = path.strip_prefix("/devices/") {
+        if catalog::valid_id(tail) {
+            return matches!(method, "GET" | "DELETE");
+        }
+        if let Some(id) = tail.strip_suffix("/user") {
+            return catalog::valid_id(id) && method == "PUT";
+        }
+        if let Some(id) = tail.strip_suffix("/policy") {
+            return catalog::valid_id(id) && matches!(method, "GET" | "PUT");
+        }
+    }
+    // Exact scan-only schedule adapter methods, never watch or task siblings.
+    if path == "/schedules" {
+        return matches!(method, "GET" | "POST");
+    }
+    if path
+        .strip_prefix("/schedules/")
+        .is_some_and(catalog::valid_id)
+    {
+        return matches!(method, "GET" | "PUT" | "DELETE");
+    }
+    // Native durable scan requests retain their exact accepted source scope.
+    // Explicit methods only: HEAD and sibling management routes stay closed.
+    if path == "/scans" {
+        return method == "GET";
+    }
+    if let Some(id) = path.strip_prefix("/scans/") {
+        if catalog::valid_id(id) {
+            return method == "GET";
+        }
+        if let Some(id) = id.strip_suffix("/cancel") {
+            return catalog::valid_id(id) && method == "POST";
+        }
+    }
+    if let Some(id) = path
+        .strip_prefix("/libraries/")
+        .and_then(|p| p.strip_suffix("/scans"))
+    {
+        return catalog::valid_id(id) && method == "POST";
+    }
+    // Each enabled physical operation retains its native identity/generation,
+    // current authorization and exact occurrence fences. Do not open families.
+    if path == "/processing/preparations" {
+        return method == "POST";
+    }
+    if path == "/processing/renditions" {
+        return method == "GET";
+    }
+    // Descriptive processing-job reads and only the bounded preparation
+    // controls. The native handler independently requires retained admission;
+    // a route match never adopts legacy history or another job family.
+    if path == "/jobs" || path.strip_prefix("/jobs/").is_some_and(catalog::valid_id) {
+        return method == "GET";
+    }
+    if let Some(tail) = path.strip_prefix("/jobs/") {
+        if let Some(id) = tail
+            .strip_suffix("/cancel")
+            .or_else(|| tail.strip_suffix("/retry"))
+        {
+            return method == "POST" && catalog::valid_id(id);
+        }
+    }
+    if path == "/playback/plans" {
+        return method == "POST";
+    }
+    if matches!(
+        path,
+        "/playback/delivery-sessions" | "/playback/viewing-sessions" | "/content-access"
+    ) {
+        return method == "POST";
+    }
+    if let Some(tail) = path.strip_prefix("/playback/delivery-sessions/") {
+        if catalog::valid_id(tail) {
+            return matches!(method, "GET" | "DELETE");
+        }
+        if let Some(id) = tail.strip_suffix("/heartbeat") {
+            return catalog::valid_id(id) && method == "POST";
+        }
+        if let Some(id) = tail.strip_suffix("/changes") {
+            return catalog::valid_id(id) && method == "POST";
+        }
+        let segments: Vec<_> = tail.split('/').collect();
+        if let [id, "generations", generation, "activate"] = segments.as_slice() {
+            return method == "POST"
+                && catalog::valid_id(id)
+                && generation.bytes().all(|b| b.is_ascii_digit())
+                && generation.parse::<u64>().is_ok_and(|n| n > 0);
+        }
+    }
+    if let Some(tail) = path.strip_prefix("/playback/viewing-sessions/") {
+        if catalog::valid_id(tail) {
+            return method == "GET";
+        }
+        if let Some(id) = tail.strip_suffix("/events") {
+            return catalog::valid_id(id) && method == "POST";
+        }
+        if let Some(id) = tail.strip_suffix("/delivery") {
+            return catalog::valid_id(id) && method == "PUT";
+        }
+    }
+    if let Some(tail) = path.strip_prefix("/streams/") {
+        let segments: Vec<_> = tail.split('/').collect();
+        if let [delivery, generation, "content"] = segments.as_slice() {
+            return catalog::valid_id(delivery) && catalog::valid_id(generation) && method == "GET";
+        }
+    }
+    if path == "/offline/sync" {
+        return method == "POST";
+    }
+    if path == "/downloads" {
+        return matches!(method, "GET" | "POST");
+    }
+    if let Some(tail) = path.strip_prefix("/downloads/") {
+        if catalog::valid_id(tail) {
+            return matches!(method, "GET" | "DELETE");
+        }
+        if let Some(id) = tail.strip_suffix("/transfer") {
+            return catalog::valid_id(id) && method == "PUT";
+        }
+        if let Some(id) = tail.strip_suffix("/manifest") {
+            return catalog::valid_id(id) && method == "GET";
+        }
+    }
+    if let Some(tail) = path.strip_prefix("/media/files/") {
+        let segments: Vec<_> = tail.split('/').collect();
+        if let [id, "previews", sheet] = segments.as_slice() {
+            return catalog::valid_id(id)
+                && !sheet.is_empty()
+                && sheet.bytes().all(|b| b.is_ascii_digit())
+                && sheet.parse::<u32>().is_ok_and(|n| n > 0)
+                && method == "GET";
+        }
+    }
+    if let Some(id) = path
+        .strip_prefix("/media/files/")
+        .and_then(|tail| tail.strip_suffix("/content"))
+    {
+        return catalog::valid_id(id) && method == "GET";
+    }
+    if let Some(id) = path
+        .strip_prefix("/media/assets/")
+        .and_then(|tail| tail.strip_suffix("/content"))
+    {
+        return catalog::valid_id(id) && matches!(method, "GET" | "HEAD");
+    }
+    if let Some(tail) = path.strip_prefix("/catalog/items/") {
+        let segments: Vec<_> = tail.split('/').collect();
+        match segments.as_slice() {
+            [id, "artwork"] if catalog::valid_id(id) => return matches!(method, "GET" | "POST"),
+            [id, "artwork", "selection"] if catalog::valid_id(id) => {
+                return matches!(method, "GET" | "PUT");
+            }
+            [id, "metadata"] if catalog::valid_id(id) => return method == "GET",
+            [id, "metadata", "contributions", source]
+                if catalog::valid_id(id) && catalog::valid_id(source) =>
+            {
+                return method == "PUT";
+            }
+            _ => {}
+        }
+    }
+    if let Some(id) = path
+        .strip_prefix("/catalog/items/")
+        .and_then(|tail| tail.strip_suffix("/relationships"))
+    {
+        return catalog::valid_id(id) && matches!(method, "GET" | "POST");
+    }
+    // Native detail adapters independently verify complete current owners.
+    if let Some(tail) = path.strip_prefix("/catalog/items/") {
+        let segments: Vec<_> = tail.split('/').collect();
+        if let [id, "editions" | "timelines"] = segments.as_slice() {
+            return catalog::valid_id(id) && method == "GET";
+        }
+    }
+    if let Some(tail) = path.strip_prefix("/catalog/timelines/") {
+        let segments: Vec<_> = tail.split('/').collect();
+        return match segments.as_slice() {
+            [id] | [id, "versions"] => catalog::valid_id(id) && method == "GET",
+            [id, "markers" | "previews"] => {
+                catalog::valid_id(id) && matches!(method, "GET" | "POST")
+            }
+            _ => false,
+        };
+    }
+    if let Some(id) = path.strip_prefix("/catalog/relationships/") {
+        return catalog::valid_id(id) && matches!(method, "GET" | "DELETE");
+    }
+    if path == "/catalog/items" {
+        return matches!(method, "GET" | "HEAD" | "POST");
+    }
+    if path == "/catalog/search" {
+        return matches!(method, "GET" | "HEAD");
+    }
+    if let Some(tail) = path.strip_prefix("/profiles/") {
+        let segments: Vec<_> = tail.split('/').collect();
+        if let [profile, "continue-watching"] = segments.as_slice() {
+            return catalog::valid_id(profile) && method == "GET";
+        }
+        if let [profile, "timelines", timeline, "viewing"] = segments.as_slice() {
+            return catalog::valid_id(profile)
+                && catalog::valid_id(timeline)
+                && matches!(method, "GET" | "HEAD" | "PUT");
+        }
+    }
+    if let Some(id) = path
+        .strip_prefix("/profiles/")
+        .and_then(|p| p.strip_suffix("/preferences"))
+    {
+        return catalog::valid_id(id) && matches!(method, "GET" | "HEAD" | "PUT");
+    }
+    path.strip_prefix("/catalog/items/")
+        .is_some_and(|id| catalog::valid_id(id))
+        && matches!(method, "GET" | "HEAD" | "PUT")
+}
+
+pub fn router(app: App) -> Router<App> {
     Router::new()
         .route("/openapi.json", get(system::openapi))
         .route("/system/health", get(system::health))
@@ -957,11 +1294,343 @@ pub fn router() -> Router<App> {
         .merge(markers::routes())
         .fallback(|| async { Problem::not_found() })
         .layer(DefaultBodyLimit::max(BODY_LIMIT))
+        .layer(middleware::from_fn_with_state(app, native_catalog_gate))
         .layer(middleware::from_fn(request_scope))
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn native_gate_is_a_positive_operation_allowlist() {
+        for (method, path) in [
+            ("GET", "/jobs"),
+            ("GET", "/jobs/job-1"),
+            ("GET", "/api/v2/jobs/job-1"),
+            ("POST", "/jobs/job-1/cancel"),
+            ("POST", "/jobs/job-1/retry"),
+            ("POST", "/api/v2/jobs/job-1/cancel"),
+            ("POST", "/api/v2/jobs/job-1/retry"),
+            ("GET", "/playback/viewing-sessions/session-1"),
+            ("POST", "/playback/delivery-sessions/delivery-1/heartbeat"),
+            ("POST", "/playback/delivery-sessions/delivery-1/changes"),
+            (
+                "POST",
+                "/playback/delivery-sessions/delivery-1/generations/2/activate",
+            ),
+            ("GET", "/playback/delivery-sessions/delivery-1"),
+            ("GET", "/schedules"),
+            ("POST", "/schedules"),
+            ("GET", "/schedules/schedule-1"),
+            ("PUT", "/schedules/schedule-1"),
+            ("DELETE", "/schedules/schedule-1"),
+            ("PUT", "/playback/viewing-sessions/session-1/delivery"),
+            ("GET", "/catalog/filters"),
+            ("POST", "/catalog/filters"),
+            ("GET", "/catalog/filters/filter-1"),
+            ("PUT", "/catalog/filters/filter-1"),
+            ("DELETE", "/catalog/filters/filter-1"),
+            ("GET", "/playlists"),
+            ("POST", "/playlists"),
+            ("GET", "/playlists/list-1"),
+            ("PUT", "/playlists/list-1"),
+            ("DELETE", "/playlists/list-1"),
+            ("GET", "/collections"),
+            ("POST", "/collections"),
+            ("GET", "/collections/collection-1"),
+            ("PUT", "/collections/collection-1"),
+            ("DELETE", "/collections/collection-1"),
+            ("POST", "/playback/plans"),
+            ("POST", "/processing/preparations"),
+            ("GET", "/processing/renditions"),
+            ("GET", "/catalog/items"),
+            ("GET", "/catalog/items/work-1/artwork"),
+            ("POST", "/catalog/items/work-1/artwork"),
+            ("GET", "/media/assets/asset-1/content"),
+            ("HEAD", "/media/assets/asset-1/content"),
+            ("GET", "/catalog/items/work-1/artwork/selection"),
+            ("PUT", "/catalog/items/work-1/artwork/selection"),
+            ("GET", "/catalog/items/work-1/relationships"),
+            ("POST", "/catalog/items/work-1/relationships"),
+            ("GET", "/catalog/relationships/edge-1"),
+            ("DELETE", "/catalog/relationships/edge-1"),
+            ("POST", "/api/v2/catalog/items"),
+            ("GET", "/catalog/items/work-1"),
+            ("GET", "/catalog/search"),
+            ("GET", "/catalog/timelines/timeline-1/previews"),
+            ("POST", "/api/v2/catalog/timelines/timeline-1/previews"),
+            ("GET", "/media/files/file-1/previews/1"),
+            ("GET", "/api/v2/media/files/file-1/previews/4294967295"),
+            ("GET", "/catalog/timelines/timeline-1/markers"),
+            ("POST", "/api/v2/catalog/timelines/timeline-1/markers"),
+            ("GET", "/profiles/profile-1/continue-watching"),
+            ("PUT", "/profiles/profile-1/preferences"),
+            ("HEAD", "/profiles/profile-1/preferences"),
+            ("GET", "/profiles/profile-1/timelines/timeline-1/viewing"),
+            (
+                "HEAD",
+                "/api/v2/profiles/profile-1/timelines/timeline-1/viewing",
+            ),
+            ("PUT", "/profiles/profile-1/timelines/timeline-1/viewing"),
+            ("GET", "/events"),
+            ("GET", "/api/v2/events"),
+            ("POST", "/downloads"),
+            ("GET", "/api/v2/downloads"),
+            ("POST", "/api/v2/offline/sync"),
+            ("GET", "/api/v2/downloads/download-1"),
+            ("DELETE", "/downloads/download-1"),
+            ("PUT", "/downloads/download-1/transfer"),
+            ("GET", "/api/v2/downloads/download-1/manifest"),
+            ("GET", "/media/files/file-1/content"),
+            ("DELETE", "/sources/source-1"),
+            ("POST", "/libraries"),
+            ("HEAD", "/libraries/library-1"),
+            ("PUT", "/libraries/library-1"),
+            ("POST", "/libraries/library-1/scans"),
+            ("GET", "/scans"),
+            ("GET", "/devices"),
+            ("DELETE", "/devices/device-1"),
+            ("GET", "/devices/device-1/policy"),
+            ("GET", "/users"),
+            ("POST", "/users"),
+            ("GET", "/users/user-1"),
+            ("PUT", "/users/user-1"),
+            ("GET", "/access/setup"),
+            ("POST", "/access/setup"),
+            ("PUT", "/devices/device-1/user"),
+            ("GET", "/admin/metrics"),
+            ("POST", "/playback/delivery-sessions"),
+            ("DELETE", "/playback/delivery-sessions/delivery-1"),
+            ("POST", "/playback/viewing-sessions"),
+            ("POST", "/playback/viewing-sessions/session-1/events"),
+            ("POST", "/content-access"),
+            ("GET", "/streams/delivery-1/generation-1/content"),
+            ("GET", "/profiles"),
+            ("POST", "/profiles"),
+            ("GET", "/profiles/profile-1"),
+            ("PUT", "/profiles/profile-1"),
+            ("DELETE", "/profiles/profile-1"),
+            ("GET", "/devices/device-1"),
+            ("PUT", "/devices/device-1/policy"),
+            ("GET", "/api/v2/scans/scan-1"),
+            ("POST", "/scans/scan-1/cancel"),
+        ] {
+            assert!(super::native_route_supported(method, path));
+        }
+        for (method, path) in [
+            ("HEAD", "/events"),
+            ("POST", "/events"),
+            ("PUT", "/events"),
+            ("DELETE", "/events"),
+            ("GET", "/events/replay"),
+            ("GET", "/events/"),
+            ("HEAD", "/schedules"),
+            ("HEAD", "/schedules/schedule-1"),
+            ("PATCH", "/schedules/schedule-1"),
+            ("PUT", "/schedules"),
+            ("POST", "/schedules/schedule-1"),
+            ("GET", "/schedules/schedule-1/events"),
+            ("GET", "/watch"),
+            ("HEAD", "/playback/delivery-sessions/delivery-1"),
+            ("GET", "/playback/delivery-sessions/delivery-1/heartbeat"),
+            ("HEAD", "/playback/viewing-sessions/session-1"),
+            ("GET", "/playback/viewing-sessions/session-1/delivery"),
+            ("HEAD", "/collections"),
+            ("HEAD", "/collections/collection-1"),
+            ("PUT", "/collections"),
+            ("GET", "/collections/collection-1/members"),
+            ("HEAD", "/catalog/filters"),
+            ("HEAD", "/catalog/filters/filter-1"),
+            ("POST", "/catalog/filters/filter-1"),
+            ("GET", "/catalog/filters/filter-1/evaluate"),
+            ("HEAD", "/playlists"),
+            ("HEAD", "/playlists/list-1"),
+            ("POST", "/playlists/list-1/play"),
+            ("GET", "/playback/queues"),
+            ("DELETE", "/catalog/items/work-1"),
+            ("POST", "/catalog/items/work-1/editions"),
+            ("HEAD", "/catalog/items/work-1/artwork"),
+            ("POST", "/media/assets/asset-1/content"),
+            ("GET", "/media/assets/asset-1/other/content"),
+            ("DELETE", "/catalog/items/work-1/artwork/selection"),
+            ("GET", "/catalog/items/work-1/artwork/selection/extra"),
+            ("GET", "/playback/delivery-sessions"),
+            ("HEAD", "/playback/delivery-sessions/delivery-1/changes"),
+            ("GET", "/playback/delivery-sessions/delivery-1/changes"),
+            ("PUT", "/playback/delivery-sessions/delivery-1/changes"),
+            (
+                "POST",
+                "/playback/delivery-sessions/delivery-1/changes/extra",
+            ),
+            (
+                "HEAD",
+                "/playback/delivery-sessions/delivery-1/generations/2/activate",
+            ),
+            (
+                "GET",
+                "/playback/delivery-sessions/delivery-1/generations/2/activate",
+            ),
+            (
+                "POST",
+                "/playback/delivery-sessions/delivery-1/generations/0/activate",
+            ),
+            (
+                "POST",
+                "/playback/delivery-sessions/delivery-1/generations/+2/activate",
+            ),
+            (
+                "POST",
+                "/playback/delivery-sessions/delivery-1/generations/18446744073709551616/activate",
+            ),
+            (
+                "POST",
+                "/playback/delivery-sessions/delivery-1/generations/2/activate/extra",
+            ),
+            (
+                "POST",
+                "/playback/delivery-sessions/delivery-1/generations/generation-1/activate",
+            ),
+            ("GET", "/playback/viewing-sessions/session-1/events"),
+            ("POST", "/playback/viewing-sessions/session-1/delivery"),
+            ("GET", "/content-access"),
+            ("DELETE", "/content-access/access-1"),
+            ("HEAD", "/streams/delivery-1/generation-1/content"),
+            ("GET", "/streams/delivery-1/generation-1/subtitles.vtt"),
+            ("GET", "/streams/delivery-1/generation-1/master.m3u8"),
+            (
+                "GET",
+                "/streams/delivery-1/generation-1/variants/variant-1/index.m3u8",
+            ),
+            ("GET", "/streams/delivery-1/generation-1/segments/segment-1"),
+            ("GET", "/streams/delivery-1/generation-1/extra/content"),
+            ("GET", "/playback/plans"),
+            ("HEAD", "/processing/renditions"),
+            ("GET", "/processing/preparations"),
+            ("POST", "/processing/renditions"),
+            ("HEAD", "/jobs"),
+            ("POST", "/jobs"),
+            ("HEAD", "/jobs/job-1"),
+            ("PUT", "/jobs/job-1"),
+            ("DELETE", "/jobs/job-1"),
+            ("GET", "/jobs/job-1/cancel"),
+            ("HEAD", "/jobs/job-1/retry"),
+            ("PUT", "/jobs/job-1/cancel"),
+            ("DELETE", "/jobs/job-1/retry"),
+            ("POST", "/jobs//cancel"),
+            ("POST", "/jobs/job-1/extra/cancel"),
+            ("POST", "/jobs/job-1/retry/extra"),
+            ("POST", "/jobs/job-1/cancel/"),
+            ("POST", "/jobs/job%2F1/cancel"),
+            ("GET", "/jobs/job-1/extra"),
+            ("HEAD", "/catalog/timelines/timeline-1/previews"),
+            ("PUT", "/catalog/timelines/timeline-1/previews"),
+            ("DELETE", "/catalog/timelines/timeline-1/previews"),
+            ("GET", "/catalog/timelines/timeline-1/previews/1"),
+            ("HEAD", "/media/files/file-1/previews/1"),
+            ("POST", "/media/files/file-1/previews/1"),
+            ("PUT", "/media/files/file-1/previews/1"),
+            ("DELETE", "/media/files/file-1/previews/1"),
+            ("GET", "/media/files/file-1/previews/0"),
+            ("GET", "/media/files/file-1/previews/4294967296"),
+            ("GET", "/media/files/file-1/previews/+1"),
+            ("GET", "/media/files/file-1/previews/-1"),
+            ("GET", "/media/files/file-1/previews/1/extra"),
+            ("GET", "/media/files/file-1/previews"),
+            ("GET", "/media/files/motion.file:one/previews/1"),
+            ("HEAD", "/catalog/timelines/timeline-1/markers"),
+            ("PUT", "/catalog/timelines/timeline-1/markers"),
+            ("DELETE", "/catalog/timelines/timeline-1/markers"),
+            ("PATCH", "/catalog/timelines/timeline-1/markers"),
+            ("GET", "/catalog/timelines/timeline-1/markers/marker-1"),
+            ("POST", "/catalog/timelines/timeline-1/other/markers"),
+            ("GET", "/catalog/timelines/motion.timeline:one/markers"),
+            ("HEAD", "/catalog/items/work-1/relationships"),
+            ("HEAD", "/catalog/relationships/edge-1"),
+            ("PUT", "/catalog/relationships/edge-1"),
+            ("POST", "/catalog/items/work-1/other/relationships"),
+            ("HEAD", "/profiles/profile-1/continue-watching"),
+            ("POST", "/profiles/profile-1/continue-watching"),
+            ("GET", "/profiles/profile-1/continue-watching/next"),
+            ("GET", "/profiles/profile-1/next"),
+            ("DELETE", "/profiles/profile-1/preferences"),
+            ("GET", "/profiles/profile-1/other/preferences"),
+            ("GET", "/catalog/items/work-1/files"),
+            ("POST", "/playback/sessions"),
+            ("DELETE", "/profiles/profile-1/timelines/timeline-1/viewing"),
+            ("POST", "/profiles/profile-1/timelines/timeline-1/viewing"),
+            (
+                "GET",
+                "/profiles/profile-1/timelines/timeline-1/viewing/events",
+            ),
+            (
+                "GET",
+                "/profiles/profile-1/timelines/motion.timeline:one/viewing",
+            ),
+            ("GET", "/offline/sync"),
+            ("HEAD", "/offline/sync"),
+            ("PUT", "/offline/sync"),
+            ("DELETE", "/offline/sync"),
+            ("POST", "/offline/sync/extra"),
+            ("POST", "/offline/other/sync"),
+            ("POST", "/offline"),
+            ("HEAD", "/downloads"),
+            ("HEAD", "/downloads/download-1"),
+            ("PUT", "/downloads"),
+            ("PUT", "/downloads/download-1"),
+            ("GET", "/downloads/download-1/transfer"),
+            ("POST", "/downloads/download-1/transfer"),
+            ("PUT", "/downloads/download-1/transfer/extra"),
+            ("POST", "/downloads/download-1/cancel"),
+            ("HEAD", "/downloads/download-1/manifest"),
+            ("POST", "/downloads/download-1/manifest"),
+            ("PUT", "/downloads/download-1/manifest"),
+            ("DELETE", "/downloads/download-1/manifest"),
+            ("GET", "/downloads/download-1/manifest/extra"),
+            ("GET", "/downloads/download-1/other/manifest"),
+            ("GET", "/downloads/download-1/subtitles"),
+            ("POST", "/downloads/download-1/sync"),
+            ("HEAD", "/media/files/file-1/content"),
+            ("GET", "/media/files/file-1/subtitles"),
+            ("GET", "/media/files/file-1/other/content"),
+            ("POST", "/admin/scans"),
+            ("GET", "/admin/files"),
+            ("GET", "/catalog/items/motion.edition:one"),
+            ("PUT", "/sources/source-1"),
+            ("PATCH", "/sources/source-1"),
+            ("DELETE", "/sources"),
+            ("DELETE", "/sources/source-1/settings"),
+            ("POST", "/sources/source-1/reactivate"),
+            ("DELETE", "/libraries/library-1"),
+            ("PATCH", "/libraries/library-1"),
+            ("PUT", "/libraries"),
+            ("PUT", "/libraries/library-1/other"),
+            ("PUT", "/libraries/library-1/scans"),
+            ("HEAD", "/scans"),
+            ("HEAD", "/devices/device-1"),
+            ("HEAD", "/devices"),
+            ("HEAD", "/users"),
+            ("DELETE", "/users/user-1"),
+            ("GET", "/users/user-1/devices"),
+            ("HEAD", "/access/setup"),
+            ("DELETE", "/access/setup"),
+            ("GET", "/devices/device-1/user"),
+            ("DELETE", "/devices/device-1/user"),
+            ("HEAD", "/admin/metrics"),
+            ("HEAD", "/admin/auth/users/user-1"),
+            ("HEAD", "/admin/diagnostics"),
+            ("HEAD", "/profiles"),
+            ("HEAD", "/profiles/profile-1"),
+            ("PUT", "/devices/device-1/other/policy"),
+            ("HEAD", "/scans/scan-1"),
+            ("DELETE", "/scans/scan-1"),
+            ("GET", "/scans/scan-1/cancel"),
+            ("POST", "/scans/scan-1/other/cancel"),
+            ("GET", "/libraries/library-1/scans"),
+            ("POST", "/libraries/library-1/other/scans"),
+        ] {
+            assert!(!super::native_route_supported(method, path));
+        }
+    }
+
     #[test]
     fn timestamps_are_rfc3339_utc() {
         assert_eq!(super::timestamp(0), "1970-01-01T00:00:00Z");

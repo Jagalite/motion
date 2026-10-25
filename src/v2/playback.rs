@@ -10,7 +10,7 @@ use super::{
     Body, Problem, Scope,
     auth::Caller,
     catalog::{self, TimelineRow},
-    content::file_facts,
+    content::{file_facts, transport_file_facts, transport_version_ready},
     etag, idempotency_key, if_match, timestamp, viewing,
 };
 use crate::{App, api::ApiError, db, delivery, now, viewing as legacy};
@@ -190,6 +190,266 @@ fn segment(s: &str) -> String {
     url.path().trim_start_matches('/').into()
 }
 
+/// Reserve application access to a native-owned catalog projection. Refresh
+/// happens before the Motion writer reservation, never while holding it. The
+/// following generation check fails closed if a native writer won that gap.
+/// All native writers reserve Motion first, so this transaction fences the
+/// validated projection through application authorization and commit.
+///
+/// This is not a physical-file grant: byte routes still require the exact
+/// native occurrence/version resolver and remain gated until qualified.
+pub(crate) async fn begin_catalog_application(
+    app: &App,
+    write: bool,
+) -> Result<sqlx::Transaction<'static, sqlx::Sqlite>, Problem> {
+    begin_catalog_application_typed(app, write)
+        .await
+        .map_err(application_problem)
+}
+
+/// Finite read admission for polling native renditions. Busy never returns
+/// cached authority and never queues a native owner behind an observer.
+pub(crate) async fn begin_catalog_poll(
+    app: &App,
+) -> Result<sqlx::Transaction<'static, sqlx::Sqlite>, Problem> {
+    let Some(native) = &app.native_catalog else {
+        return begin_catalog_application(app, false).await;
+    };
+    for _ in 0..3 {
+        if !native
+            .try_rebuild_projection()
+            .await
+            .map_err(Problem::internal)?
+        {
+            return Err(catalog_poll_busy());
+        }
+        // Acquiring a pool connection is cancellation-safe and performs no
+        // catalog effect. Never hold a detached native waiter on exhaustion.
+        let mut connection =
+            match tokio::time::timeout(std::time::Duration::from_millis(100), app.db.acquire())
+                .await
+            {
+                Ok(result) => result?,
+                Err(_) => return Err(catalog_poll_busy()),
+            };
+        // This connection must never reenter the pool with a changed busy
+        // handler, even on cancellation or BEGIN failure.
+        connection.close_on_drop();
+        sqlx::query("PRAGMA busy_timeout=0")
+            .execute(&mut *connection)
+            .await?;
+        let mut tx =
+            match sqlx::Transaction::begin(connection, Some("BEGIN IMMEDIATE".into())).await {
+                Ok(tx) => tx,
+                Err(error) if sqlite_admission_busy(&error) => return Err(catalog_poll_busy()),
+                Err(error) => return Err(error.into()),
+            };
+        match native
+            .try_projection_freshness(&mut tx)
+            .await
+            .map_err(Problem::internal)?
+        {
+            Some(crate::native_catalog::ProjectionFreshness::Current) => return Ok(tx),
+            Some(crate::native_catalog::ProjectionFreshness::Advanced { .. }) => {
+                tx.rollback().await?
+            }
+            None => {
+                tx.rollback().await?;
+                return Err(catalog_poll_busy());
+            }
+        }
+    }
+    Err(catalog_poll_busy())
+}
+fn sqlite_admission_busy(error: &sqlx::Error) -> bool {
+    error
+        .as_database_error()
+        .and_then(|e| e.code())
+        .and_then(|code| code.parse::<i32>().ok())
+        .is_some_and(|code| matches!(code & 0xff, 5 | 6))
+}
+fn catalog_poll_busy() -> Problem {
+    Problem {
+        retry_after: Some(1),
+        ..Problem::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "native_projection_busy",
+            "The native catalog owner is busy; retry the request",
+        )
+    }
+}
+
+// Preserve exact public Problems without flattening native admission causes.
+// Worker cancellation may recognize only the actual typed Runtime refusal.
+#[derive(Debug)]
+struct ApplicationProblem(Problem);
+impl std::fmt::Display for ApplicationProblem {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.0.code, self.0.detail)
+    }
+}
+impl std::error::Error for ApplicationProblem {}
+fn application_problem(error: anyhow::Error) -> Problem {
+    match error.downcast::<ApplicationProblem>() {
+        Ok(error) => error.0,
+        Err(error) => Problem::internal(error),
+    }
+}
+
+pub(crate) async fn begin_catalog_application_typed(
+    app: &App,
+    write: bool,
+) -> anyhow::Result<sqlx::Transaction<'static, sqlx::Sqlite>> {
+    if let Some(native) = &app.native_catalog {
+        begin_current_projection_typed(&app.db, native, || async {
+            native.rebuild_projection().await?;
+            Ok(())
+        })
+        .await
+    } else {
+        let mut tx = if write {
+            app.db.begin_with("BEGIN IMMEDIATE").await
+        } else {
+            app.db.begin().await
+        }
+        .map_err(|e| ApplicationProblem(e.into()))?;
+        if native_bound(&mut tx).await.map_err(ApplicationProblem)? {
+            return Err(ApplicationProblem(Problem::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "native_owner_unavailable",
+                "This catalog is bound to native ownership but no admitted native runtime is available",
+            )).into());
+        }
+        Ok(tx)
+    }
+}
+
+// Test fault injection uses the same algorithm and public error translation.
+#[cfg(test)]
+async fn begin_current_projection<F, Fut>(
+    db: &sqlx::SqlitePool,
+    native: &crate::native_catalog::Runtime,
+    mut refresh: F,
+) -> Result<sqlx::Transaction<'static, sqlx::Sqlite>, Problem>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<(), Problem>>,
+{
+    begin_current_projection_typed(db, native, || {
+        let result = refresh();
+        async move { result.await.map_err(|e| ApplicationProblem(e).into()) }
+    })
+    .await
+    .map_err(application_problem)
+}
+
+// Only a positively classified same-owner forward generation can converge by
+// releasing the stale writer and refreshing. Callers authorize only afterward.
+async fn begin_current_projection_typed<F, Fut>(
+    db: &sqlx::SqlitePool,
+    native: &crate::native_catalog::Runtime,
+    mut refresh: F,
+) -> anyhow::Result<sqlx::Transaction<'static, sqlx::Sqlite>>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<()>>,
+{
+    for _ in 0..3 {
+        refresh().await?;
+        let mut tx = db
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(|e| ApplicationProblem(e.into()))?;
+        match native.projection_freshness(&mut tx).await? {
+            crate::native_catalog::ProjectionFreshness::Current => return Ok(tx),
+            crate::native_catalog::ProjectionFreshness::Advanced { .. } => {
+                tx.rollback()
+                    .await
+                    .map_err(|e| ApplicationProblem(e.into()))?;
+            }
+        }
+    }
+    Err(ApplicationProblem(Problem {
+        retry_after: Some(1),
+        ..Problem::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "native_projection_busy",
+            "The native catalog changed during admission; retry the request",
+        )
+    })
+    .into())
+}
+
+#[cfg(test)]
+#[path = "playback/native_admission_tests.rs"]
+mod native_admission_tests;
+
+#[cfg(test)]
+#[path = "playback/native_replan_tests.rs"]
+mod native_replan_tests;
+
+#[path = "playback/native_hls_candidate.rs"]
+pub(crate) mod native_hls_candidate;
+
+/// A bound-but-unprojected catalog is not a legacy catalog. In particular,
+/// interrupted cutover must not revive old file/timeline rows as authority.
+pub(crate) async fn native_bound(conn: &mut sqlx::SqliteConnection) -> Result<bool, Problem> {
+    Ok(
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM catabolic_binding)")
+            .fetch_one(conn)
+            .await?,
+    )
+}
+
+pub(crate) async fn require_native_scope(
+    conn: &mut sqlx::SqliteConnection,
+    principal: &Principal,
+) -> Result<(), Problem> {
+    if native_bound(conn).await?
+        && (matches!(
+            access::catalog_scope(principal),
+            access::CatalogScope::Nothing
+        ) || principal.policy.rating_restricted())
+    {
+        return Err(Problem::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "native_scope_unavailable",
+            "Native physical access for metadata-constrained policies is not yet qualified",
+        ));
+    }
+    Ok(())
+}
+
+/// Exact compatibility references are admissible only when the native typed
+/// version owner and the live work were positively projected in this generation.
+/// A retired/aliased work's old history is never silently moved to its survivor.
+/// Edited heads are qualified only for an exact whole-file original. Sliced
+/// edits and generated delivery still require separate end-to-end qualification.
+pub(crate) async fn native_version_ready(
+    conn: &mut sqlx::SqliteConnection,
+    version: &str,
+) -> Result<bool, Problem> {
+    if !native_bound(conn).await? {
+        return Ok(true);
+    }
+    Ok(sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM catabolic_projection_versions p \
+         JOIN catabolic_projection_state s ON s.singleton=1 AND s.generation=p.generation \
+         JOIN media_versions v ON v.id=p.version_id AND v.revision=p.motion_version_revision \
+         JOIN timelines t ON t.id=p.timeline_id AND t.id=v.timeline_id AND t.revision=p.motion_timeline_revision \
+         JOIN editions e ON e.id=t.edition_id \
+         JOIN catabolic_projection_items i ON i.native_id=e.item_id AND i.generation=s.generation \
+         WHERE p.version_id=? AND p.ready=1 AND p.native_timeline_revision>0 \
+         AND p.native_timeline_revision=p.native_current_timeline_revision AND p.native_version_revision>0 \
+         AND ((p.native_timeline_revision=1 AND p.native_version_revision=1) OR \
+           (v.origin='original' AND (SELECT count(*) FROM version_files b WHERE b.version_id=v.id)=1 \
+            AND EXISTS(SELECT 1 FROM version_files b JOIN media_files f ON f.id=b.file_id \
+              WHERE b.version_id=v.id AND b.part=1 AND b.start_ms IS NULL AND b.end_ms IS NULL \
+              AND f.generated=0 AND f.available=1 AND f.revision=b.file_revision))) \
+         AND json_type(i.metadata_json,'$.retirement')='null')")
+        .bind(version).fetch_one(conn).await?)
+}
+
 // ---------------------------------------------------------------- profiles
 
 /// A profile the principal may use. Unknown and forbidden are indistinguishable.
@@ -221,6 +481,36 @@ pub(crate) async fn readable_timeline(
     .fetch_optional(&mut *conn)
     .await?
     .ok_or_else(Problem::not_found)?;
+    require_native_scope(conn, principal).await?;
+    if native_bound(conn).await? {
+        let versions: Vec<String> =
+            sqlx::query_scalar("SELECT id FROM media_versions WHERE timeline_id=?")
+                .bind(timeline)
+                .fetch_all(&mut *conn)
+                .await?;
+        let scope = access::catalog_scope(principal);
+        for version in versions {
+            if !transport_version_ready(conn, principal, &version).await? {
+                continue;
+            }
+            let files: Vec<String> = sqlx::query_scalar(
+                "SELECT file_id FROM version_files WHERE version_id=? ORDER BY part",
+            )
+            .bind(&version)
+            .fetch_all(&mut *conn)
+            .await?;
+            for file in files {
+                if let Some(facts) = transport_file_facts(conn, principal, &file).await?
+                    && scope.admits(facts.library_ids.iter())
+                {
+                    // Exact current native owner/file membership is sufficient.
+                    // Frozen work/edition library joins are never native authority.
+                    return Ok(row);
+                }
+            }
+        }
+        return Err(Problem::not_found());
+    }
     // The same visibility as catalog timeline reads: the work and the edition.
     let scope = access::catalog_scope(principal);
     catalog::load_item(conn, &scope, &row.item_id, false).await?;
@@ -263,10 +553,14 @@ pub async fn get_preferences(
     caller: Caller,
     Path(profile): Path<String>,
 ) -> Result<Response, Problem> {
-    let mut conn = app.db.acquire().await?;
-    usable_profile(&mut conn, &caller.principal, &profile).await?;
-    drop(conn);
-    let state = legacy::prefs(&app, &profile).await.map_err(problem)?;
+    // Profile ownership and its preference document are observed in one
+    // snapshot. Native catalog ownership does not change this app-owned data;
+    // neither a second pool connection nor a stale caller grant is authority.
+    let mut tx = app.db.begin().await?;
+    let principal = caller.reauthorize(&mut tx, None).await?;
+    usable_profile(&mut tx, &principal, &profile).await?;
+    let state = legacy::prefs_in(&mut tx, &profile).await.map_err(problem)?;
+    tx.commit().await?;
     Ok(tagged(
         StatusCode::OK,
         preferences_json(&state),
@@ -727,8 +1021,37 @@ async fn readable_prepared(
 ) -> Result<Vec<Bound>, Problem> {
     let mut readable = Vec::new();
     for p in prepared_of(conn, timeline, original, version).await? {
+        if native_bound(conn).await? {
+            let job: Option<String> = sqlx::query_scalar(
+                "SELECT external_id FROM renditions WHERE source='playscale' AND file_id=?",
+            )
+            .bind(&p.file.id)
+            .fetch_optional(&mut *conn)
+            .await?;
+            let Some(job) = job else {
+                continue;
+            };
+            if !crate::native_processing::validate_prepared_rendition_in(
+                conn,
+                &job,
+                &p.file.id,
+                &p.file.revision,
+                &p.version,
+                timeline,
+            )
+            .await
+            .map_err(Problem::internal)?
+            {
+                continue;
+            }
+        }
         // A rendition outside the caller's scope is not a candidate.
-        if core::readable(principal, file_facts(conn, &p.file.id).await?.as_ref()) {
+        if core::readable(
+            principal,
+            transport_file_facts(conn, principal, &p.file.id)
+                .await?
+                .as_ref(),
+        ) {
             readable.push(p);
         }
     }
@@ -736,7 +1059,14 @@ async fn readable_prepared(
 }
 
 /// Whether the version still binds the file to the timeline.
-async fn still_bound(conn: &mut sqlx::SqliteConnection, claims: &Claims) -> Result<bool, Problem> {
+async fn still_bound(
+    conn: &mut sqlx::SqliteConnection,
+    principal: &Principal,
+    claims: &Claims,
+) -> Result<bool, Problem> {
+    if !transport_version_ready(conn, principal, &claims.version).await? {
+        return Ok(false);
+    }
     if !claims.parts.is_empty() {
         // Exactly the pinned parts and nothing else: every binding of the
         // version, whole files only, at their revisions and durations, all in
@@ -794,6 +1124,9 @@ async fn pinned_rendition_source(
     timeline: &str,
     version: &str,
 ) -> Result<Option<String>, Problem> {
+    if native_bound(conn).await? {
+        return Ok(sqlx::query_scalar("SELECT json_extract(command_json,'$.command.payload.request.provenance.job.source_file_id') FROM catabolic_generated_publications WHERE receipt_json IS NOT NULL AND json_extract(receipt_json,'$.result.version_id')=? AND json_extract(receipt_json,'$.result.timeline_id')=? LIMIT 1").bind(version).bind(timeline).fetch_optional(conn).await?);
+    }
     Ok(sqlx::query_scalar(
         "SELECT r.source_file_id FROM media_versions v JOIN version_files b ON b.version_id=v.id AND b.part=1 \
          JOIN renditions r ON r.file_id=b.file_id WHERE v.id=? AND v.timeline_id=? AND v.origin='generated' LIMIT 1",
@@ -830,8 +1163,15 @@ async fn prepared_of(
     .bind(version)
     .fetch_all(&mut *conn)
     .await?;
+    let native = native_bound(conn).await?;
     let mut found = Vec::new();
     for (version, file, available, revision, registered, source, registered_source) in rows {
+        if native {
+            let exact_source:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM catabolic_generated_publications WHERE receipt_json IS NOT NULL AND json_extract(receipt_json,'$.result.version_id')=? AND json_extract(command_json,'$.command.payload.request.provenance.job.source_file_id')=?)").bind(&version).bind(original).fetch_one(&mut *conn).await?;
+            if !exact_source {
+                continue;
+            }
+        }
         if playscale_core::renditions::available(
             available,
             &revision,
@@ -1080,9 +1420,12 @@ pub async fn plan(
         ));
     }
     let require_sdr = input.quality.hdr_policy == "require_sdr";
-    let principal = &caller.principal;
     // All planning observations share one read snapshot and one pool slot.
-    let mut conn = app.db.begin().await?;
+    let mut conn = begin_catalog_application(&app, false).await?;
+    let current_principal = caller
+        .reauthorize(&mut conn, Some(Permission::PlaybackRequest))
+        .await?;
+    let principal = &current_principal;
     usable_profile(&mut conn, principal, &input.profile_id).await?;
     readable_timeline(&mut conn, principal, &input.timeline_id).await?;
     // A pinned generated version names the original it renders; only that
@@ -1645,6 +1988,9 @@ pub async fn plan(
         failed: input.failed_candidate_ids.clone(),
     };
     let mut decided = core::plan(&bound.file.id, &source, &request);
+    if native_bound(&mut conn).await? && decided == core::Plan::Observe {
+        return Ok(Json(blocked(&input, "native_delivery_route_unavailable")).into_response());
+    }
     if decided == core::Plan::Observe {
         let core::StreamCopy::Unobserved(route) = source.copy else {
             return Err(Problem::internal("copy observation without a candidate"));
@@ -1662,7 +2008,19 @@ pub async fn plan(
             }
             _ => core::StreamCopy::Ineligible,
         };
-        conn = app.db.begin().await?;
+        conn = begin_catalog_application(&app, false).await?;
+        let refreshed = caller
+            .reauthorize(&mut conn, Some(Permission::PlaybackRequest))
+            .await?;
+        if refreshed != current_principal {
+            return Err(Problem::new(
+                StatusCode::CONFLICT,
+                "plan_authorization_changed",
+                "Authorization changed during observation; request a new plan",
+            ));
+        }
+        usable_profile(&mut conn, &refreshed, &input.profile_id).await?;
+        readable_timeline(&mut conn, &refreshed, &input.timeline_id).await?;
         decided = core::plan(&bound.file.id, &source, &request);
         if decided == core::Plan::Observe {
             return Err(Problem::internal(
@@ -1787,6 +2145,23 @@ pub async fn plan(
             },
             false => (subtitle, sidecar, burn),
         };
+    // Only exact original or receipt-verified whole prepared byte transport.
+    // Live conversion, intervals and sidecars remain separately unqualified.
+    let native_transport = route == Route::Original
+        || (route == Route::Prepared
+            && transport_file_facts(&mut conn, principal, &chosen.file.id)
+                .await?
+                .is_some());
+    if native_bound(&mut conn).await?
+        && (!native_transport
+            || chosen.clip.is_some()
+            || !chosen.parts.is_empty()
+            || subtitle.is_some()
+            || sidecar.is_some()
+            || burn.is_some())
+    {
+        return Ok(Json(blocked(&input, "native_delivery_route_unavailable")).into_response());
+    }
     let expires_at = now() + core::PLAN_TTL_SECONDS;
     let claims = Claims {
         principal: principal.id.clone(),
@@ -1854,6 +2229,7 @@ pub async fn plan(
 /// plan with current file facts and binding (core `admit`). A refusal keeps
 /// its v2 problem so its code reaches the client unchanged.
 struct PlanAuthority {
+    app: App,
     caller: Caller,
     claims: Claims,
     refusal: std::sync::Mutex<Option<Problem>>,
@@ -1873,15 +2249,32 @@ impl delivery::AdmissionAuthority for PlanAuthority {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<String, ApiError>> + Send + 'a>>
     {
         Box::pin(async move {
+            // delivery::admit_owned owns this writer inside its detached task.
+            // Validate there, not only in the cancellable request preflight.
+            if let Some(native) = &self.app.native_catalog {
+                native
+                    .validate_projection(db)
+                    .await
+                    .map_err(|e| self.refuse(Problem::internal(e)))?;
+            } else if native_bound(db).await.map_err(|p| self.refuse(p))? {
+                return Err(self.refuse(Problem::new(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "native_owner_unavailable",
+                    "Native catalog ownership is not admitted",
+                )));
+            }
             let principal = self
                 .caller
                 .reauthorize(db, None)
                 .await
                 .map_err(|p| self.refuse(p))?;
-            let facts = file_facts(db, &self.claims.file)
+            require_native_scope(db, &principal)
                 .await
                 .map_err(|p| self.refuse(p))?;
-            let bound = still_bound(db, &self.claims)
+            let facts = transport_file_facts(db, &principal, &self.claims.file)
+                .await
+                .map_err(|p| self.refuse(p))?;
+            let bound = still_bound(db, &principal, &self.claims)
                 .await
                 .map_err(|p| self.refuse(p))?;
             core::reauthorize(
@@ -1914,13 +2307,13 @@ async fn may_probe(
     claims: &Claims,
     delivery: Option<&str>,
 ) -> Result<(), Problem> {
-    let mut conn = app.db.acquire().await?;
+    let mut conn = begin_catalog_application(&app, false).await?;
     let principal = caller.reauthorize(&mut conn, None).await?;
     if let Some(id) = delivery {
         controlled_by(app, &mut conn, &principal, id).await?;
     }
-    let facts = file_facts(&mut conn, &claims.file).await?;
-    let bound = still_bound(&mut conn, claims).await?;
+    let facts = transport_file_facts(&mut conn, &principal, &claims.file).await?;
+    let bound = still_bound(&mut conn, &principal, claims).await?;
     core::reauthorize(
         claims,
         &core::Observed {
@@ -2342,6 +2735,7 @@ pub async fn create_delivery(
         backend: None,
     };
     let planned = delivery::Planned {
+        native_input: None,
         owner: owner.clone(),
         version: claims.version.clone(),
         route: claims.route,
@@ -2353,7 +2747,16 @@ pub async fn create_delivery(
         max_bitrate_bps: claims.max_bitrate_bps,
         adaptive: claims.adaptive,
     };
+    // Refresh before the delivery writer is reserved; reauthorization above
+    // validates the same identity/generation under actual admission custody.
+    if let Some(native) = &app.native_catalog {
+        native
+            .rebuild_projection()
+            .await
+            .map_err(Problem::internal)?;
+    }
     let authority = Arc::new(PlanAuthority {
+        app: app.clone(),
         caller: caller.clone(),
         claims,
         refusal: Default::default(),
@@ -2398,18 +2801,11 @@ pub(crate) async fn controlled_by(
         .await
         .map_err(problem)?
         .ok_or_else(Problem::not_found)?;
-    let facts = file_facts(conn, &owner.file).await?;
+    let facts = transport_file_facts(conn, principal, &owner.file).await?;
     if !core::may_control(&owner, principal, facts.as_ref()) {
         return Err(Problem::not_found());
     }
     Ok(owner)
-}
-
-/// Read-only authorization (GET, stream bytes): the caller was resolved from
-/// current credential state for this request.
-async fn observed(app: &App, caller: &Caller, id: &str) -> Result<Owner, Problem> {
-    let mut conn = app.db.acquire().await?;
-    controlled_by(app, &mut conn, &caller.principal, id).await
 }
 
 /// A delivery command authorizes inside the write transaction, so a
@@ -2420,7 +2816,7 @@ async fn command<'a>(
     caller: &Caller,
     id: &str,
 ) -> Result<(sqlx::Transaction<'a, sqlx::Sqlite>, Principal, Owner), Problem> {
-    let mut tx = db::begin_write(&app.db).await?;
+    let mut tx = begin_catalog_application(&app, true).await?;
     let principal = caller
         .reauthorize(&mut tx, Some(Permission::PlaybackRequest))
         .await?;
@@ -2447,12 +2843,18 @@ pub async fn get_delivery(
     caller: Caller,
     Path(id): Path<String>,
 ) -> Result<Response, Problem> {
-    let owner = observed(&app, &caller, &id).await?;
-    let view = delivery::any_view(&app, &id)
+    let mut tx = begin_catalog_application(&app, false).await?;
+    let principal = caller.reauthorize(&mut tx, None).await?;
+    let owner = controlled_by(&app, &mut tx, &principal, &id).await?;
+    let view = delivery::any_view(&app, &mut tx, &id)
         .await
         .map_err(problem)?
         .ok_or_else(Problem::not_found)?;
-    Ok(Json(delivery_json(&view, &owner)).into_response())
+    // Keep current authorization/native generation custody through both live
+    // and recorded state reads and response construction, without a pool gap.
+    let body = delivery_json(&view, &owner);
+    tx.commit().await?;
+    Ok(Json(body).into_response())
 }
 
 /// Idempotent: a delivery that is already closed, failed or interrupted is done.
@@ -2556,6 +2958,77 @@ async fn durable_replay(
     Ok(Some(response))
 }
 
+/// New native control effects are narrower than historical read/close and
+/// receipt replay: only an unchanged, current whole-byte binding qualifies.
+async fn native_byte_control(
+    app: &App,
+    conn: &mut sqlx::SqliteConnection,
+    id: &str,
+    owner: &Owner,
+    principal: &Principal,
+) -> Result<(), Problem> {
+    if app.native_catalog.is_none() {
+        return Ok(());
+    }
+    if !delivery::whole_byte_control(app, id).map_err(problem)? {
+        return Err(Problem::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "native_control_unavailable",
+            "Only whole-original or prepared delivery controls are qualified",
+        ));
+    }
+    let version: Option<String> = sqlx::query_scalar(
+        "SELECT o.version_id FROM delivery_owners o \
+         JOIN media_versions v ON v.id=o.version_id AND v.timeline_id=o.timeline_id \
+         JOIN version_files b ON b.version_id=v.id \
+         WHERE o.delivery_id=? AND o.timeline_id=? AND o.file_id=? AND o.file_revision=? \
+         AND v.origin IN ('original','generated') AND b.file_id=o.file_id AND b.file_revision=o.file_revision \
+         AND b.part=1 AND b.start_ms IS NULL AND b.end_ms IS NULL \
+         AND (SELECT count(*) FROM version_files x WHERE x.version_id=v.id)=1",
+    )
+    .bind(id)
+    .bind(&owner.timeline)
+    .bind(&owner.file)
+    .bind(&owner.file_revision)
+    .fetch_optional(&mut *conn)
+    .await?;
+    let current = transport_file_facts(conn, principal, &owner.file)
+        .await?
+        .is_some_and(|f| f.revision == owner.file_revision);
+    let ready = match version {
+        Some(version) => transport_version_ready(conn, principal, &version).await?,
+        None => false,
+    };
+    if !current || !ready {
+        return Err(Problem::new(
+            StatusCode::CONFLICT,
+            "source_revision_changed",
+            "Create a new delivery from the current version",
+        ));
+    }
+    Ok(())
+}
+
+/// Native replan shares only the already admitted whole-byte transport cohort.
+/// This adapter gate is not a new planner: core admission and compatibility still
+/// decide current principal, source revision, timeline and profile validity.
+fn native_replan_cohort(claims: &Claims) -> Result<(), Problem> {
+    if !matches!(claims.route, Route::Original | Route::Prepared)
+        || claims.clip.is_some()
+        || !claims.parts.is_empty()
+        || claims.subtitle.is_some()
+        || claims.max_bitrate_bps.is_some()
+        || claims.adaptive
+    {
+        return Err(Problem::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "native_replan_unavailable",
+            "Only whole-original or prepared replans without subtitles are qualified",
+        ));
+    }
+    Ok(())
+}
+
 /// Stage a seek or replan. Its acknowledgement is recorded with the staged
 /// generation, under the delivery's lock (`delivery::change_live`), so an exact
 /// retry of a lost response replays it instead of staging another generation.
@@ -2579,6 +3052,13 @@ pub async fn change_delivery(
         };
         if let Some(replay) = durable_replay(&mut tx, &durable, &body.digest).await? {
             return Ok(replay);
+        }
+        if app.native_catalog.is_some()
+            && let DeliveryChange::Replan { plan_token, .. } = &body.value
+        {
+            // Refuse unsupported routes before any external probe. The current
+            // writer below repeats this gate after fresh authorization.
+            native_replan_cohort(&open(&app, plan_token)?)?;
         }
         tx.commit().await?;
     }
@@ -2662,6 +3142,7 @@ pub async fn change_delivery(
             .insert("idempotent-replayed", HeaderValue::from_static("true"));
         return Ok(response);
     }
+    native_byte_control(&app, &mut tx, &id, &owner, &principal).await?;
     let (expected, position, selection) = match body.value {
         DeliveryChange::Seek {
             expected_generation,
@@ -2673,8 +3154,27 @@ pub async fn change_delivery(
             position_ms,
         } => {
             let claims = open(&app, &plan_token)?;
-            let facts = file_facts(&mut tx, &claims.file).await?;
-            let bound = still_bound(&mut tx, &claims).await?;
+            if app.native_catalog.is_some() {
+                native_replan_cohort(&claims)?;
+                // Replan does not rewrite the durable owner's version binding.
+                // Even a second version of the same file needs a new delivery.
+                let same_version: bool = sqlx::query_scalar(
+                    "SELECT EXISTS(SELECT 1 FROM delivery_owners WHERE delivery_id=? AND version_id=?)",
+                )
+                .bind(&id)
+                .bind(&claims.version)
+                .fetch_one(&mut *tx)
+                .await?;
+                if !same_version {
+                    return Err(Problem::new(
+                        StatusCode::CONFLICT,
+                        "replan_incompatible",
+                        "A different version needs a new delivery",
+                    ));
+                }
+            }
+            let facts = transport_file_facts(&mut tx, &principal, &claims.file).await?;
+            let bound = still_bound(&mut tx, &principal, &claims).await?;
             core::admit(
                 &claims,
                 &core::Observed {
@@ -2772,6 +3272,7 @@ pub async fn activate(
         key: key.clone(),
         digest: body.digest.clone(),
     };
+    native_byte_control(&app, &mut tx, &id, &owner, &principal).await?;
     let (view, replayed) = delivery::activate_live(
         &app,
         &id,
@@ -2810,22 +3311,107 @@ pub struct StreamParams {
     ticket: Option<String>,
 }
 
+async fn stream_admission(
+    app: &App,
+    headers: &HeaderMap,
+    params: &StreamParams,
+    id: &str,
+    generation: &str,
+) -> Result<(Owner, Principal, sqlx::Transaction<'static, sqlx::Sqlite>), Problem> {
+    let caller = if params.ticket.is_none() {
+        Some(super::auth::resolve(app, &Method::GET, headers).await?)
+    } else {
+        None
+    };
+    let mut conn = begin_catalog_application(app, false).await?;
+    let principal =
+        stream_principal_in(app, &mut conn, caller.as_ref(), params, id, generation).await?;
+    require_native_scope(&mut conn, &principal).await?;
+    let owner = controlled_by(app, &mut conn, &principal, id).await?;
+    Ok((owner, principal, conn))
+}
+
+async fn stream_principal_in(
+    app: &App,
+    conn: &mut sqlx::SqliteConnection,
+    caller: Option<&Caller>,
+    params: &StreamParams,
+    id: &str,
+    generation: &str,
+) -> Result<Principal, Problem> {
+    if let Some(token) = &params.ticket {
+        super::content::delivery_ticket_in(app, conn, token, id, generation).await
+    } else {
+        caller
+            .ok_or_else(|| Problem::internal("missing resolved stream caller"))?
+            .reauthorize(conn, None)
+            .await
+    }
+}
+
+struct StreamRead {
+    // Capture before any awaited output work. Removal of a native session must
+    // never turn a pending native response into an unchecked legacy release.
+    native_hls: bool,
+}
+
 async fn stream_owner(
     app: &App,
     headers: &HeaderMap,
     params: &StreamParams,
     id: &str,
     generation: &str,
-) -> Result<Owner, Problem> {
-    let principal = if let Some(token) = &params.ticket {
-        super::content::delivery_ticket(app, token, id, generation).await?
-    } else {
-        super::auth::resolve(app, &Method::GET, headers)
-            .await?
-            .principal
-    };
-    let mut conn = app.db.acquire().await?;
-    controlled_by(app, &mut conn, &principal, id).await
+) -> Result<StreamRead, Problem> {
+    let native_hls = delivery::native_hls_session(app, id);
+    stream_admission(app, headers, params, id, generation).await?;
+    Ok(StreamRead { native_hls })
+}
+
+impl StreamRead {
+    /// Native output is already immutable and bounded here. Authenticate the
+    /// real request again after the awaited read, not the session's background
+    /// continuation principal. Fence response admission, not a slow client's
+    /// later drain of these already admitted bytes.
+    async fn release(
+        self,
+        app: &App,
+        headers: &HeaderMap,
+        params: &StreamParams,
+        id: &str,
+        generation: &str,
+        response: Response,
+    ) -> Result<Response, Problem> {
+        if !self.native_hls {
+            return Ok(response);
+        }
+        let caller = if params.ticket.is_none() {
+            Some(super::auth::resolve(app, &Method::GET, headers).await?)
+        } else {
+            None
+        };
+        let mut fence = begin_catalog_application(app, false).await?;
+        let principal =
+            stream_principal_in(app, &mut fence, caller.as_ref(), params, id, generation).await?;
+        require_native_scope(&mut fence, &principal).await?;
+        controlled_by(app, &mut fence, &principal, id).await?;
+        fence = delivery::native_hls_release_fence(app, id, generation, &principal, fence)
+            .await
+            .map_err(stream_problem)?;
+        // Native exact-source validation can wait on actual filesystem work.
+        // Time-based credential/ticket expiry must be checked after it too.
+        let principal =
+            stream_principal_in(app, &mut fence, caller.as_ref(), params, id, generation).await?;
+        require_native_scope(&mut fence, &principal).await?;
+        controlled_by(app, &mut fence, &principal, id).await?;
+        if !delivery::serves_generation(app, id, generation) {
+            return Err(Problem::not_found());
+        }
+        // The immutable response retains its session/native lease and bounded
+        // buffer capacity, but not SQLite's writer. Later revocation prevents
+        // new admission without waiting for an already admitted client to read.
+        fence.commit().await?;
+        Ok(response)
+    }
 }
 
 fn stream_link(path: &str, params: &StreamParams) -> String {
@@ -2845,7 +3431,8 @@ pub async fn generation_content(
     method: Method,
     headers: HeaderMap,
 ) -> Result<Response, Problem> {
-    let owner = stream_owner(&app, &headers, &params, &id, &generation).await?;
+    let (owner, principal, fence) =
+        stream_admission(&app, &headers, &params, &id, &generation).await?;
     let transfer = delivery::transfer(&app, &id);
     let view = delivery::live_view(&app, &id).ok_or_else(Problem::not_found)?;
     if !delivery::serves_generation(&app, &id, &generation)
@@ -2856,14 +3443,16 @@ pub async fn generation_content(
     {
         return Err(Problem::not_found());
     }
-    crate::media::serve(
-        State(app.clone()),
-        Path(owner.file),
-        Query(crate::media::MediaQuery {
+    crate::media::serve_authorized(
+        app.clone(),
+        owner.file,
+        crate::media::MediaQuery {
             revision: Some(owner.file_revision),
-        }),
+        },
         method,
         headers,
+        fence,
+        &principal,
     )
     .await
     .map(|response| delivery::count(transfer, response))
@@ -2876,12 +3465,15 @@ pub async fn generation_subtitles(
     Query(params): Query<StreamParams>,
     headers: HeaderMap,
 ) -> Result<Response, Problem> {
-    stream_owner(&app, &headers, &params, &id, &generation).await?;
+    let authority = stream_owner(&app, &headers, &params, &id, &generation).await?;
     let transfer = delivery::transfer(&app, &id);
-    delivery::subtitles(State(app.clone()), Path((id.clone(), generation)))
+    let response = delivery::subtitles(State(app.clone()), Path((id.clone(), generation.clone())))
         .await
-        .map(|response| delivery::count(transfer, response))
-        .map_err(stream_problem)
+        .map_err(stream_problem)?;
+    let response = authority
+        .release(&app, &headers, &params, &id, &generation, response)
+        .await?;
+    Ok(delivery::count(transfer, response))
 }
 
 pub async fn master_playlist(
@@ -2890,7 +3482,7 @@ pub async fn master_playlist(
     headers: HeaderMap,
     Path((id, generation)): Path<(String, String)>,
 ) -> Result<Response, Problem> {
-    stream_owner(&app, &headers, &params, &id, &generation).await?;
+    let authority = stream_owner(&app, &headers, &params, &id, &generation).await?;
     let transfer = delivery::transfer(&app, &id);
     let view = delivery::live_view(&app, &id).ok_or_else(Problem::not_found)?;
     let serving = [view.active.as_ref(), view.pending.as_ref()]
@@ -2955,15 +3547,22 @@ pub async fn master_playlist(
         resolution(size),
         stream_link(&format!("variants/{VARIANT}/index.m3u8"), &params)
     );
-    let response = (
-        [
-            (header::CONTENT_TYPE, "application/vnd.apple.mpegurl"),
-            (header::CACHE_CONTROL, "private, no-store"),
-            (header::REFERRER_POLICY, "no-referrer"),
-        ],
-        text,
-    )
-        .into_response();
+    let response_headers = [
+        (header::CONTENT_TYPE, "application/vnd.apple.mpegurl"),
+        (header::CACHE_CONTROL, "private, no-store"),
+        (header::REFERRER_POLICY, "no-referrer"),
+    ];
+    let response = if authority.native_hls {
+        let body = delivery::native_hls_playlist_body(&app, &id, &generation, text)
+            .await
+            .map_err(stream_problem)?;
+        (response_headers, body).into_response()
+    } else {
+        (response_headers, text).into_response()
+    };
+    let response = authority
+        .release(&app, &headers, &params, &id, &generation, response)
+        .await?;
     Ok(delivery::count(transfer, response))
 }
 
@@ -2973,10 +3572,10 @@ pub async fn variant_playlist(
     headers: HeaderMap,
     Path((id, generation, variant)): Path<(String, String, String)>,
 ) -> Result<Response, Problem> {
-    stream_owner(&app, &headers, &params, &id, &generation).await?;
+    let authority = stream_owner(&app, &headers, &params, &id, &generation).await?;
     let transfer = delivery::transfer(&app, &id);
-    if variant == LOW_VARIANT {
-        return delivery::low_playlist(
+    let response = if variant == LOW_VARIANT {
+        delivery::low_playlist(
             &app,
             &id,
             &generation,
@@ -2984,33 +3583,31 @@ pub async fn variant_playlist(
             &stream_link("init.mp4", &params),
         )
         .await
-        .map(|response| delivery::count(transfer, response))
-        .map_err(stream_problem);
-    }
-    if variant == SUBTITLE_VARIANT {
-        return delivery::subtitle_playlist(&app, &id, &generation, |i| {
+    } else if variant == SUBTITLE_VARIANT {
+        delivery::subtitle_playlist(&app, &id, &generation, |i| {
             stream_link(
                 &format!("../../segments/{SUBTITLE_VARIANT}-{i}.vtt"),
                 &params,
             )
         })
         .await
-        .map(|response| delivery::count(transfer, response))
-        .map_err(stream_problem);
-    }
-    if variant != VARIANT {
+    } else if variant == VARIANT {
+        delivery::playlist_with(
+            &app,
+            &id,
+            &generation,
+            |i| stream_link(&format!("../../segments/{i}.m4s"), &params),
+            &stream_link("init.mp4", &params),
+        )
+        .await
+    } else {
         return Err(Problem::not_found());
     }
-    delivery::playlist_with(
-        &app,
-        &id,
-        &generation,
-        |i| stream_link(&format!("../../segments/{i}.m4s"), &params),
-        &stream_link("init.mp4", &params),
-    )
-    .await
-    .map(|response| delivery::count(transfer, response))
-    .map_err(stream_problem)
+    .map_err(stream_problem)?;
+    let response = authority
+        .release(&app, &headers, &params, &id, &generation, response)
+        .await?;
+    Ok(delivery::count(transfer, response))
 }
 
 pub async fn init_segment(
@@ -3019,21 +3616,20 @@ pub async fn init_segment(
     headers: HeaderMap,
     Path((id, generation, variant)): Path<(String, String, String)>,
 ) -> Result<Response, Problem> {
-    stream_owner(&app, &headers, &params, &id, &generation).await?;
+    let authority = stream_owner(&app, &headers, &params, &id, &generation).await?;
     let transfer = delivery::transfer(&app, &id);
-    if variant == LOW_VARIANT {
-        return delivery::low_init(&app, &id, &generation)
-            .await
-            .map(|response| delivery::count(transfer, response))
-            .map_err(stream_problem);
-    }
-    if variant != VARIANT {
+    let response = if variant == LOW_VARIANT {
+        delivery::low_init(&app, &id, &generation).await
+    } else if variant == VARIANT {
+        delivery::init(State(app.clone()), Path((id.clone(), generation.clone()))).await
+    } else {
         return Err(Problem::not_found());
     }
-    delivery::init(State(app.clone()), Path((id.clone(), generation)))
-        .await
-        .map(|response| delivery::count(transfer, response))
-        .map_err(stream_problem)
+    .map_err(stream_problem)?;
+    let response = authority
+        .release(&app, &headers, &params, &id, &generation, response)
+        .await?;
+    Ok(delivery::count(transfer, response))
 }
 
 pub async fn media_segment(
@@ -3042,30 +3638,30 @@ pub async fn media_segment(
     headers: HeaderMap,
     Path((id, generation, segment)): Path<(String, String, String)>,
 ) -> Result<Response, Problem> {
-    stream_owner(&app, &headers, &params, &id, &generation).await?;
+    let authority = stream_owner(&app, &headers, &params, &id, &generation).await?;
     let transfer = delivery::transfer(&app, &id);
-    if let Some(index) = segment
+    let response = if let Some(index) = segment
         .strip_prefix(&format!("{SUBTITLE_VARIANT}-"))
         .and_then(|s| s.strip_suffix(".vtt"))
     {
         let index: u32 = index.parse().map_err(|_| Problem::not_found())?;
-        return delivery::subtitle_segment(&app, &id, &generation, index)
-            .await
-            .map(|response| delivery::count(transfer, response))
-            .map_err(stream_problem);
-    }
-    if let Some(index) = segment
+        delivery::subtitle_segment(&app, &id, &generation, index).await
+    } else if let Some(index) = segment
         .strip_prefix(&format!("{LOW_VARIANT}-"))
         .and_then(|s| s.strip_suffix(".m4s"))
     {
         let index: u32 = index.parse().map_err(|_| Problem::not_found())?;
-        return delivery::low_segment(&app, &id, &generation, index)
-            .await
-            .map(|response| delivery::count(transfer, response))
-            .map_err(stream_problem);
-    }
-    delivery::segment(State(app), Path((id, generation, segment)))
+        delivery::low_segment(&app, &id, &generation, index).await
+    } else {
+        delivery::segment(
+            State(app.clone()),
+            Path((id.clone(), generation.clone(), segment)),
+        )
         .await
-        .map(|response| delivery::count(transfer, response))
-        .map_err(stream_problem)
+    }
+    .map_err(stream_problem)?;
+    let response = authority
+        .release(&app, &headers, &params, &id, &generation, response)
+        .await?;
+    Ok(delivery::count(transfer, response))
 }

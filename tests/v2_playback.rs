@@ -5,6 +5,10 @@
 //! crates/core/src/delivery.rs and crates/core/src/viewing.rs. These tests
 //! check that the adapter supplies the right observations, enforces the
 //! decisions and executes the effects (bytes, segments, durable progress).
+#[path = "support/media_fixtures.rs"]
+mod media_fixtures;
+use media_fixtures::align_fixture_audio_to_video;
+
 use axum::{
     body::Body,
     http::{HeaderMap, Request, StatusCode},
@@ -61,6 +65,7 @@ impl Server {
         processing.supervisor = env!("CARGO_BIN_EXE_playscale").into();
         let app = App {
             health: Arc::new(playscale::operations::Health::new(false)),
+            native_catalog: None,
             db,
             admin_token: Arc::new(OPERATOR.into()),
             origin: Arc::new("http://127.0.0.1:8787".into()),
@@ -1966,6 +1971,11 @@ async fn timeline_viewing_backfill_attributes_only_certain_progress() {
     use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
     let dir = tempfile::tempdir().unwrap();
     let pool = SqlitePoolOptions::new()
+        .after_connect(|connection, _| {
+            Box::pin(motion_catalog_backend::projection::configure_connection(
+                connection,
+            ))
+        })
         .max_connections(1)
         .connect_with(
             SqliteConnectOptions::new()
@@ -3054,6 +3064,7 @@ fn copyable_mkv(f: &Fixture, name: &str, level: &str) {
             "ac3",
         ],
     );
+    align_fixture_audio_to_video(&f.dir.path().join("media").join(name));
 }
 
 /// Streams of an init segment followed by one media segment.
@@ -5993,6 +6004,7 @@ async fn copied_manifests_declare_the_source_rate() {
             "aac",
         ],
     );
+    align_fixture_audio_to_video(&f.dir.path().join("media/noise.mkv"));
     f.scan().await;
     let (timeline, _) = f.timeline().await;
     let (_, auth) = f.device(&["default"], PLAYER).await;

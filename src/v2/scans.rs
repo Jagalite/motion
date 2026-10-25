@@ -13,6 +13,8 @@ use playscale_core::access::{self, Idempotent, Permission};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
+mod native;
+
 pub fn routes() -> Router<App> {
     Router::new()
         .route("/libraries/{id}/scans", post(create))
@@ -175,6 +177,9 @@ async fn create(
     headers: HeaderMap,
     body: Body<Input>,
 ) -> Result<Response, Problem> {
+    if app.native_catalog.is_some() {
+        return native::create(app, caller, id, headers, body).await;
+    }
     caller.require(Permission::SourcesManage)?;
     let key = idempotency_key(&headers)?;
     if let Some(ids) = &body.value.source_ids
@@ -248,6 +253,9 @@ async fn read(
     caller: Caller,
     Path(id): Path<String>,
 ) -> Result<Response, Problem> {
+    if app.native_catalog.is_some() {
+        return native::read(app, caller, id).await;
+    }
     caller.require(Permission::SourcesManage)?;
     let mut tx = app.db.begin().await?;
     visible(&mut tx, &caller.principal, &id).await?;
@@ -289,6 +297,9 @@ async fn list(
     caller: Caller,
     Query(query): Query<ListQuery>,
 ) -> Result<Response, Problem> {
+    if app.native_catalog.is_some() {
+        return native::list(app, caller, query).await;
+    }
     caller.require(Permission::SourcesManage)?;
     if query
         .library_id
@@ -388,6 +399,9 @@ async fn cancel(
     Path(id): Path<String>,
     headers: HeaderMap,
 ) -> Result<Response, Problem> {
+    if app.native_catalog.is_some() {
+        return native::cancel(app, caller, id, headers).await;
+    }
     caller.require(Permission::SourcesManage)?;
     let key = idempotency_key(&headers)?;
     let digest = super::sha256(b"");

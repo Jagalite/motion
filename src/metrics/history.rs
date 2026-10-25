@@ -166,6 +166,11 @@ pub async fn pool(app: &App) -> Result<SqlitePool, sqlx::Error> {
 /// than waiting behind application writes.
 async fn writer_pool(database: SqliteConnectOptions) -> Result<SqlitePool, sqlx::Error> {
     SqlitePoolOptions::new()
+        .after_connect(|connection, _| {
+            Box::pin(crate::catalog_backend::projection::configure_connection(
+                connection,
+            ))
+        })
         .max_connections(3)
         .min_connections(0)
         .acquire_timeout(Duration::from_millis(100))
@@ -515,19 +520,24 @@ async fn storage_worker(
             _ = stop.cancelled() => break,
             _ = tick.tick() => {},
         }
-        tokio::select! {
-            biased;
-            _ = stop.cancelled() => break,
-            result = storage_sample(&app,&pool,&run_id,&writes,&stop) => {
-                if result.is_err() { tracing::warn!(code="metrics_storage_sample_skipped", "Operational storage sample skipped"); }
-            }
+        // storage_sample retains an owned blocking filesystem operation. Do
+        // not select-drop it on cancellation: its walker observes stop and the
+        // actual JoinHandle must finish before this sampler can be joined.
+        if storage_sample(&app, &pool, &run_id, &writes, &stop)
+            .await
+            .is_err()
+        {
+            tracing::warn!(
+                code = "metrics_storage_sample_skipped",
+                "Operational storage sample skipped"
+            );
         }
     }
 }
 
 /// Spawned independently of the supervised application worker. Failure affects
 /// observation only. Initialization is retried without changing server health.
-pub async fn worker(app: App, stop: CancellationToken) {
+pub async fn worker(app: App, stop: CancellationToken) -> anyhow::Result<()> {
     let run_id = crate::new_id();
     let writes = Writes::default();
     let mut tick = tokio::time::interval(Duration::from_secs(INTERVAL_SECONDS));
@@ -552,7 +562,9 @@ pub async fn worker(app: App, stop: CancellationToken) {
         };
         if storage.as_ref().is_some_and(|task| task.is_finished()) {
             if let Some(task) = storage.take() {
-                let _ = task.await;
+                // A panic/abort may have detached blocking work. Preserve the
+                // failure rather than claiming a clean stopped-service join.
+                task.await?;
             }
             tracing::warn!(
                 code = "metrics_storage_worker_stopped",
@@ -598,8 +610,10 @@ pub async fn worker(app: App, stop: CancellationToken) {
         }
     }
     if let Some(task) = storage {
-        task.abort();
+        // stop is cancelled; retain and join its real blocking cleanup.
+        task.await?;
     }
+    Ok(())
 }
 
 #[cfg(test)]

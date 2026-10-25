@@ -180,3 +180,27 @@ the production `playscale_core::jobs::admit_retry` policy. A stale review
 is refused with 412 and a missing precondition with 428, and one review
 admits at most one retry. The Stateless model
 `playscale.jobs.reviewed_retry` explores that policy with the job reducer.
+
+## Bounded native preparation controls
+
+`processing.native_job_reads` stays a read-only capability. The separate
+`processing.native_preparation_controls` leaf must be implemented and enabled,
+with `contract_version=1`, `operations=cancel,retry` and
+`cohort=native_preparation`. Shared `JobActionAvailable` interprets the optional
+versioned `Job.controls` descriptor for new TUI offers; it does not recreate
+server admission from job phases or convert history into native authority.
+Only matching rendition rows with `cohort=true` and the specific action hint
+offer that action. Both wire action hints must be explicit booleans; a missing
+or null hint invalidates the whole descriptor. Duplicate controls feature
+entries are rejected. Missing/unknown descriptors and unsupported job kinds
+stay closed. Servers predating both leaves retain their existing behavior.
+
+The TUI rechecks before confirmation, hides per-row unavailable shortcuts and
+invalidates delayed reviews after withdrawal. Uncertain intents retain their
+key and original `If-Match` across hint, permission and capability changes;
+replay is offered again only when server support and permission return, without
+reviewing a newer revision. The explicit CLI remains server-authoritative and
+does not require capability reads before list/show, new commands or exact
+resubmission. All backend ownership, native admission and publication barriers
+still apply. Source tests cover these adapters; native runtime acceptance is a
+separate server qualification, not a claim made by these fixtures.

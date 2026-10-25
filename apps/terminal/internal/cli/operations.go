@@ -48,6 +48,9 @@ func jobsCmd(env *Env) *cobra.Command {
 	}}
 	// action resolves the intent before connecting: one key per invocation,
 	// or the recorded key of an earlier attempt whose outcome is unknown.
+	// Explicit CLI commands remain server-authoritative. In particular, a
+	// capability or NEW-request hint must not prevent exact keyed replay after
+	// an earlier request changed the job's phase. Reads need no broad feature.
 	action := func(kind operations.JobActionKind, job, key, ifMatch string) (operations.JobAction, error) {
 		if key != "" {
 			return operations.ResumeJobAction(kind, job, key, ifMatch)

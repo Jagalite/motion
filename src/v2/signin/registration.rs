@@ -338,6 +338,7 @@ pub(super) async fn complete(
         > 0;
     let default_valid = policy::default_grant_allowed(&registration.default.grant())
         && access_management::validate_grant(
+            app,
             tx,
             &registration.default.grant(),
             &registration.default.policy,
@@ -592,7 +593,8 @@ pub async fn replace_registration(
         "registration",
     )
     .await?;
-    access_management::validate_grant(&mut tx, &next.default.grant(), &next.default.policy).await?;
+    access_management::validate_grant(&app, &mut tx, &next.default.grant(), &next.default.policy)
+        .await?;
     let revision = if next != current {
         let revision = revision.checked_add(1).ok_or_else(unavailable)?;
         sqlx::query("UPDATE signin_settings SET registration_json=?,registration_revision=?,revision=revision+1")

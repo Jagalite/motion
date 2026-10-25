@@ -54,6 +54,68 @@ pub async fn serve(
     method: Method,
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
+    if app.native_catalog.is_some()
+        || sqlx::query_scalar::<_, bool>("SELECT EXISTS(SELECT 1 FROM catabolic_binding)")
+            .fetch_one(&app.db)
+            .await?
+    {
+        return Err(ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "native_authorization_required",
+            "Native bytes require a current authorized file-open fence",
+        ));
+    }
+    serve_inner(app, id, query, method, headers, None).await
+}
+
+/// The caller retains its authorization and native generation reservation until
+/// the blocking open has established an owned descriptor. Cancellation transfers
+/// custody to that blocking operation, never releases the fence early.
+pub(crate) async fn serve_authorized(
+    app: App,
+    id: String,
+    query: MediaQuery,
+    method: Method,
+    headers: HeaderMap,
+    mut fence: sqlx::Transaction<'static, sqlx::Sqlite>,
+    principal: &playscale_core::access::Principal,
+) -> Result<Response, ApiError> {
+    let convert = |p: crate::v2::Problem| ApiError::new(p.status, p.code, &p.detail);
+    if let Some(native) = &app.native_catalog {
+        native
+            .validate_projection(&mut fence)
+            .await
+            .map_err(ApiError::internal)?;
+    } else if crate::v2::playback::native_bound(&mut fence)
+        .await
+        .map_err(convert)?
+    {
+        return Err(ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "native_owner_unavailable",
+            "Native catalog ownership is not admitted",
+        ));
+    }
+    crate::v2::playback::require_native_scope(&mut fence, principal)
+        .await
+        .map_err(convert)?;
+    let facts = crate::v2::content::transport_file_facts(&mut fence, principal, &id)
+        .await
+        .map_err(convert)?;
+    playscale_core::access::admit_file_bytes(principal, facts.as_ref())
+        .map_err(crate::v2::Problem::from)
+        .map_err(convert)?;
+    serve_inner(app, id, query, method, headers, Some(fence)).await
+}
+
+async fn serve_inner(
+    app: App,
+    id: String,
+    query: MediaQuery,
+    method: Method,
+    headers: HeaderMap,
+    mut fence: Option<sqlx::Transaction<'static, sqlx::Sqlite>>,
+) -> Result<Response, ApiError> {
     // Acquire before the available-row observation, so GC cannot retire a file
     // between that observation and the real open/read. The body and blocking
     // closures share ownership even when their async waiter is cancelled.
@@ -62,10 +124,17 @@ pub async fn serve(
         .artifacts
         .pin([id.clone()])
         .ok_or_else(ApiError::not_found)?;
+    let mut ordinary;
+    let conn: &mut sqlx::SqliteConnection = if let Some(tx) = fence.as_mut() {
+        &mut *tx
+    } else {
+        ordinary = app.db.acquire().await?;
+        &mut ordinary
+    };
     let row =
         sqlx::query_as::<_, ItemRow>("SELECT * FROM catalog_files WHERE id=? AND available=1")
             .bind(&id)
-            .fetch_optional(&app.db)
+            .fetch_optional(&mut *conn)
             .await?
             .ok_or_else(ApiError::not_found)?;
     if query.revision.as_ref().is_some_and(|r| *r != row.revision) {
@@ -77,8 +146,43 @@ pub async fn serve(
     let (root, identity): (String, String) =
         sqlx::query_as("SELECT root,root_identity FROM libraries WHERE id=?")
             .bind(&row.library_id)
-            .fetch_one(&app.db)
+            .fetch_one(&mut *conn)
             .await?;
+    if app.native_catalog.is_some() {
+        let raw: String = sqlx::query_scalar(
+            "SELECT mapping_json FROM catabolic_projection_files WHERE file_id=? AND available=1",
+        )
+        .bind(&id)
+        .fetch_one(&mut *conn)
+        .await?;
+        let mapping: motion_catalog_backend::occurrence_bridge::OccurrenceMapping =
+            serde_json::from_str(&raw).map_err(ApiError::internal)?;
+        let source = mapping.source.clone();
+        app.native_catalog
+            .as_ref()
+            .ok_or_else(ApiError::not_found)?
+            .with_host(move |host| {
+                let observed = host.source_occurrences(&source.native_source)?;
+                anyhow::ensure!(
+                    observed["binding"] == source.native_binding
+                        && observed["policy"] == source.native_policy,
+                    "native source authority changed before file open"
+                );
+                Ok(())
+            })
+            .await
+            .map_err(ApiError::internal)?;
+        if mapping.source.library_id != row.library_id
+            || mapping.source.motion_root != root
+            || mapping.source.motion_root_identity != identity
+            || mapping.motion_file["id"].as_str() != Some(id.as_str())
+            || mapping.motion_file["relative_path"].as_str() != Some(row.relative_path.as_str())
+            || mapping.motion_file["fingerprint"].as_str() != Some(row.fingerprint.as_str())
+            || mapping.motion_file["revision"].as_str() != Some(row.revision.as_str())
+        {
+            return Err(ApiError::not_found());
+        }
+    }
     let permit = Arc::new((
         app.streams.clone().try_acquire_owned().map_err(|_| {
             ApiError::new(
@@ -90,7 +194,11 @@ pub async fn serve(
         artifact,
     ));
     let relative = row.relative_path.clone();
+    let expected = row.fingerprint.clone();
     let (file, meta) = admitted_io(permit.clone(), move || {
+        // This owned transaction remains in the OS task even when its waiter
+        // is cancelled. Drop only after open + full fingerprint verification.
+        let _fence = fence;
         let root_meta = std::fs::metadata(&root).map_err(|_| ApiError::not_found())?;
         if crate::db::root_identity(&root_meta) != identity {
             return Err(ApiError::conflict(
@@ -101,6 +209,12 @@ pub async fn serve(
         let file = open_file(std::path::Path::new(&root), std::path::Path::new(&relative))
             .map_err(|_| ApiError::not_found())?;
         let meta = file.metadata().map_err(ApiError::internal)?;
+        if fingerprint(&meta) != expected {
+            return Err(ApiError::conflict(
+                "source_revision_changed",
+                "Source changed; rescan the library",
+            ));
+        }
         Ok((file, meta))
     })
     .await
@@ -228,6 +342,69 @@ pub async fn serve(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn cancelled_file_open_keeps_native_writer_fence_until_descriptor_step_finishes() {
+        use sqlx::Connection;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fence.sqlite");
+        let pool = crate::db::connect(&path).await.unwrap();
+        let fence = pool.begin_with("BEGIN IMMEDIATE").await.unwrap();
+        let mut contender = sqlx::SqliteConnection::connect_with(
+            &sqlx::sqlite::SqliteConnectOptions::new()
+                .filename(&path)
+                .busy_timeout(std::time::Duration::ZERO),
+        )
+        .await
+        .unwrap();
+        let slots = Arc::new(tokio::sync::Semaphore::new(1));
+        let artifacts = Arc::new(crate::artifact_leases::Registry::default());
+        let permit = Arc::new((
+            slots.clone().try_acquire_owned().unwrap(),
+            artifacts.pin(["file".into()]).unwrap(),
+        ));
+        let (started, ready) = tokio::sync::oneshot::channel();
+        let (release, blocked) = std::sync::mpsc::channel();
+        let task = tokio::spawn(admitted_io(permit, move || {
+            let _fence = fence;
+            started.send(()).unwrap();
+            blocked.recv().unwrap();
+        }));
+        ready.await.unwrap();
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        let refused = sqlx::query("BEGIN IMMEDIATE")
+            .execute(&mut contender)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            refused.as_database_error().unwrap().code().as_deref(),
+            Some("5")
+        );
+        release.send(()).unwrap();
+        let _permit = tokio::time::timeout(std::time::Duration::from_secs(2), slots.acquire())
+            .await
+            .unwrap()
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                match sqlx::query("BEGIN IMMEDIATE").execute(&mut contender).await {
+                    Ok(_) => break,
+                    Err(e) => {
+                        assert_eq!(e.as_database_error().unwrap().code().as_deref(), Some("5"));
+                        tokio::task::yield_now().await;
+                    }
+                }
+            }
+        })
+        .await
+        .unwrap();
+        sqlx::query("ROLLBACK")
+            .execute(&mut contender)
+            .await
+            .unwrap();
+        pool.close().await;
+    }
 
     #[tokio::test]
     async fn cancelled_io_keeps_admission_until_blocking_operation_finishes() {

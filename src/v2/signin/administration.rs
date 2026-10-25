@@ -1199,7 +1199,19 @@ pub async fn email_activity(
         .bind(i64::from(limit) + 1)
         .fetch_all(&mut *tx)
         .await?;
-    let mut items: Vec<Value> = rows.iter().map(super::outbox::activity_value).collect();
+    let mut items: Vec<Value> = rows
+        .iter()
+        .map(|row| {
+            let mut value = super::outbox::activity_value(row);
+            // SMTP/remote diagnostic text is not a typed secret-free field.
+            // Native read admission reports only a stable presence marker,
+            // never raw historical network output or sealed outbox payloads.
+            if app.native_catalog.is_some() && !value["detail"].is_null() {
+                value["detail"] = json!("mail_delivery_detail_recorded");
+            }
+            value
+        })
+        .collect();
     let more = items.len() > limit as usize;
     items.truncate(limit as usize);
     let next = more

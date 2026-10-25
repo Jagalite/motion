@@ -926,3 +926,68 @@ async fn downloads_are_requested_and_cancelled_through_public_operations() {
     );
     assert!(subtitled.contains("Subtitle 2 · eng"));
 }
+
+#[tokio::test]
+async fn processing_mixes_native_actions_and_inert_history_without_kind_inference() {
+    let admin = app(Some(principal("everyone", ADMIN)), None);
+    let (status, _, html) = get_page(&admin, "/processing").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_strict_markup(&html);
+    assert!(html.contains(
+        r#"data-command="POST /api/v2/jobs/native-running/cancel" data-idempotent="true""#
+    ));
+    assert!(html.contains(r#"data-command="POST /api/v2/jobs/native-failed/retry" data-idempotent="true" data-if-match="&quot;r-8&quot;""#));
+    assert!(!html.contains("/api/v2/jobs/native-running/retry"));
+    assert!(!html.contains("/api/v2/jobs/native-failed/cancel"));
+    for id in [
+        "native-barrier",
+        "native-cancelling",
+        "historical-rendition",
+    ] {
+        assert!(html.contains(id));
+        assert!(!html.contains(&format!("/api/v2/jobs/{id}/cancel")), "{id}");
+        assert!(!html.contains(&format!("/api/v2/jobs/{id}/retry")), "{id}");
+        assert!(
+            html.contains(&format!(r#"data-job-control-recovery="{id}""#)),
+            "false new-action hints do not discard an uncertain exact request"
+        );
+    }
+    assert!(html.contains("Read-only job history"));
+    assert!(html.contains("Cancelling (not yet confirmed)"));
+    assert!(
+        !html.contains(r#"data-job-control-recovery="job3""#),
+        "legacy behavior stays separate"
+    );
+}
+
+#[tokio::test]
+async fn native_job_recovery_scope_survives_reload_but_not_identity_or_session_changes() {
+    fn scope(html: &str) -> &str {
+        html.split("data-job-control-scope=\"")
+            .nth(1)
+            .unwrap()
+            .split('"')
+            .next()
+            .unwrap()
+    }
+    let who = principal("everyone", ADMIN);
+    let admin = app(Some(who.clone()), None);
+    let (_, _, first) = get_page(&admin, "/processing").await;
+    let (_, _, second) = get_page(&admin, "/processing").await;
+    assert_eq!(scope(&first), scope(&second));
+    assert_eq!(scope(&first).len(), 64);
+    assert!(scope(&first).bytes().all(|b| b.is_ascii_hexdigit()));
+    for field in ["principal", "profile", "server", "restore", "session"] {
+        let mut changed = who.clone();
+        match field {
+            "principal" => changed.principal_id = "other-principal".into(),
+            "profile" => changed.profile_id = "other-profile".into(),
+            "server" => changed.server_epoch = "other-server".into(),
+            "restore" => changed.viewing_epoch = "server:other-restore".into(),
+            "session" => changed.csrf_token = "other-session-csrf".into(),
+            _ => unreachable!(),
+        }
+        let (_, _, html) = get_page(&app(Some(changed), None), "/processing").await;
+        assert_ne!(scope(&first), scope(&html), "{field}");
+    }
+}

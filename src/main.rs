@@ -1,3 +1,6 @@
+mod native_bootstrap;
+mod service_shutdown;
+use anyhow::Context;
 use clap::Parser;
 use playscale::{App, db, scan};
 use std::{io::Write, sync::Arc};
@@ -27,6 +30,9 @@ fn token(path: &std::path::Path) -> anyhow::Result<String> {
 }
 
 fn main() -> anyhow::Result<()> {
+    if let Some(code) = motion_catalog_backend::observer::dispatch_builtin_invocation() {
+        std::process::exit(code);
+    }
     if std::env::args_os().nth(1).as_deref()
         == Some(std::ffi::OsStr::new("--internal-ffmpeg-supervisor"))
     {
@@ -72,6 +78,12 @@ async fn run() -> anyhow::Result<()> {
         args.listen.ip().is_loopback(),
         "Playscale must bind to loopback; expose it through Tailscale Serve"
     );
+    if cli.native_schema_upgrade.is_some() {
+        anyhow::ensure!(
+            args.data_dir.is_dir(),
+            "offline native upgrade requires an existing data directory"
+        );
+    }
     tokio::fs::create_dir_all(&args.data_dir).await?;
     let lock = std::fs::OpenOptions::new()
         .create(true)
@@ -81,6 +93,54 @@ async fn run() -> anyhow::Result<()> {
         .open(args.data_dir.join("server.lock"))?;
     fs2::FileExt::try_lock_exclusive(&lock)
         .map_err(|_| anyhow::anyhow!("another server owns this data directory"))?;
+    playscale::native_service::require_complete_pair_install(
+        &args.data_dir,
+        &args
+            .catalog_path
+            .clone()
+            .unwrap_or_else(|| args.data_dir.join("catabolic.sqlite3")),
+        &lock,
+    )?;
+    if let Some(operation) = cli.native_schema_upgrade.as_deref() {
+        anyhow::ensure!(
+            cli.confirm_native_upgrade_quiescence,
+            "explicit offline native upgrade confirmation is required"
+        );
+        let motion = args.data_dir.join("playscale.sqlite3");
+        let native = args
+            .catalog_path
+            .clone()
+            .unwrap_or_else(|| args.data_dir.join("catabolic.sqlite3"));
+        anyhow::ensure!(
+            motion.is_file() && native.is_file(),
+            "offline upgrade never initializes missing catalogs"
+        );
+        // Only the reviewed sealed Motion control migrations run here. No
+        // bootstrap, listener, retained native session or background task starts.
+        let control = db::connect_catalog_control(&motion).await?;
+        control.close().await;
+        let operation = operation.to_owned();
+        let result = tokio::task::spawn_blocking(move || {
+            let _server_lock = lock;
+            let quiescence = catabolic_store::migration::NativeUpgradeQuiescence {
+                admission_stopped: true,
+                readers_and_workers_stopped: true,
+                exclusive_operational_ownership: true,
+            };
+            match operation.as_str() {
+                "prepare" => {
+                    motion_catalog_backend::native_upgrade::prepare(&motion, &native, quiescence)
+                }
+                "execute" => {
+                    motion_catalog_backend::native_upgrade::execute(&motion, &native, quiescence)
+                }
+                _ => anyhow::bail!("unknown offline native upgrade operation"),
+            }
+        })
+        .await??;
+        println!("{}", serde_json::to_string_pretty(&result)?);
+        return Ok(());
+    }
     let log = playscale::storage::RollingLog::new(
         args.data_dir.join("logs"),
         args.storage.log_bytes,
@@ -112,8 +172,48 @@ async fn run() -> anyhow::Result<()> {
         .expect("validated origin")
         .as_str()
         .to_owned();
-    let db = db::connect(&args.data_dir.join("playscale.sqlite3")).await?;
-    db::recover(&db).await?;
+    let motion_path = args.data_dir.join("playscale.sqlite3");
+    // Native is the default owner. Existing legacy databases require explicit
+    // offline migration; configuration removal can never restart legacy writers.
+    let path = args
+        .catalog_path
+        .clone()
+        .unwrap_or_else(|| args.data_dir.join("catabolic.sqlite3"));
+    anyhow::ensure!(
+        args.libraries.is_empty(),
+        "native catalog sources must be registered through native source APIs; legacy --library startup scanning is disabled"
+    );
+    let fresh_intent = native_bootstrap::prepare(&motion_path, &path).await?;
+    let db = if fresh_intent {
+        db::connect_native_bootstrap(&motion_path).await?
+    } else {
+        db::connect_catalog_control(&motion_path).await?
+    };
+    if fresh_intent {
+        bootstrap_empty_native(db.clone(), path.clone()).await?;
+    } else {
+        let native_bound: bool =
+            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM catabolic_binding)")
+                .fetch_one(&db)
+                .await?;
+        anyhow::ensure!(
+            native_bound,
+            "existing Motion data requires explicit offline Catabolic migration; legacy fallback is forbidden"
+        );
+        anyhow::ensure!(
+            path.try_exists()?,
+            "native catalog is missing; explicit native catalog configuration is required and legacy fallback is forbidden"
+        );
+    }
+    let native =
+        playscale::native_catalog::Runtime::open(db.clone(), path, args.catalog_profile.clone())
+            .await?;
+    // Only this executable owns the embedded helper dispatcher.
+    native
+        .register_observer(motion_catalog_backend::observer::packaged_current_executable()?)
+        .await?;
+    native.require_serving_routes().await?;
+    let native_catalog = Some(Arc::new(native));
     let token_path = args.data_dir.join("admin-token");
     let assets = args
         .demuxe_dir
@@ -126,6 +226,7 @@ async fn run() -> anyhow::Result<()> {
     let app = App {
         health: Arc::new(playscale::operations::Health::new(assets.is_some())),
         db,
+        native_catalog,
         admin_token: Arc::new(token(&token_path)?),
         origin: Arc::new(origin.clone()),
         authority: Arc::new(authority),
@@ -154,6 +255,9 @@ async fn run() -> anyhow::Result<()> {
     if let Some(fd) = cli.bootstrap_fd {
         app.access.set_bootstrap(&read_bootstrap(fd)?)?;
     }
+    // Native receipt recovery and projection ACK have already completed in
+    // Runtime::open. Adopt actual encoder witnesses before serving or claiming
+    // new work; native recovery never invokes legacy catalog publication.
     playscale::processing::recover(&app).await?;
     playscale::delivery::recover(&app).await?;
     if assets.is_none() {
@@ -161,84 +265,338 @@ async fn run() -> anyhow::Result<()> {
             "Demuxe assets absent; run scripts/install_demuxe.py before browser playback"
         );
     }
-    let router = playscale::api::router(app.clone(), assets);
+    let router = playscale::api::router(app.clone(), assets.clone());
     // Install the shutdown handlers before anything serves. Until a handler is
     // registered, SIGINT/SIGTERM still have their default action and would kill
     // a server that is already answering requests, skipping graceful shutdown.
     let shutdown_requested = shutdown_signal()?;
     let shutdown = CancellationToken::new();
+    if app.native_catalog.is_some() {
+        // Library-owned construction launches only the known real native roles;
+        // main cannot substitute caller-created successful task proofs.
+        let mut service = playscale::native_service::NativeService::start(
+            app.clone(),
+            assets,
+            listener,
+            ingress,
+            lock,
+            shutdown.clone(),
+        )?;
+        announce_started(&app, &cli, &origin, address, &token_path).await?;
+        let outcome: anyhow::Result<()> = tokio::select! {
+            result = shutdown_requested => result,
+            result = service.wait_for_exit() => result,
+        };
+        if let Err(error) = &outcome {
+            tracing::error!(error=%format!("{error:#}"), "native service owner stopped; beginning owned shutdown");
+        }
+        // This is normal shutdown only. No backup is automatically requested.
+        let stopped = service.stop().await?;
+        stopped.close().await?;
+        return outcome;
+    }
+    use service_shutdown::ownership::{Registry, Role};
+    let mut owner_registry = Registry::new(app.native_catalog.clone());
     // Observability failures never fail the job supervisor or HTTP server.
     let metrics_app = app.clone();
     let metrics_stop = shutdown.clone();
-    let mut metrics = tokio::spawn(async move {
-        let mut task = tokio::spawn(playscale::metrics::history::worker(
-            metrics_app,
-            metrics_stop.clone(),
-        ));
-        tokio::select! {
-            result = &mut task => {
-                if !metrics_stop.is_cancelled() {
-                    tracing::warn!(code = "metrics_worker_stopped", panicked = result.is_err(),
-                        "Operational metrics worker stopped");
-                }
-            }
-            _ = metrics_stop.cancelled() => {
-                if tokio::time::timeout(std::time::Duration::from_secs(1), &mut task).await.is_err() {
-                    task.abort();
-                }
-            }
-        }
-    });
+    let mut metrics = owner_registry.register(
+        Role::Metrics,
+        tokio::spawn(async move {
+            playscale::metrics::history::worker(metrics_app, metrics_stop).await
+        }),
+    )?;
     app.health
         .worker_running
         .store(true, std::sync::atomic::Ordering::Relaxed);
     let worker_app = app.clone();
     let worker_stop = shutdown.clone();
-    let mut worker = tokio::spawn(async move {
-        let result = tokio::try_join!(
-            scan::worker(worker_app.clone(), worker_stop.clone()),
-            playscale::processing::worker(worker_app.clone(), worker_stop.clone()),
-            playscale::v2::previews::worker(worker_app.clone(), worker_stop.clone()),
-            playscale::delivery::worker(worker_app.clone(), worker_stop.clone()),
-            playscale::maintenance::worker(worker_app.clone(), worker_stop.clone()),
-            playscale::storage::worker(worker_app.clone(), worker_stop.clone()),
-            playscale::watch::worker(worker_app.clone(), worker_stop.clone(), Default::default()),
-            playscale::v2::signin::mail_worker(worker_app.clone(), worker_stop.clone()),
-            playscale::scan::configure(worker_app.clone(), args.libraries, worker_stop)
-        )
-        .map(|_| ());
-        worker_app
-            .health
-            .worker_running
-            .store(false, std::sync::atomic::Ordering::Relaxed);
-        result
-    });
-    if let Some(socket) = ingress {
-        // Identity headers are trusted only on this listener.
+    let mut worker = owner_registry.register(
+        Role::Worker,
+        tokio::spawn(async move {
+            let result = if worker_app.native_catalog.is_some() {
+                // Legacy workers publish catalog rows, refresh FTS, or mutate scan
+                // state. They must not run against the sealed compatibility source.
+                // Motion retains delivery/auth and durable accepted-demand ownership.
+                // This worker uses only the retained native observation/publication
+                // pipeline; it never starts the legacy scanner or configure writer.
+                let (scan, processing, previews, delivery, mail) = tokio::join!(
+                    service_shutdown::cancel_on_error(worker_stop.clone(), async {
+                        playscale::native_scans::worker(worker_app.clone(), worker_stop.clone())
+                            .await
+                            .context("native scan coordinator")
+                    }),
+                    service_shutdown::cancel_on_error(worker_stop.clone(), async {
+                        playscale::processing::worker(worker_app.clone(), worker_stop.clone())
+                            .await
+                            .context("processing coordinator")
+                    }),
+                    service_shutdown::cancel_on_error(worker_stop.clone(), async {
+                        playscale::v2::previews::worker(worker_app.clone(), worker_stop.clone())
+                            .await
+                            .context("native preview coordinator")
+                    }),
+                    service_shutdown::cancel_on_error(worker_stop.clone(), async {
+                        playscale::delivery::worker(worker_app.clone(), worker_stop.clone())
+                            .await
+                            .context("delivery coordinator")
+                    }),
+                    service_shutdown::cancel_on_error(worker_stop.clone(), async {
+                        playscale::v2::signin::mail_worker(worker_app.clone(), worker_stop.clone())
+                            .await
+                            .context("sign-in mail coordinator")
+                    })
+                );
+                scan.and(processing).and(previews).and(delivery).and(mail)
+            } else {
+                tokio::try_join!(
+                    scan::worker(worker_app.clone(), worker_stop.clone()),
+                    playscale::processing::worker(worker_app.clone(), worker_stop.clone()),
+                    playscale::v2::previews::worker(worker_app.clone(), worker_stop.clone()),
+                    playscale::delivery::worker(worker_app.clone(), worker_stop.clone()),
+                    playscale::maintenance::worker(worker_app.clone(), worker_stop.clone()),
+                    playscale::storage::worker(worker_app.clone(), worker_stop.clone()),
+                    playscale::watch::worker(
+                        worker_app.clone(),
+                        worker_stop.clone(),
+                        Default::default()
+                    ),
+                    playscale::v2::signin::mail_worker(worker_app.clone(), worker_stop.clone()),
+                    playscale::scan::configure(worker_app.clone(), args.libraries, worker_stop)
+                )
+                .map(|_| ())
+            };
+            worker_app
+                .health
+                .worker_running
+                .store(false, std::sync::atomic::Ordering::Relaxed);
+            result
+        }),
+    )?;
+    let ingress_task = if let Some(socket) = ingress {
         let router = router
             .clone()
             .layer(axum::Extension(playscale::v2::auth::TrustedIngress));
         let stop = shutdown.clone();
-        tokio::spawn(async move {
-            if let Err(error) = axum::serve(socket, router)
+        Some(tokio::spawn(async move {
+            axum::serve(socket, router)
                 .with_graceful_shutdown(stop.cancelled_owned())
                 .await
-            {
-                tracing::error!(%error, "trusted ingress listener stopped");
-            }
-        });
-    }
+        }))
+    } else {
+        None
+    };
+    let mut ingress_task = owner_registry.ingress(ingress_task)?;
     let stop_http = shutdown.clone();
-    let mut http = tokio::spawn(async move {
-        // Peer addresses classify a playback client's network for monitoring
-        // (local, private or remote); they are not stored or exposed.
-        axum::serve(
-            listener,
-            router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
-        )
-        .with_graceful_shutdown(stop_http.cancelled_owned())
-        .await
-    });
+    let mut http = owner_registry.register(
+        Role::Http,
+        tokio::spawn(async move {
+            // Peer addresses classify a playback client's network for monitoring
+            // (local, private or remote); they are not stored or exposed.
+            axum::serve(
+                listener,
+                router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .with_graceful_shutdown(stop_http.cancelled_owned())
+            .await
+        }),
+    )?;
+    let required_owners = owner_registry.seal()?;
+    announce_started(&app, &cli, &origin, address, &token_path).await?;
+    let outcome: anyhow::Result<()> = tokio::select! {
+        result = shutdown_requested => result,
+        result = worker.wait() => {
+            let terminal=result;
+            let reason=terminal.as_ref().err().cloned().unwrap_or_else(||"worker stopped unexpectedly".into());
+            Err(anyhow::anyhow!(reason))
+        },
+        result = http.wait() => {
+            let terminal=result;
+            let reason=terminal.as_ref().err().cloned().unwrap_or_else(||"HTTP server stopped unexpectedly".into());
+            Err(anyhow::anyhow!(reason))
+        },
+    };
+    if let Err(error) = &outcome {
+        tracing::error!(error = %format!("{error:#}"), "server owner stopped; beginning retained shutdown");
+    }
+    app.health
+        .shutting_down
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    shutdown.cancel();
+    let grace = std::time::Duration::from_secs(if app.native_catalog.is_some() { 120 } else { 5 });
+    // Attempt all registered owners even if one fails. Each proof is emitted
+    // only by its owned handle's actual successful join, never is_finished.
+    let (worker_join, http_join, metrics_join, ingress_join) = tokio::join!(
+        worker.join(grace),
+        http.join(std::time::Duration::from_secs(5)),
+        metrics.join(std::time::Duration::from_secs(2)),
+        async {
+            match ingress_task.as_mut() {
+                Some(task) => task.join(std::time::Duration::from_secs(5)).await.map(Some),
+                None => Ok(None),
+            }
+        }
+    );
+    let mut joined = Vec::new();
+    let mut failure = None;
+    for result in [worker_join, http_join, metrics_join] {
+        match result {
+            Ok(proof) => joined.push(proof),
+            Err(error) => {
+                tracing::warn!(%error, "service owner did not stop cleanly");
+                failure = Some(error);
+            }
+        }
+    }
+    match ingress_join {
+        Ok(Some(proof)) => joined.push(proof),
+        Ok(None) => {}
+        Err(error) => {
+            tracing::warn!(%error, "trusted ingress did not stop cleanly");
+            failure = Some(error);
+        }
+    }
+    let joined_service = if failure.is_none() {
+        Some(required_owners.finish(joined)?)
+    } else {
+        None
+    };
+    if let Some(native) = &app.native_catalog {
+        if let Some(error) = failure {
+            return Err(error);
+        }
+        anyhow::ensure!(
+            joined_service
+                .as_ref()
+                .is_some_and(|proof| proof.belongs_to(native)),
+            "native startup owner proof mismatch"
+        );
+    }
+    // Motion owns renderer/supervisor cleanup independently of Catabolic's
+    // observation owner. Neither an elapsed timeout nor a returned worker is
+    // proof that an unjoined encoder or detached blocking copy has stopped.
+    let _native_io_custody = if app.native_catalog.is_some() {
+        Some(native_shutdown_custody(&app.processing)?)
+    } else {
+        None
+    };
+    if let Some(native) = &app.native_catalog {
+        if let Err(error) = native.shutdown().await {
+            tracing::error!(%error, "native catalog did not shut down cleanly");
+            app.db.close().await;
+            return Err(error);
+        }
+    }
+    app.db.close().await;
+    drop(lock);
+    outcome
+}
+
+/// Bootstrap requires the durable fresh-install intent created while both
+/// destinations were absent. Replay uses the same exact audited cutover intent.
+async fn bootstrap_empty_native(
+    db: sqlx::SqlitePool,
+    path: std::path::PathBuf,
+) -> anyhow::Result<()> {
+    let identity = motion_catalog_backend::inspect(path.clone())
+        .await?
+        .identity;
+    const IMPORT: &str = "motion.fresh.native.v1";
+    let imports: Vec<(String, String, String)> = sqlx::query_as(
+        "SELECT import_id,input_digest,snapshot_json FROM catabolic_import_snapshots",
+    )
+    .fetch_all(&db)
+    .await?;
+    anyhow::ensure!(
+        imports.len() <= 1,
+        "fresh bootstrap refuses unrelated import snapshots"
+    );
+    if let Some((id, digest, json)) = imports.first() {
+        let snapshot: motion_catalog_backend::migration::Snapshot = serde_json::from_str(json)?;
+        anyhow::ensure!(
+            id == IMPORT
+                && snapshot.manifest.import_id == IMPORT
+                && snapshot.manifest.contract_version == 3
+                && snapshot.batches.is_empty()
+                && snapshot.manifest.batches.is_empty()
+                && snapshot.validate()? == *digest,
+            "fresh bootstrap requires its exact retained empty import"
+        );
+    } else {
+        let catalog_rows: i64 = sqlx::query_scalar("SELECT (SELECT count(*) FROM items)+(SELECT count(*) FROM editions)+(SELECT count(*) FROM media_files)+(SELECT count(*) FROM libraries)+(SELECT count(*) FROM catalog_libraries)")
+            .fetch_one(&db).await?;
+        anyhow::ensure!(
+            catalog_rows == 0,
+            "fresh bootstrap refuses nonempty source data; use explicit migration"
+        );
+    }
+    let backend = motion_catalog_backend::NativeCatalog::bind(db.clone(), path, identity).await?;
+    let recorded: Option<(String, String)> =
+        sqlx::query_as("SELECT import_id,phase FROM catabolic_cutover WHERE singleton=1")
+            .fetch_optional(&db)
+            .await?;
+    anyhow::ensure!(
+        recorded.as_ref().is_none_or(|(id, _)| id == IMPORT),
+        "fresh bootstrap cannot resume another migration identity"
+    );
+    let phase = recorded.map(|(_, phase)| phase);
+    if phase.as_deref() == Some("activated") {
+        backend.reconcile_motion_cutover().await?;
+        return Ok(());
+    }
+    if phase.as_deref() == Some("validated") {
+        backend
+            .activate_motion_cutover(std::time::Duration::from_secs(30))
+            .await?;
+        return Ok(());
+    }
+    if motion_catalog_backend::source_freeze::admission(&db)
+        .await?
+        .is_none_or(|state| state.active_freeze().is_none())
+    {
+        backend.freeze_motion_source(IMPORT, 0).await?;
+    }
+    backend.capture_motion_import(IMPORT).await?;
+    backend.stage_import(IMPORT).await?;
+    backend.prepare_motion_cutover(IMPORT).await?;
+    backend
+        .activate_motion_cutover(std::time::Duration::from_secs(30))
+        .await?;
+    Ok(())
+}
+
+/// Read the bootstrap secret from an inherited descriptor and close it.
+#[cfg(unix)]
+fn read_bootstrap(fd: i32) -> anyhow::Result<String> {
+    use std::{io::Read, os::fd::FromRawFd};
+    anyhow::ensure!(
+        fd > 2,
+        "bootstrap descriptor must not be stdin/stdout/stderr"
+    );
+    // SAFETY: the launcher passes this descriptor to us for exclusive use;
+    // it is consumed and closed here exactly once.
+    let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
+    let mut secret = String::new();
+    Read::by_ref(&mut file)
+        .take(256)
+        .read_to_string(&mut secret)?;
+    Ok(secret.trim().to_owned())
+}
+
+#[cfg(not(unix))]
+fn read_bootstrap(_fd: i32) -> anyhow::Result<String> {
+    anyhow::bail!("bootstrap descriptors are supported on Unix only")
+}
+
+/// Independent Motion custody gate. A successful guard is retained through
+/// native shutdown; refusal must return before polling the native clean drain.
+async fn announce_started(
+    app: &App,
+    cli: &Args,
+    origin: &str,
+    address: std::net::SocketAddr,
+    token_path: &std::path::Path,
+) -> anyhow::Result<()> {
     if let Some(fd) = cli.ready_fd {
         let (server_id, _) = playscale::v2::system::server_identity(&app)
             .await
@@ -249,7 +607,7 @@ async fn run() -> anyhow::Result<()> {
                 protocol: 1,
                 server_id,
                 server_epoch: app.access.server_epoch.clone(),
-                origin: origin.clone(),
+                origin: origin.to_owned(),
                 version: env!("CARGO_PKG_VERSION"),
                 contract_digest: playscale::v2::system::contract_digest(),
             },
@@ -281,61 +639,33 @@ async fn run() -> anyhow::Result<()> {
             tracing::warn!(%error, "Could not open browser");
         }
     }
-    let outcome: anyhow::Result<()> = tokio::select! {
-        result = shutdown_requested => result,
-        result = &mut worker => match result { Ok(Ok(())) => Err(anyhow::anyhow!("scan worker stopped unexpectedly")), Ok(Err(e)) => Err(e), Err(e) => Err(e.into()) },
-        result = &mut http => match result { Ok(Ok(())) => Err(anyhow::anyhow!("HTTP server stopped unexpectedly")), Ok(Err(e)) => Err(e.into()), Err(e) => Err(e.into()) },
-    };
-    app.health
-        .shutting_down
-        .store(true, std::sync::atomic::Ordering::Relaxed);
-    shutdown.cancel();
-    if tokio::time::timeout(std::time::Duration::from_secs(2), &mut metrics)
-        .await
-        .is_err()
-    {
-        metrics.abort();
-    }
-    if !worker.is_finished()
-        && tokio::time::timeout(std::time::Duration::from_secs(5), &mut worker)
-            .await
-            .is_err()
-    {
-        worker.abort();
-    }
-    if !http.is_finished()
-        && tokio::time::timeout(std::time::Duration::from_secs(5), &mut http)
-            .await
-            .is_err()
-    {
-        http.abort();
-    }
-    app.db.close().await;
-    drop(lock);
-    outcome
+    Ok(())
 }
 
-/// Read the bootstrap secret from an inherited descriptor and close it.
-#[cfg(unix)]
-fn read_bootstrap(fd: i32) -> anyhow::Result<String> {
-    use std::{io::Read, os::fd::FromRawFd};
-    anyhow::ensure!(
-        fd > 2,
-        "bootstrap descriptor must not be stdin/stdout/stderr"
-    );
-    // SAFETY: the launcher passes this descriptor to us for exclusive use;
-    // it is consumed and closed here exactly once.
-    let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
-    let mut secret = String::new();
-    Read::by_ref(&mut file)
-        .take(256)
-        .read_to_string(&mut secret)?;
-    Ok(secret.trim().to_owned())
-}
-
-#[cfg(not(unix))]
-fn read_bootstrap(_fd: i32) -> anyhow::Result<String> {
-    anyhow::bail!("bootstrap descriptors are supported on Unix only")
+fn native_shutdown_custody(
+    processing: &playscale::processing::Runtime,
+) -> anyhow::Result<tokio::sync::OwnedSemaphorePermit> {
+    for (name, state) in [
+        ("execution", processing.execution.snapshot()),
+        ("hardware", processing.hardware.snapshot()),
+    ] {
+        anyhow::ensure!(
+            state.used == 0
+                && state.running == 0
+                && state.terminating == 0
+                && state.stuck.is_empty()
+                && state.waiting == 0,
+            "Motion {name} ownership remains unresolved; no clean native shutdown acknowledged"
+        );
+    }
+    let permit=processing.io.clone().try_acquire_owned().map_err(|_| {
+        anyhow::anyhow!("Motion blocking I/O ownership remains unresolved; no clean native shutdown acknowledged")
+    })?;
+    // The checks above are diagnostic only. These core transitions linearize
+    // terminal refusal of new reservations under each actual ledger mutex.
+    processing.execution.close_admission_if_idle()?;
+    processing.hardware.close_admission_if_idle()?;
+    Ok(permit)
 }
 
 /// Register for SIGINT and SIGTERM (Ctrl+C on Windows) now; the returned
@@ -366,6 +696,44 @@ fn shutdown_signal() -> anyhow::Result<impl std::future::Future<Output = anyhow:
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn fresh_native_bootstrap_reopens_without_legacy_ownership() {
+        let dir = tempfile::tempdir().unwrap();
+        let native = dir.path().join("catalog.sqlite3");
+        motion_catalog_backend::initialize(native.clone())
+            .await
+            .unwrap();
+        let db = playscale::db::connect(&dir.path().join("motion.sqlite3"))
+            .await
+            .unwrap();
+        super::bootstrap_empty_native(db.clone(), native.clone())
+            .await
+            .unwrap();
+        // A retained fresh intent replays acknowledgment, not a second import.
+        super::bootstrap_empty_native(db.clone(), native.clone())
+            .await
+            .unwrap();
+        let mut admission =
+            motion_catalog_backend::cutover::open_server(db.clone(), native, "default".into())
+                .await
+                .unwrap();
+        admission
+            .admission
+            .admitted_host()
+            .unwrap()
+            .close()
+            .unwrap();
+        assert!(
+            sqlx::query("INSERT INTO items(id,title,kind) VALUES('old','Old','video')")
+                .execute(&db)
+                .await
+                .is_err()
+        );
+        sqlx::query("UPDATE profiles SET name='Native profile' WHERE id='default'")
+            .execute(&db)
+            .await
+            .unwrap();
+    }
     #[test]
     fn blocked_io_does_not_prevent_runtime_shutdown() {
         let (started, wait_started) = std::sync::mpsc::channel();
@@ -408,5 +776,82 @@ mod tests {
                 .expect("shutdown not requested")
                 .unwrap();
         }
+    }
+}
+
+#[cfg(test)]
+mod native_shutdown_tests {
+    use super::native_shutdown_custody;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    // The callback is only a test observation of reaching the next statement,
+    // never a substitute native cleanup witness or a synthetic process exit.
+    fn attempt_drain(
+        processing: &playscale::processing::Runtime,
+        calls: &AtomicUsize,
+    ) -> anyhow::Result<()> {
+        let _custody = native_shutdown_custody(processing)?;
+        calls.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn outstanding_motion_io_prevents_native_clean_drain() {
+        let dir = tempfile::tempdir().unwrap();
+        let processing =
+            playscale::processing::Runtime::new(dir.path().join("generated"), Default::default());
+        let calls = AtomicUsize::new(0);
+        let live_copy = processing.io.clone().acquire_owned().await.unwrap();
+        assert!(
+            attempt_drain(&processing, &calls)
+                .unwrap_err()
+                .to_string()
+                .contains("I/O ownership")
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            processing.io.available_permits(),
+            0,
+            "refusal must not release someone else's I/O"
+        );
+        drop(live_copy);
+        attempt_drain(&processing, &calls).unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn outstanding_execution_or_hardware_owner_prevents_native_clean_drain() {
+        let dir = tempfile::tempdir().unwrap();
+        let processing =
+            playscale::processing::Runtime::new(dir.path().join("generated"), Default::default());
+        let calls = AtomicUsize::new(0);
+        for (label, coordinator) in [
+            ("execution", &processing.execution),
+            ("hardware", &processing.hardware),
+        ] {
+            let owner = coordinator
+                .reserve(
+                    format!("shutdown-test-{label}"),
+                    playscale_core::work::Class::Preparation,
+                    1,
+                )
+                .await
+                .unwrap();
+            assert!(
+                attempt_drain(&processing, &calls)
+                    .unwrap_err()
+                    .to_string()
+                    .contains(label)
+            );
+            assert_eq!(calls.load(Ordering::SeqCst), 0);
+            assert!(
+                coordinator.snapshot().used > 0,
+                "refusal must not release an actual owner"
+            );
+            drop(owner); // This reservation has not launched a child.
+            assert_eq!(coordinator.snapshot().used, 0);
+        }
+        attempt_drain(&processing, &calls).unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 }

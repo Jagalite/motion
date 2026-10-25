@@ -1992,3 +1992,135 @@ mod tests {
         }
     }
 }
+
+/// Private native software-HLS cohort. Transport authority and actual descriptor
+/// currentness are adapter observations; unsupported pin shapes never dispatch.
+pub fn native_whole_hls(pin: &Pin) -> bool {
+    pin.operation == Operation::VideoTranscode
+        && pin.clip.is_none()
+        && pin.parts.is_empty()
+        && pin.max_bitrate_bps.is_none()
+        && !pin.adaptive
+        && pin.tone_map.is_none()
+        && pin.tracks.len() == 3
+        && pin.tracks[0] == "video:0"
+        && pin.tracks[2] == "subtitle:none"
+        && pin.tracks[1]
+            .strip_prefix("audio:")
+            .is_some_and(|n| n == "none" || n.parse::<u32>().is_ok())
+}
+
+/// Bounded private cohort, not a movie-scale transcoding capability. These
+/// facts must come from the current native occurrence; adapters still prove
+/// descriptor identity, actual MP4 bytes and all authorization fences.
+pub fn native_hls_media_duration(seconds: Option<f64>, bytes: Option<i64>) -> Option<u64> {
+    let seconds = seconds?;
+    let bytes = bytes?;
+    if !seconds.is_finite()
+        || seconds <= 0.0
+        || seconds > 60.0
+        || !(1..=64 * 1024 * 1024).contains(&bytes)
+    {
+        return None;
+    }
+    let milliseconds = (seconds * 1000.0).round() as u64;
+    (milliseconds > 0).then_some(milliseconds)
+}
+
+/// Whole-file success requires a successful actual child exit (adapter fact)
+/// and complete bounded duration coverage. A size-limited/truncated stream is
+/// never represented as the whole source merely because it has an ENDLIST.
+pub fn native_hls_complete(remaining_ms: u64, segments: &[u64]) -> bool {
+    remaining_ms > 0
+        && remaining_ms <= 60_000
+        && !segments.is_empty()
+        && segments.len() <= 16
+        && segments
+            .iter()
+            .all(|duration| (1..=6_000).contains(duration))
+        && segments
+            .iter()
+            .try_fold(0u64, |sum, duration| sum.checked_add(*duration))
+            .is_some_and(|total| total.abs_diff(remaining_ms) <= 250)
+}
+
+#[cfg(test)]
+mod native_whole_hls_tests {
+    use super::*;
+    #[test]
+    fn short_whole_cohort_and_completion_bounds_are_explicit() {
+        assert_eq!(
+            native_hls_media_duration(Some(60.0), Some(64 * 1024 * 1024)),
+            Some(60_000)
+        );
+        for duration in [
+            None,
+            Some(0.0),
+            Some(-1.0),
+            Some(f64::NAN),
+            Some(f64::INFINITY),
+            Some(60.001),
+        ] {
+            assert_eq!(native_hls_media_duration(duration, Some(1)), None);
+        }
+        for bytes in [None, Some(0), Some(-1), Some(64 * 1024 * 1024 + 1)] {
+            assert_eq!(native_hls_media_duration(Some(1.0), bytes), None);
+        }
+        assert!(native_hls_complete(9_000, &[4_000, 4_000, 1_000]));
+        assert!(!native_hls_complete(9_000, &[4_000, 4_000]));
+        assert!(!native_hls_complete(9_000, &[9_000]));
+        assert!(!native_hls_complete(60_001, &[4_000; 15]));
+        assert!(!native_hls_complete(1, &[]));
+        assert!(!native_hls_complete(1, &[1; 17]));
+    }
+    #[test]
+    fn software_whole_only_no_accidental_variant_admission() {
+        let baseline = Pin {
+            source_file: "f".into(),
+            source_revision: "r".into(),
+            tracks: vec!["video:0".into(), "audio:0".into(), "subtitle:none".into()],
+            operation: Operation::VideoTranscode,
+            recipe_digest: None,
+            clip: None,
+            parts: vec![],
+            max_bitrate_bps: None,
+            adaptive: false,
+            tone_map: None,
+        };
+        assert!(native_whole_hls(&baseline));
+        let mut absent_audio = baseline.clone();
+        absent_audio.tracks[1] = "audio:none".into();
+        assert!(native_whole_hls(&absent_audio));
+        for operation in [
+            Operation::Original,
+            Operation::Remux,
+            Operation::AudioConvert,
+        ] {
+            let mut p = baseline.clone();
+            p.operation = operation;
+            assert!(!native_whole_hls(&p));
+        }
+        for track in [
+            "subtitle:0",
+            "subtitle-burn:0",
+            "subtitle-sidecar:x",
+            "subtitle-burn-text:0:1",
+        ] {
+            let mut p = baseline.clone();
+            p.tracks[2] = track.into();
+            assert!(!native_whole_hls(&p));
+        }
+        let mut p = baseline.clone();
+        p.clip = Some(crate::parts::Clip {
+            start_ms: 0,
+            end_ms: 100,
+        });
+        assert!(!native_whole_hls(&p));
+        let mut p = baseline.clone();
+        p.adaptive = true;
+        assert!(!native_whole_hls(&p));
+        let mut p = baseline;
+        p.max_bitrate_bps = Some(1000);
+        assert!(!native_whole_hls(&p));
+    }
+}

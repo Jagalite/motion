@@ -1,6 +1,9 @@
 package tui
 
-import "charm.land/bubbles/v2/key"
+import (
+	"charm.land/bubbles/v2/key"
+	"github.com/Jagalite/motion/apps/terminal/internal/operations"
+)
 
 type keyMap struct {
 	Up, Down, Left, Right key.Binding
@@ -76,12 +79,21 @@ func move(label string) key.Binding {
 	return key.NewBinding(key.WithKeys("up", "down", "left", "right"), key.WithHelp("←↑↓→", label))
 }
 
-// fullHelp is the help page: every shortcut, grouped.
-func fullHelp() [][]key.Binding {
+// fullHelp is the help page: supported shortcuts, grouped. Read-only job
+// observations do not advertise mutation shortcuts even away from Processing.
+func (m Model) fullHelp() [][]key.Binding {
+	actions := []key.Binding{keys.Shorter, keys.Longer, keys.Play, keys.Layout, keys.Choose, keys.Inspect}
+	if m.jobHelpAvailable(operations.CancelJob) {
+		actions = append(actions, keys.Cancel)
+	}
+	if m.jobHelpAvailable(operations.RetryJob) {
+		actions = append(actions, keys.Retry)
+	}
+	actions = append(actions, keys.History, keys.ClearFilter)
 	return [][]key.Binding{
 		{keys.Up, keys.Down, keys.Left, keys.Right, keys.PageUp, keys.PageDown, keys.Top, keys.Bottom},
 		{keys.Open, keys.Back, keys.Focus, keys.Search, keys.Refresh, keys.Help, keys.Quit},
-		{keys.Shorter, keys.Longer, keys.Play, keys.Layout, keys.Choose, keys.Inspect, keys.Cancel, keys.Retry, keys.History, keys.ClearFilter},
+		actions,
 		{keys.New, keys.Rename, keys.Delete, keys.NewLibrary, keys.Policy, keys.Assign, keys.Setup, keys.Pair, keys.Redeem, keys.SignOut},
 	}
 }

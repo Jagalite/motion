@@ -6,15 +6,17 @@
 //! adapter observes the facts those decisions need and commits each decided
 //! change in one SQLite write transaction. Transfer, verification, local
 //! publication and removal belong to the device.
+pub(crate) mod native_subtitles;
+
 use super::{
     Body, PageQuery, Problem, Scope,
     auth::Caller,
     content::file_facts,
     idempotency_key, page,
-    playback::{readable_timeline, usable_profile},
+    playback::{begin_catalog_application, readable_timeline, usable_profile},
     viewing,
 };
-use crate::{App, db::begin_write, new_id, now};
+use crate::{App, new_id, now};
 use axum::{
     Json, Router,
     extract::{Path, Query, State},
@@ -169,6 +171,43 @@ async fn owned(
     Ok(row)
 }
 
+/// Native prepared downloads use the exact receipt-qualified whole-output
+/// transport, but retain download-specific original-currentness and pin rules.
+async fn download_version_ready(
+    conn: &mut SqliteConnection,
+    principal: &Principal,
+    version: &str,
+    timeline: &str,
+    file: &str,
+    revision: &str,
+) -> Result<bool, Problem> {
+    if !super::playback::native_bound(conn).await? {
+        return Ok(true);
+    }
+    let generated: bool =
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM media_files WHERE id=? AND generated=1)")
+            .bind(file)
+            .fetch_one(&mut *conn)
+            .await?;
+    if !generated {
+        return super::playback::native_version_ready(conn, version).await;
+    }
+    let jobs: Vec<String> = sqlx::query_scalar("SELECT external_id FROM renditions WHERE source='playscale' AND file_id=? AND file_revision=? LIMIT 2")
+        .bind(file).bind(revision).fetch_all(&mut *conn).await?;
+    let [job] = jobs.as_slice() else {
+        return Ok(false);
+    };
+    if !crate::native_processing::validate_prepared_rendition_in(
+        conn, job, file, revision, version, timeline,
+    )
+    .await
+    .map_err(Problem::internal)?
+    {
+        return Ok(false);
+    }
+    super::content::transport_version_ready(conn, principal, version).await
+}
+
 /// Current facts about the pinned source, observed for the core state.
 async fn observe(
     conn: &mut SqliteConnection,
@@ -203,7 +242,16 @@ async fn observe(
     .fetch_optional(&mut *conn)
     .await?;
     let ready = super::processing::output_rendition_status(conn, &row.file_id).await?;
-    let bound = bound.filter(|_| {
+    let native_ready = download_version_ready(
+        conn,
+        principal,
+        &row.version_id,
+        &row.timeline_id,
+        &row.file_id,
+        &row.file_revision,
+    )
+    .await?;
+    let bound = bound.filter(|_| native_ready).filter(|_| {
         rendition.as_ref().is_none_or(
             |(available, revision, registered, source, registered_source)| {
                 playscale_core::renditions::available(
@@ -216,7 +264,7 @@ async fn observe(
             },
         )
     });
-    let facts = file_facts(conn, &row.file_id).await?;
+    let facts = super::content::transport_file_facts(conn, principal, &row.file_id).await?;
     let readable = match readable_timeline(conn, principal, &row.timeline_id).await {
         Ok(_) => access::admit_file_bytes(principal, facts.as_ref()).is_ok(),
         Err(p) if p.status == StatusCode::NOT_FOUND => false,
@@ -459,6 +507,9 @@ async fn candidates(
             seconds,
         ) in rows
         {
+            if !super::playback::native_version_ready(conn, &version).await? {
+                continue;
+            }
             let facts = file_facts(conn, &file).await?;
             let subtitles = text_subtitles(conn, &file).await?;
             let duration_ms = timeline_duration
@@ -516,6 +567,19 @@ async fn prepared_candidates(
     tracks: &TrackInput,
     request: &Request,
 ) -> Result<Vec<Candidate>, Problem> {
+    let native = super::playback::native_bound(conn).await?;
+    if native
+        && (tracks.audio_component_id.is_some()
+            || tracks.subtitle_component_id.is_some()
+            || tracks.subtitle_track_id.is_some()
+            || !matches!(tracks.subtitle_policy, SubtitlePolicy::Off))
+    {
+        return Err(Problem::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "native_download_selection_unavailable",
+            "Prepared native downloads currently require explicit subtitle-off and revision-local audio selection",
+        ));
+    }
     type Row = (
         String,
         String,
@@ -659,7 +723,12 @@ async fn prepared_candidates(
                 }
                 None => false,
             };
-            let facts = file_facts(conn, &file).await?;
+            if !download_version_ready(conn, principal, &version, timeline, &file, &revision)
+                .await?
+            {
+                continue;
+            }
+            let facts = super::content::transport_file_facts(conn, principal, &file).await?;
             let subtitles = text_subtitles(conn, &file).await?;
             let candidate = Candidate {
                 version_id: version,
@@ -699,16 +768,31 @@ async fn prepared_candidates(
     Ok(found)
 }
 
-pub async fn create(
-    State(app): State<App>,
-    caller: Caller,
-    headers: HeaderMap,
+struct PreparedCreate {
+    tx: sqlx::Transaction<'static, sqlx::Sqlite>,
+    principal: Principal,
+    device: String,
+    key: String,
+    digest: String,
+    input: DownloadInput,
+    timeline_revision: i64,
+    timeline_duration: Option<i64>,
+}
+enum CreatePreparation {
+    Replay(Response),
+    New(PreparedCreate),
+}
+
+async fn prepare_create(
+    app: &App,
+    caller: &Caller,
+    headers: &HeaderMap,
     body: Body<DownloadInput>,
-) -> Result<Response, Problem> {
+) -> Result<CreatePreparation, Problem> {
     caller.require(Permission::DownloadsManage)?;
     let key = idempotency_key(&headers)?;
     let input = body.value;
-    let mut tx = begin_write(&app.db).await?;
+    let mut tx = begin_catalog_application(&app, true).await?;
     let principal = caller
         .reauthorize(&mut tx, Some(Permission::DownloadsManage))
         .await?;
@@ -736,7 +820,7 @@ pub async fn create(
         response
             .headers_mut()
             .insert("idempotent-replayed", HeaderValue::from_static("true"));
-        return Ok(response);
+        return Ok(CreatePreparation::Replay(response));
     }
     usable_profile(&mut tx, &principal, &input.profile_id).await?;
     readable_timeline(&mut tx, &principal, &input.timeline_id).await?;
@@ -745,6 +829,84 @@ pub async fn create(
             .bind(&input.timeline_id)
             .fetch_one(&mut *tx)
             .await?;
+    Ok(CreatePreparation::New(PreparedCreate {
+        tx,
+        principal,
+        device,
+        key,
+        digest: body.digest,
+        input,
+        timeline_revision,
+        timeline_duration,
+    }))
+}
+
+pub async fn create(
+    State(app): State<App>,
+    caller: Caller,
+    headers: HeaderMap,
+    body: Body<DownloadInput>,
+) -> Result<Response, Problem> {
+    let mut prepared = match prepare_create(&app, &caller, &headers, body).await? {
+        CreatePreparation::Replay(response) => return Ok(response),
+        CreatePreparation::New(prepared) => prepared,
+    };
+    let input = &prepared.input;
+    // A native original's bytes may contain subtitle streams, but pinning a
+    // separate WebVTT artifact still needs its own retained extraction owner.
+    // Refuse explicit track selection before any demand or receipt is created;
+    // do not advertise a ready pin whose manifest can only refuse later.
+    if input.recipe_id.is_none()
+        && input.tracks.subtitle_track_id.is_some()
+        && matches!(input.tracks.subtitle_policy, SubtitlePolicy::Require)
+        && super::playback::native_bound(&mut prepared.tx).await?
+    {
+        return Err(Problem::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "native_download_selection_unavailable",
+            "Native original subtitle extraction is not yet qualified; request the original without a subtitle selection",
+        ));
+    }
+    commit_create(&app, prepared).await
+}
+
+/// Private candidate entry for the exact original text owner. It uses the
+/// ordinary preparation/replay/core choice/commit, never synthetic pin rows.
+/// Public selection remains refused until cache/manifest qualification.
+pub(crate) async fn admit_native_original_text(
+    app: &App,
+    caller: &Caller,
+    headers: &HeaderMap,
+    body: Body<DownloadInput>,
+) -> Result<Response, Problem> {
+    caller.require(Permission::DownloadsManage)?;
+    if app.native_catalog.is_none()
+        || body.value.recipe_id.is_some()
+        || body.value.tracks.subtitle_track_id.is_none()
+        || !matches!(body.value.tracks.subtitle_policy, SubtitlePolicy::Require)
+    {
+        return Err(Problem::invalid(
+            "download_subtitle_unavailable",
+            "This private owner admits only an exact native original text selection",
+        ));
+    }
+    match prepare_create(app, caller, headers, body).await? {
+        CreatePreparation::Replay(response) => Ok(response),
+        CreatePreparation::New(prepared) => commit_create(app, prepared).await,
+    }
+}
+
+async fn commit_create(app: &App, prepared: PreparedCreate) -> Result<Response, Problem> {
+    let PreparedCreate {
+        mut tx,
+        principal,
+        device,
+        key,
+        digest,
+        input,
+        timeline_revision,
+        timeline_duration,
+    } = prepared;
     let request = Request {
         version_id: input.version_id.clone(),
         recipe_id: input.recipe_id.clone(),
@@ -817,6 +979,28 @@ pub async fn create(
         &found,
         usize::try_from(active).unwrap_or(usize::MAX),
     )?;
+    if let Some(track) = &choice.subtitle_track_id
+        && super::playback::native_bound(&mut tx).await?
+    {
+        let subtitle = track
+            .strip_prefix('s')
+            .and_then(|v| v.parse::<u32>().ok())
+            .ok_or_else(|| Problem::internal("invalid chosen subtitle track"))?;
+        crate::delivery::native_subtitles::validate_selection_in(
+            app,
+            &mut tx,
+            &principal,
+            &crate::delivery::native_subtitles::Selection {
+                profile: input.profile_id.clone(),
+                timeline: input.timeline_id.clone(),
+                version: choice.version_id.clone(),
+                file: choice.file_id.clone(),
+                revision: choice.file_revision.clone(),
+                subtitle,
+            },
+        )
+        .await?;
+    }
     let at = now();
     let row = Row {
         id: new_id(),
@@ -858,14 +1042,14 @@ pub async fn create(
     .execute(&mut *tx)
     .await?;
     let ack = download_json(&row, core::State::Ready);
+    let scope = Scope {
+        principal: &principal.id,
+        operation: "createDownload",
+        target: &device,
+        key: &key,
+    };
     scope
-        .save(
-            &mut tx,
-            &body.digest,
-            StatusCode::ACCEPTED,
-            Some(&ack),
-            None,
-        )
+        .save(&mut tx, &digest, StatusCode::ACCEPTED, Some(&ack), None)
         .await?;
     tx.commit().await?;
     Ok(tagged(StatusCode::ACCEPTED, ack, row.revision))
@@ -891,7 +1075,9 @@ pub async fn list(
     Query(q): Query<DownloadQuery>,
 ) -> Result<Response, Problem> {
     caller.require(Permission::DownloadsManage)?;
-    let device = device(&caller.principal, None)?;
+    // Preserve ingress error precedence, then derive the query identity again
+    // from fresh authorization under the retained application writer below.
+    device(&caller.principal, None)?;
     let pagination = PageQuery {
         cursor: q.cursor,
         limit: q.limit,
@@ -902,16 +1088,20 @@ pub async fn list(
     } else {
         ""
     };
-    let mut tx = app.db.begin().await?;
-    let profiles: Vec<&String> = caller.principal.grant.profile_ids.iter().collect();
+    let mut tx = begin_catalog_application(&app, false).await?;
+    let principal = caller
+        .reauthorize(&mut tx, Some(Permission::DownloadsManage))
+        .await?;
+    let device = device(&principal, None)?;
+    let profiles: Vec<&String> = principal.grant.profile_ids.iter().collect();
     let rows: Vec<Row> = sqlx::query_as(&format!(
         "SELECT {COLUMNS} FROM downloads WHERE device_id=? AND principal_id=? AND id>?{active} \
          AND (? OR profile_id IN (SELECT value FROM json_each(?))) ORDER BY id LIMIT ?"
     ))
     .bind(&device)
-    .bind(&caller.principal.id)
+    .bind(&principal.id)
     .bind(pagination.after()?)
-    .bind(caller.principal.is_admin())
+    .bind(principal.is_admin())
     .bind(serde_json::to_string(&profiles).map_err(Problem::internal)?)
     .bind(i64::from(limit) + 1)
     .fetch_all(&mut *tx)
@@ -920,10 +1110,10 @@ pub async fn list(
     for row in &rows {
         items.push((
             row.id.clone(),
-            current_json(&mut tx, &caller.principal, row).await?,
+            current_json(&mut tx, &principal, row).await?,
         ));
     }
-    let body = page(&mut tx, &caller.principal, items, limit).await?;
+    let body = page(&mut tx, &principal, items, limit).await?;
     tx.commit().await?;
     Ok(Json(body).into_response())
 }
@@ -934,9 +1124,12 @@ pub async fn read(
     Path(id): Path<String>,
 ) -> Result<Response, Problem> {
     caller.require(Permission::DownloadsManage)?;
-    let mut tx = app.db.begin().await?;
-    let row = owned(&mut tx, &caller.principal, &id).await?;
-    let body = current_json(&mut tx, &caller.principal, &row).await?;
+    let mut tx = begin_catalog_application(&app, false).await?;
+    let principal = caller
+        .reauthorize(&mut tx, Some(Permission::DownloadsManage))
+        .await?;
+    let row = owned(&mut tx, &principal, &id).await?;
+    let body = current_json(&mut tx, &principal, &row).await?;
     tx.commit().await?;
     Ok(tagged(StatusCode::OK, body, row.revision))
 }
@@ -949,7 +1142,7 @@ pub async fn cancel(
     Path(id): Path<String>,
 ) -> Result<Response, Problem> {
     caller.require(Permission::DownloadsManage)?;
-    let mut tx = begin_write(&app.db).await?;
+    let mut tx = begin_catalog_application(&app, true).await?;
     let principal = caller
         .reauthorize(&mut tx, Some(Permission::DownloadsManage))
         .await?;
@@ -1069,6 +1262,19 @@ async fn active(app: &App, download_id: &str) -> bool {
 /// active demand (cancelled or gone), each under its lock. Best effort: a
 /// leftover is removed by a later call.
 pub(crate) async fn release_subtitles(app: App) {
+    if app.native_catalog.is_some() {
+        // Native artifacts require exact identity-safe cleanup, not a
+        // path-based unlink after checking a download state. Until that owner
+        // exists, retain files and account their space at new publication.
+        return;
+    }
+    let Ok(mut conn) = app.db.acquire().await else {
+        return;
+    };
+    if !matches!(super::playback::native_bound(&mut conn).await, Ok(false)) {
+        return;
+    }
+    drop(conn);
     let directory = subtitles_path(&app, "x");
     let Some(directory) = directory.parent() else {
         return;
@@ -1122,7 +1328,9 @@ async fn record_subtitle(
     bytes: Option<&[u8]>,
 ) -> Result<(), crate::api::ApiError> {
     use sha2::Digest;
-    let mut tx = crate::db::begin_write(&app.db).await?;
+    let mut tx = begin_catalog_application(app, true)
+        .await
+        .map_err(|p| crate::api::ApiError::new(p.status, p.code, &p.detail))?;
     let active: bool =
         sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM downloads WHERE id=? AND state='ready')")
             .bind(id)
@@ -1351,9 +1559,12 @@ async fn subtitles(
 ) -> Result<Response, Problem> {
     caller.require(Permission::DownloadsManage)?;
     let permit = subtitle_read_slot()?;
-    let mut tx = app.db.begin().await?;
-    let row = owned(&mut tx, &caller.principal, &id).await?;
-    let current = observe(&mut tx, &caller.principal, &row).await?;
+    let mut tx = begin_catalog_application(&app, false).await?;
+    let principal = caller
+        .reauthorize(&mut tx, Some(Permission::DownloadsManage))
+        .await?;
+    let row = owned(&mut tx, &principal, &id).await?;
+    let current = observe(&mut tx, &principal, &row).await?;
     tx.commit().await?;
     if !core::transferable(core::state(row.stored(), &row.pin(), &current)) {
         return Err(Problem::new(
@@ -1431,7 +1642,7 @@ pub async fn report_transfer(
             "sequence, download_revision and bytes_received must not exceed 9223372036854775807",
         ));
     }
-    let mut tx = begin_write(&app.db).await?;
+    let mut tx = begin_catalog_application(&app, true).await?;
     let principal = caller
         .reauthorize(&mut tx, Some(Permission::DownloadsManage))
         .await?;
@@ -1543,6 +1754,74 @@ fn extension(content_type: &str) -> &'static str {
     }
 }
 
+/// Media-only native body shared by the public subtitle-off manifest and the
+/// private exact-text owner. Caller retains current authorization/native writer
+/// and has already verified the exact pin; optional legacy enrichments stay out.
+async fn native_manifest_body(conn: &mut SqliteConnection, row: &Row) -> Result<Value, Problem> {
+    let item: String = sqlx::query_scalar(
+        "SELECT e.item_id FROM timelines t JOIN editions e ON e.id=t.edition_id WHERE t.id=?",
+    )
+    .bind(&row.timeline_id)
+    .fetch_one(&mut *conn)
+    .await?;
+    let view = viewing::load_view(&mut *conn, &row.profile_id, &row.timeline_id).await?;
+    // Read in the same snapshot as the base, so the pair names one history.
+    let (server_id, restore_epoch): (String, String) =
+        sqlx::query_as("SELECT server_id,restore_epoch FROM server_identity WHERE singleton=1")
+            .fetch_one(&mut *conn)
+            .await?;
+    // The viewing base as it was restored, when this history began with a
+    // restore whose baseline was captured; unknown otherwise.
+    let captured: Option<String> = sqlx::query_scalar(
+        "SELECT restore_epoch FROM restore_baseline_epoch WHERE singleton=1 AND captured=1",
+    )
+    .fetch_optional(&mut *conn)
+    .await?;
+    let restored = if captured.as_deref() == Some(restore_epoch.as_str()) {
+        let row: Option<(i64, i64)> = sqlx::query_as(
+            "SELECT revision,manual_epoch FROM restore_baselines WHERE profile_id=? AND timeline_id=?",
+        )
+        .bind(&row.profile_id)
+        .bind(&row.timeline_id)
+        .fetch_optional(&mut *conn)
+        .await?;
+        Some(row.unwrap_or((0, 0)))
+    } else {
+        None
+    };
+    let native_title: Option<String> = sqlx::query_scalar(
+        "SELECT json_extract(i.metadata_json,'$.metadata.title') FROM catabolic_projection_items i \
+         JOIN catabolic_projection_state s ON s.singleton=1 AND s.generation=i.generation \
+         WHERE i.native_id=? AND json_type(i.metadata_json,'$.retirement')='null' \
+         AND json_extract(i.metadata_json,'$.metadata.motion_catalog.contract_version')=1 \
+         AND json_extract(i.metadata_json,'$.metadata.motion_catalog.item_id')=i.native_id \
+         AND json_type(i.metadata_json,'$.metadata.title')='text'",
+    )
+    .bind(&item)
+    .fetch_optional(&mut *conn)
+    .await?;
+    let native_title = native_title.ok_or_else(|| {
+        Problem::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "native_manifest_unavailable",
+            "Current native title definition is unavailable",
+        )
+    })?;
+    let body = json!({
+        "download_id": row.id, "download_revision": row.revision.to_string(),
+        "timeline_id": row.timeline_id, "timeline_revision": row.timeline_revision.to_string(),
+        "title": native_title, "duration_ms": row.duration_ms,
+        "files": [{"asset_id":row.file_id,"relative_name":format!("media.{}",extension(&row.content_type)),
+            "digest":format!("sha256:{}",row.file_revision),"size_bytes":row.size_bytes.to_string(),
+            "media_url":media_url(&row.file_id,&row.file_revision),"role":"media"}],
+        "viewing_revision":view.revision.to_string(),"manual_epoch":view.manual_epoch.to_string(),
+        "viewing_epoch":format!("{server_id}:{restore_epoch}"),
+        "restored_viewing_revision":restored.map(|(r,_)|r.to_string()),
+        "restored_manual_epoch":restored.map(|(_,e)|e.to_string()),
+    });
+    Ok(body)
+}
+
 /// Exact files, checksums and the viewing base the device pins its offline
 /// events to. Read again after reconciling to rebase later offline events.
 pub async fn manifest(
@@ -1552,9 +1831,12 @@ pub async fn manifest(
 ) -> Result<Response, Problem> {
     caller.require(Permission::DownloadsManage)?;
     let _subtitle_read = subtitle_read_slot()?;
-    let mut tx = app.db.begin().await?;
-    let row = owned(&mut tx, &caller.principal, &id).await?;
-    let current = observe(&mut tx, &caller.principal, &row).await?;
+    let mut tx = begin_catalog_application(&app, false).await?;
+    let principal = caller
+        .reauthorize(&mut tx, Some(Permission::DownloadsManage))
+        .await?;
+    let row = owned(&mut tx, &principal, &id).await?;
+    let current = observe(&mut tx, &principal, &row).await?;
     match core::state(row.stored(), &row.pin(), &current) {
         core::State::Ready => {}
         core::State::Cancelled => {
@@ -1581,12 +1863,6 @@ pub async fn manifest(
     // The title's descriptive metadata, as the catalog resolves it, bounded
     // for the device (`offline::offline_metadata`); carried in the manifest
     // itself, so the manifest pins it.
-    let metadata = crate::metadata::documents(&mut tx, &item)
-        .await
-        .map_err(Problem::internal)?;
-    let metadata = playscale_core::offline::offline_metadata(
-        &playscale_core::metadata::resolve(&metadata.docs).values,
-    );
     let view = viewing::load_view(&mut tx, &row.profile_id, &row.timeline_id).await?;
     // Read in the same snapshot as the base, so the pair names one history.
     let (server_id, restore_epoch): (String, String) =
@@ -1612,6 +1888,28 @@ pub async fn manifest(
     } else {
         None
     };
+    if super::playback::native_bound(&mut tx).await? {
+        // Native original/prepared media manifests cannot consume retained
+        // legacy metadata documents, artwork or subtitle publication. Metadata
+        // and artwork are optional in the offline contract; omit unsupported
+        // optional enrichment, never pretend the old source rows are current.
+        if row.subtitle_track_id.is_some() {
+            return Err(Problem::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "native_manifest_unavailable",
+                "Native subtitle manifests are not qualified",
+            ));
+        }
+        let body = native_manifest_body(&mut tx, &row).await?;
+        tx.commit().await?;
+        return Ok(tagged(StatusCode::OK, body, row.revision));
+    }
+    let metadata = crate::metadata::documents(&mut tx, &item)
+        .await
+        .map_err(Problem::internal)?;
+    let metadata = playscale_core::offline::offline_metadata(
+        &playscale_core::metadata::resolve(&metadata.docs).values,
+    );
     // The title's selected poster travels with the download, pinned by its
     // content digest (an artwork asset's ID is its SHA-256); only one the
     // device can fetch (an asset of the title, as asset content requires).
@@ -1640,7 +1938,7 @@ pub async fn manifest(
     };
     // Conversion may have awaited external work; reauthorize all state before
     // returning names, metadata or artifact grants from the earlier snapshot.
-    let mut current_tx = app.db.begin().await?;
+    let mut current_tx = begin_catalog_application(&app, false).await?;
     let principal = caller
         .reauthorize(&mut current_tx, Some(Permission::DownloadsManage))
         .await?;
@@ -1917,17 +2215,44 @@ async fn target(
     device: &str,
     profile: &str,
     event: &OfflineEvent,
+    reader: Option<&mut crate::native_catalog::timeline_visibility::Reader>,
 ) -> Result<Option<Target>, Problem> {
-    match readable_timeline(conn, principal, &event.timeline_id).await {
-        Ok(_) => {}
-        Err(p) if p.status == StatusCode::NOT_FOUND => return Ok(None),
-        Err(p) => return Err(p),
-    }
-    let (revision, duration): (i64, Option<i64>) =
+    let (revision, duration): (i64, Option<i64>) = if let Some(reader) = reader {
+        // Historical reconciliation requires current descriptive ownership and
+        // scope, not playable bytes or an unexpired transfer demand.
+        let Some(body) = reader
+            .timeline_body(conn, &event.timeline_id)
+            .await
+            .map_err(super::catalog::native_read_error)?
+        else {
+            return Ok(None);
+        };
+        let revision = body["revision"]
+            .as_str()
+            .and_then(|v| v.parse::<i64>().ok())
+            .filter(|v| *v > 0)
+            .ok_or_else(|| Problem::internal("native timeline revision absent"))?;
+        let duration = if body["duration_ms"].is_null() {
+            None
+        } else {
+            Some(
+                body["duration_ms"]
+                    .as_i64()
+                    .ok_or_else(|| Problem::internal("native timeline duration invalid"))?,
+            )
+        };
+        (revision, duration)
+    } else {
+        match readable_timeline(conn, principal, &event.timeline_id).await {
+            Ok(_) => {}
+            Err(p) if p.status == StatusCode::NOT_FOUND => return Ok(None),
+            Err(p) => return Err(p),
+        }
         sqlx::query_as("SELECT revision,duration_ms FROM timelines WHERE id=?")
             .bind(&event.timeline_id)
             .fetch_one(&mut *conn)
-            .await?;
+            .await?
+    };
     let duration = match duration.filter(|d| *d > 0) {
         Some(d) => Some(d),
         None => sqlx::query_scalar(
@@ -2033,10 +2358,69 @@ pub async fn sync(
             "The re-anchor must match the acknowledgement and the first retained sequence",
         ));
     }
-    let mut tx = begin_write(&app.db).await?;
+    // Prepare native scope outside the application writer. Reauthorize and
+    // compare it again under the successful writer before any sequence effect.
+    let native_scope = if let Some(runtime) = &app.native_catalog {
+        let mut initial = app.db.begin().await?;
+        let principal = caller
+            .reauthorize(&mut initial, Some(Permission::ViewingWrite))
+            .await?;
+        usable_profile(&mut initial, &principal, &profile).await?;
+        let scope = access::catalog_scope(&principal);
+        initial.commit().await?;
+        let library = match &scope {
+            access::CatalogScope::Libraries(ids) => Some(
+                runtime
+                    .prepare_library_read_scope(ids.clone())
+                    .await
+                    .map_err(super::catalog::native_read_error)?,
+            ),
+            _ => None,
+        };
+        let selection = match (&scope, &library) {
+            (access::CatalogScope::Nothing, _) => None,
+            (_, Some(library)) => Some(library.selection.clone()),
+            _ => Some(
+                runtime
+                    .prepare_all_scope()
+                    .await
+                    .map_err(super::catalog::native_read_error)?,
+            ),
+        };
+        Some((runtime.clone(), scope, library, selection))
+    } else {
+        None
+    };
+    let mut tx = begin_catalog_application(&app, true).await?;
     let principal = caller
         .reauthorize(&mut tx, Some(Permission::ViewingWrite))
         .await?;
+    let mut native_reader = if let Some((runtime, scope, library, selection)) = native_scope {
+        if access::catalog_scope(&principal) != scope {
+            return Err(Problem::new(
+                StatusCode::CONFLICT,
+                "offline_scope_changed",
+                "Catalog authorization changed; retry the batch",
+            ));
+        }
+        if let Some(library) = library {
+            runtime
+                .validate_library_read_scope(&mut tx, &library)
+                .await
+                .map_err(super::catalog::native_read_error)?;
+        }
+        Some(
+            crate::native_catalog::timeline_visibility::Reader::new(
+                runtime,
+                &mut tx,
+                selection.into_iter().collect(),
+            )
+            .await
+            .map_err(super::catalog::native_read_error)?,
+        )
+    } else {
+        None
+    };
     let device = device(&principal, Some(&input.device_id))?;
     // The batch's bases belong to one server history (the manifest's
     // viewing_epoch). After a restore or server replacement nothing is
@@ -2147,7 +2531,15 @@ pub async fn sync(
     let mut results = Vec::with_capacity(events.len());
     for event in &events {
         let prior = prior(&mut tx, &device, &profile, event).await?;
-        let target = target(&mut tx, &principal, &device, &profile, event).await?;
+        let target = target(
+            &mut tx,
+            &principal,
+            &device,
+            &profile,
+            event,
+            native_reader.as_mut(),
+        )
+        .await?;
         let view = viewing::load_view(&mut tx, &profile, &event.timeline_id).await?;
         let chain = lineage(&mut tx, &device, &profile, &event.timeline_id).await?;
         let decision = core::reconcile(

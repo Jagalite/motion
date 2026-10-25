@@ -11,6 +11,7 @@ use axum::{
 use playscale_core::access::{self, Idempotent, Permission};
 use serde::Deserialize;
 use serde_json::{Value, json};
+mod native;
 
 pub fn routes() -> Router<App> {
     Router::new()
@@ -104,6 +105,18 @@ fn validate(i: &Input, p: &access::Principal) -> Result<(), Problem> {
     }
     Ok(())
 }
+// Runtime absence never authorizes fallback to legacy schedule state after
+// native cutover. Check under the same transaction as each legacy operation.
+async fn legacy_owner_in(db: &mut sqlx::SqliteConnection) -> Result<(), Problem> {
+    if super::playback::native_bound(db).await? {
+        return Err(Problem::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "native_schedule_unavailable",
+            "Native schedule owner is unavailable",
+        ));
+    }
+    Ok(())
+}
 async fn load(
     conn: &mut sqlx::SqliteConnection,
     p: &access::Principal,
@@ -122,6 +135,9 @@ async fn list(
     caller: Caller,
     Query(q): Query<PageQuery>,
 ) -> Result<Response, Problem> {
+    if app.native_catalog.is_some() {
+        return native::list(app, caller, q).await;
+    }
     caller.require(Permission::SourcesManage)?;
     let limit = q.limit()?;
     let scope = access::catalog_scope(&caller.principal);
@@ -133,6 +149,7 @@ async fn list(
         _ => "[]".into(),
     };
     let mut tx = app.db.begin().await?;
+    legacy_owner_in(&mut tx).await?;
     let rows:Vec<Row>=sqlx::query_as("SELECT * FROM api_schedules WHERE id>? AND (? OR library_id IN (SELECT value FROM json_each(?))) ORDER BY id LIMIT ?").bind(q.after()?).bind(all).bind(ids).bind(i64::from(limit)+1).fetch_all(&mut *tx).await?;
     let result = page(
         &mut tx,
@@ -149,8 +166,12 @@ async fn read(
     caller: Caller,
     Path(id): Path<String>,
 ) -> Result<Response, Problem> {
+    if app.native_catalog.is_some() {
+        return native::read(app, caller, id).await;
+    }
     caller.require(Permission::SourcesManage)?;
     let mut tx = app.db.begin().await?;
+    legacy_owner_in(&mut tx).await?;
     let row = load(&mut tx, &caller.principal, &id).await?;
     tx.commit().await?;
     Ok(tagged(row.wire(), StatusCode::OK))
@@ -161,9 +182,13 @@ async fn create(
     headers: HeaderMap,
     body: Body<Input>,
 ) -> Result<Response, Problem> {
+    if app.native_catalog.is_some() {
+        return native::create(app, caller, headers, body).await;
+    }
     caller.require(Permission::SourcesManage)?;
     let key = idempotency_key(&headers)?;
     let mut tx = begin_write(&app.db).await?;
+    legacy_owner_in(&mut tx).await?;
     let p = caller
         .reauthorize(&mut tx, Some(Permission::SourcesManage))
         .await?;
@@ -208,9 +233,13 @@ async fn replace(
     headers: HeaderMap,
     body: Body<Input>,
 ) -> Result<Response, Problem> {
+    if app.native_catalog.is_some() {
+        return native::replace(app, caller, id, headers, body).await;
+    }
     caller.require(Permission::SourcesManage)?;
     let expected = if_match(&headers)?;
     let mut tx = begin_write(&app.db).await?;
+    legacy_owner_in(&mut tx).await?;
     let p = caller
         .reauthorize(&mut tx, Some(Permission::SourcesManage))
         .await?;
@@ -235,9 +264,13 @@ async fn delete(
     Path(id): Path<String>,
     headers: HeaderMap,
 ) -> Result<Response, Problem> {
+    if app.native_catalog.is_some() {
+        return native::delete(app, caller, id, headers).await;
+    }
     caller.require(Permission::SourcesManage)?;
     let expected = if_match(&headers)?;
     let mut tx = begin_write(&app.db).await?;
+    legacy_owner_in(&mut tx).await?;
     let p = caller
         .reauthorize(&mut tx, Some(Permission::SourcesManage))
         .await?;
@@ -251,11 +284,33 @@ async fn delete(
     Ok(StatusCode::NO_CONTENT.into_response())
 }
 
+// Preserve the complete typed HTTP problem at the worker's anyhow boundary.
+// This is not a fallback: a bound native catalog still refuses legacy effects.
+#[derive(Debug)]
+struct LegacyScheduleOwnerError(Problem);
+impl std::fmt::Display for LegacyScheduleOwnerError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "legacy schedule owner refused: {} ({})",
+            self.0.code, self.0.status
+        )
+    }
+}
+impl std::error::Error for LegacyScheduleOwnerError {}
+
 pub(crate) async fn tick(app: &App) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        app.native_catalog.is_none(),
+        "legacy schedule tick unavailable with native catalog"
+    );
     let ids:Vec<String>=sqlx::query_scalar("SELECT id FROM api_schedules WHERE enabled=1 AND next_run<=? ORDER BY next_run,id LIMIT 100").bind(crate::now()).fetch_all(&app.db).await?;
     for id in ids {
         let _guard = app.jobs.lock().await;
         let mut tx = begin_write(&app.db).await?;
+        legacy_owner_in(&mut tx)
+            .await
+            .map_err(LegacyScheduleOwnerError)?;
         let row: Option<Row> =
             sqlx::query_as("SELECT * FROM api_schedules WHERE id=? AND enabled=1")
                 .bind(id)

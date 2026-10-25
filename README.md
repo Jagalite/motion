@@ -1,5 +1,10 @@
 # Motion
 
+> **Combined-source WIP snapshot:** Start with [LOCAL_BUILD.md](LOCAL_BUILD.md).
+> For this snapshot it supersedes the older dependency/toolchain notes below:
+> Motion builds against the paired native Catabolic source. This is not a
+> fully qualified release.
+
 A private Rust media server using Axum, Tokio, SQLite, and Demuxe. The first core
 supports local libraries, durable scans, a documented public API, original-file
 streaming, ordered viewing sessions, source-attributed metadata/tags, generated

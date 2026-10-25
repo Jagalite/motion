@@ -60,10 +60,31 @@ pub(crate) async fn principal(
     }
     Ok(p)
 }
+/// A queued request remains intact until a qualified native publisher can own it.
+#[derive(Debug)]
+pub struct NativeRefreshUnavailable;
+impl std::fmt::Display for NativeRefreshUnavailable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(
+            "native_metadata_refresh_unavailable: native refresh publication is not yet admitted",
+        )
+    }
+}
+impl std::error::Error for NativeRefreshUnavailable {}
+
 pub async fn run_one(app: &App) -> anyhow::Result<bool> {
     let selected = {
         let _guard = app.jobs.lock().await;
         let mut tx = crate::db::begin_write(&app.db).await?;
+        let native_bound: bool =
+            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM catabolic_binding)")
+                .fetch_one(&mut *tx)
+                .await?;
+        if app.native_catalog.is_some() || native_bound {
+            // Check before job selection, attempt advance or filesystem observation.
+            // Runtime absence is not permission to fall back to legacy catalog writes.
+            return Err(NativeRefreshUnavailable.into());
+        }
         type QueuedRow = (String, String, i64, String, Option<String>, Option<String>);
         let row:Option<QueuedRow>=sqlx::query_as("SELECT id,item_id,attempt,requester_id,credential_hash,ingress_id FROM metadata_jobs WHERE phase='queued' ORDER BY created_at,id LIMIT 1").fetch_optional(&mut *tx).await?;
         let Some((id, item, attempt, owner, hash, ingress)) = row else {
@@ -90,6 +111,12 @@ pub async fn run_one(app: &App) -> anyhow::Result<bool> {
     let observed = crate::nfo::observe_item(app, &item).await;
     let _guard = app.jobs.lock().await;
     let mut tx = crate::db::begin_write(&app.db).await?;
+    let native_bound: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM catabolic_binding)")
+        .fetch_one(&mut *tx)
+        .await?;
+    if app.native_catalog.is_some() || native_bound {
+        return Err(NativeRefreshUnavailable.into());
+    }
     let (phase, current): (String, i64) =
         sqlx::query_as("SELECT phase,attempt FROM metadata_jobs WHERE id=?")
             .bind(&id)

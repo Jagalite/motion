@@ -18,6 +18,7 @@ async fn fixture() -> (tempfile::TempDir, App) {
             playscale::v2::auth::random_key(),
         )),
         health: Arc::new(playscale::operations::Health::new(false)),
+        native_catalog: None,
         db,
         admin_token: Arc::new("test-secret-token".into()),
         origin: Arc::new("http://127.0.0.1:8787".into()),

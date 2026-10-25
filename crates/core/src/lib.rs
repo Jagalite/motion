@@ -3,6 +3,8 @@ pub mod access;
 pub mod access_admin;
 pub mod artwork;
 pub mod catalog;
+pub mod catalog_backend;
+pub mod catalog_source;
 pub mod color;
 pub mod components;
 pub mod delivery;
@@ -42,3 +44,32 @@ pub mod watch;
 pub mod work;
 
 pub mod signin;
+
+pub mod catalog_cutover;
+
+pub mod catalog_registration;
+
+pub mod catalog_projection;
+
+pub mod native_scan;
+
+pub mod native_matching;
+
+pub mod catalog_aggregate_revision;
+
+pub mod catalog_command_attempt;
+
+pub mod catalog_kind;
+
+pub mod native_processing_control;
+pub mod processing_publication;
+
+pub mod source_lifecycle;
+
+pub mod scan_schedule;
+
+pub mod paired_backup;
+
+pub mod source_succession;
+
+pub mod catalog_identity_lineage;

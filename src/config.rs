@@ -21,6 +21,18 @@ pub struct Args {
     pub listen: Option<SocketAddr>,
     #[arg(long)]
     pub data_dir: Option<PathBuf>,
+    /// Existing native catalog admitted by the completed offline cutover.
+    #[arg(long)]
+    pub catalog_path: Option<PathBuf>,
+    /// Offline native39→40 transition: prepare a durable exact plan, or execute/reconcile it.
+    #[arg(long, value_parser=["prepare", "execute"], requires="confirm_native_upgrade_quiescence", conflicts_with="check_config")]
+    pub native_schema_upgrade: Option<String>,
+    /// Confirm all other native/legacy readers and workers are stopped and exclusive operational ownership is retained.
+    #[arg(long, requires = "native_schema_upgrade")]
+    pub confirm_native_upgrade_quiescence: bool,
+    /// Native source profile, checked against the retained cutover record.
+    #[arg(long)]
+    pub catalog_profile: Option<String>,
     #[arg(long)]
     pub public_origin: Option<String>,
     /// Overrides configuration libraries when provided; registers/scans at startup.
@@ -58,6 +70,8 @@ fn parse_access_mode(value: &str) -> Result<playscale_core::access::AccessMode, 
 pub struct Settings {
     pub listen: SocketAddr,
     pub data_dir: PathBuf,
+    pub catalog_path: Option<PathBuf>,
+    pub catalog_profile: String,
     pub public_origin: Option<String>,
     pub libraries: Vec<PathBuf>,
     pub demuxe_dir: PathBuf,
@@ -72,6 +86,8 @@ impl Default for Settings {
         Self {
             listen: "127.0.0.1:8787".parse().unwrap(),
             data_dir: "data".into(),
+            catalog_path: None,
+            catalog_profile: "default".into(),
             public_origin: None,
             libraries: vec![],
             demuxe_dir: "web/vendor/demuxe".into(),
@@ -162,6 +178,11 @@ impl Args {
                     *p = root.join(&*p);
                 }
             }
+            if let Some(p) = &mut s.catalog_path
+                && p.is_relative()
+            {
+                *p = root.join(&*p);
+            }
             for p in &mut s.libraries {
                 if p.is_relative() {
                     *p = root.join(&*p);
@@ -183,6 +204,18 @@ impl Args {
         if let Some(v) = &self.data_dir {
             settings.data_dir = v.clone();
         }
+        if let Some(v) = &self.catalog_path {
+            settings.catalog_path = Some(v.clone());
+        }
+        if let Some(v) = &self.catalog_profile {
+            settings.catalog_profile = v.clone();
+        }
+        anyhow::ensure!(
+            !settings.catalog_profile.is_empty()
+                && settings.catalog_profile.len() <= 256
+                && !settings.catalog_profile.chars().any(char::is_control),
+            "invalid native catalog profile"
+        );
         if let Some(v) = &self.demuxe_dir {
             settings.demuxe_dir = v.clone();
         }
@@ -248,6 +281,54 @@ pub fn validate_origin(origin: &str) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn native_catalog_config_is_explicit_and_resolves_relative_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("motion.json");
+        std::fs::write(
+            &config,
+            r#"{"catalog_path":"catalog.sqlite3","catalog_profile":"movies"}"#,
+        )
+        .unwrap();
+        let args = Args::try_parse_from(["motion", "--config", config.to_str().unwrap()]).unwrap();
+        let settings = args.resolve().unwrap();
+        assert_eq!(
+            settings.catalog_path,
+            Some(dir.path().join("catalog.sqlite3"))
+        );
+        assert_eq!(settings.catalog_profile, "movies");
+        assert_eq!(
+            Args::try_parse_from(["motion"])
+                .unwrap()
+                .resolve()
+                .unwrap()
+                .catalog_path,
+            None
+        );
+        let override_path = dir.path().join("override.sqlite3");
+        let args = Args::try_parse_from([
+            "motion",
+            "--config",
+            config.to_str().unwrap(),
+            "--catalog-path",
+            override_path.to_str().unwrap(),
+            "--catalog-profile",
+            "series",
+        ])
+        .unwrap();
+        let settings = args.resolve().unwrap();
+        assert_eq!(settings.catalog_path, Some(override_path));
+        assert_eq!(settings.catalog_profile, "series");
+    }
+
+    #[test]
+    fn native_catalog_profile_rejects_empty_and_controls() {
+        for profile in ["", "bad\nprofile"] {
+            let args = Args::try_parse_from(["motion", "--catalog-profile", profile]).unwrap();
+            assert!(args.resolve().is_err());
+        }
+    }
+
     #[test]
     fn package_moves_preserve_assets_and_config_overrides() {
         let dir = tempfile::tempdir().unwrap();
@@ -387,5 +468,34 @@ mod tests {
         ] {
             assert!(validate_origin(origin).is_err());
         }
+    }
+}
+
+#[cfg(test)]
+mod native_upgrade_cli_tests {
+    use super::*;
+    #[test]
+    fn offline_upgrade_requires_explicit_operator_confirmation() {
+        assert!(Args::try_parse_from(["motion", "--native-schema-upgrade", "prepare"]).is_err());
+        assert!(Args::try_parse_from(["motion", "--confirm-native-upgrade-quiescence"]).is_err());
+        let args = Args::try_parse_from([
+            "motion",
+            "--native-schema-upgrade",
+            "execute",
+            "--confirm-native-upgrade-quiescence",
+        ])
+        .unwrap();
+        assert_eq!(args.native_schema_upgrade.as_deref(), Some("execute"));
+        assert!(args.confirm_native_upgrade_quiescence);
+        assert!(
+            Args::try_parse_from([
+                "motion",
+                "--native-schema-upgrade",
+                "execute",
+                "--confirm-native-upgrade-quiescence",
+                "--check-config"
+            ])
+            .is_err()
+        );
     }
 }

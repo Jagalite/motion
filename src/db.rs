@@ -1,3 +1,4 @@
+mod sealed_compatibility;
 use crate::{App, new_id, now};
 use anyhow::Context;
 use playscale_core::jobs::{Input, Job, Phase, transition};
@@ -215,6 +216,73 @@ pub async fn connect(path: &Path) -> anyhow::Result<SqlitePool> {
     connect_with(path, &sqlx::migrate!("./migrations")).await
 }
 
+/// Fresh native intent uses the genuine qualified93 prefix before export.
+/// Existing frozen phases resume through exact control admission; a newer
+/// unsealed database is never downgraded or reinterpreted as fresh93.
+pub async fn connect_native_bootstrap(path: &Path) -> anyhow::Result<SqlitePool> {
+    let db = open(path).await?;
+    if catalog_source_frozen(&db).await? {
+        db.close().await;
+        return connect_catalog_control(path).await;
+    }
+    let ledger: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='_sqlx_migrations')",
+    )
+    .fetch_one(&db)
+    .await?;
+    if ledger {
+        let newer: bool =
+            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM _sqlx_migrations WHERE version>93)")
+                .fetch_one(&db)
+                .await?;
+        anyhow::ensure!(
+            !newer,
+            "fresh native bootstrap cannot downgrade existing newer Motion schema"
+        );
+    }
+    db.close().await;
+    let mut migrations = sqlx::migrate!("./migrations");
+    migrations.migrations = std::borrow::Cow::Owned(
+        migrations
+            .iter()
+            .filter(|m| m.version <= 93)
+            .cloned()
+            .collect(),
+    );
+    anyhow::ensure!(
+        migrations.iter().last().is_some_and(|m| m.version == 93),
+        "qualified native bootstrap prefix missing93"
+    );
+    connect_with(path, &migrations).await
+}
+
+/// Operator-only connection for inspecting or abandoning a persisted source
+/// freeze. Frozen application databases cannot run upgrade/background hooks.
+pub async fn connect_catalog_control(path: &Path) -> anyhow::Result<SqlitePool> {
+    let db = open(path).await?;
+    if catalog_source_frozen(&db).await? {
+        if sealed_compatibility::ordered97(&db).await? {
+            return Ok(db);
+        }
+        let full = sqlx::migrate!("./migrations");
+        let migrator = sealed_compatibility::migrator(&db, &full).await?;
+        let backup = prepare_upgrade(&db, path, &migrator).await?;
+        if backup.is_some() {
+            db.close().await;
+            crate::catalog_backend::control_migration::migrate(path, &migrator).await?;
+            return open(path).await;
+        }
+        return Ok(db);
+    }
+    db.close().await;
+    connect(path).await
+}
+async fn catalog_source_frozen(db: &SqlitePool) -> anyhow::Result<bool> {
+    Ok(crate::catalog_backend::source_freeze::admission(db)
+        .await?
+        .is_some_and(|state| !state.writes_allowed()))
+}
+
 /// A verified copy of the database taken before pending migrations were applied.
 #[derive(Debug, Clone, Serialize)]
 pub struct UpgradeBackup {
@@ -231,6 +299,10 @@ pub async fn connect_with(
     migrator: &sqlx::migrate::Migrator,
 ) -> anyhow::Result<SqlitePool> {
     let db = open(path).await?;
+    anyhow::ensure!(
+        !catalog_source_frozen(&db).await?,
+        "Motion catalog source is frozen; use the catalog control CLI to reconcile migration"
+    );
     let backup = prepare_upgrade(&db, path, migrator).await?;
     if let Err(error) = migrator.run(&db).await {
         db.close().await;
@@ -380,6 +452,11 @@ async fn open(path: &Path) -> anyhow::Result<SqlitePool> {
         .synchronous(SqliteSynchronous::Full)
         .busy_timeout(Duration::from_secs(5));
     let db = SqlitePoolOptions::new()
+        .after_connect(|connection, _| {
+            Box::pin(crate::catalog_backend::projection::configure_connection(
+                connection,
+            ))
+        })
         .max_connections(4)
         .connect_with(options)
         .await?;
@@ -671,6 +748,25 @@ pub struct RestoreReceipt {
     pub restore_epoch: Option<String>,
 }
 
+/// Interim safety boundary: a durable native binding requires a paired
+/// native/Motion backup owner. Runtime configuration cannot waive this proof.
+pub(crate) async fn require_legacy_single_database(
+    conn: &mut sqlx::SqliteConnection,
+) -> anyhow::Result<()> {
+    let exists: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='catabolic_binding')")
+        .fetch_one(&mut *conn).await?;
+    if exists {
+        let bound: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM catabolic_binding)")
+            .fetch_one(&mut *conn)
+            .await?;
+        anyhow::ensure!(
+            !bound,
+            "native-bound storage requires a paired native/Motion backup and restore owner"
+        );
+    }
+    Ok(())
+}
+
 /// Restore a backup into a new destination: verify the backup, copy it,
 /// upgrade the copy through the normal migrator (taking its own pre-upgrade
 /// backup), check integrity and references, and rotate the restore epoch so
@@ -685,6 +781,7 @@ pub async fn restore_into(backup: &Path, destination: &Path) -> anyhow::Result<R
             &SqliteConnectOptions::new().filename(backup).read_only(true),
         )
         .await?;
+        require_legacy_single_database(&mut conn).await?;
         let versions: Vec<i64> = sqlx::query_scalar(
             "SELECT version FROM _sqlx_migrations WHERE success=1 ORDER BY version",
         )
@@ -714,6 +811,23 @@ pub async fn restore_into(backup: &Path, destination: &Path) -> anyhow::Result<R
             .execute(&mut source)
             .await?;
         source.close().await?;
+    }
+    // Recheck the actual copied database, not just the earlier source probe.
+    // This also rejects a source changed concurrently during the copy window.
+    {
+        use sqlx::Connection;
+        let mut copied = sqlx::SqliteConnection::connect_with(
+            &SqliteConnectOptions::new()
+                .filename(&staging)
+                .read_only(true),
+        )
+        .await?;
+        let admitted = require_legacy_single_database(&mut copied).await;
+        copied.close().await?;
+        if let Err(error) = admitted {
+            tokio::fs::remove_file(&staging).await?;
+            return Err(error);
+        }
     }
     let restored = match connect(&staging).await {
         Ok(db) => db,
@@ -829,4 +943,126 @@ fn preview_geometry_uses_display_rotation() {
             "old video probe must refresh orientation"
         );
     }
+}
+
+#[cfg(test)]
+#[tokio::test]
+async fn sealed_control_upgrade_keeps_verified_original_backup_and_guards() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("motion.sqlite3");
+    let pool = open(&path).await.unwrap();
+    let mut old = sqlx::migrate!("./migrations");
+    old.migrations = std::borrow::Cow::Owned(
+        old.iter()
+            .filter(|migration| migration.version <= 83)
+            .cloned()
+            .collect(),
+    );
+    old.run(&pool).await.unwrap();
+    let native = dir.path().join("native.sqlite3");
+    crate::catalog_backend::initialize(native.clone())
+        .await
+        .unwrap();
+    let identity = crate::catalog_backend::inspect(native.clone())
+        .await
+        .unwrap()
+        .identity;
+    let backend = crate::catalog_backend::NativeCatalog::bind(pool.clone(), native, identity)
+        .await
+        .unwrap();
+    backend
+        .freeze_motion_source("upgrade-backup-proof", 0)
+        .await
+        .unwrap();
+    backend.seal_motion_freeze(1).await.unwrap();
+    drop(backend);
+    pool.close().await;
+    let upgraded = connect_catalog_control(&path).await.unwrap();
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT max(version) FROM _sqlx_migrations")
+            .fetch_one(&upgraded)
+            .await
+            .unwrap(),
+        93
+    );
+    assert!(
+        sqlx::query("INSERT INTO items(id,title,kind) VALUES('forbidden','Forbidden','video')")
+            .execute(&upgraded)
+            .await
+            .is_err()
+    );
+    assert!(
+        sqlx::query("UPDATE _sqlx_migrations SET execution_time=0 WHERE version=88")
+            .execute(&upgraded)
+            .await
+            .is_err()
+    );
+    let backups: Vec<_> = std::fs::read_dir(dir.path().join("upgrade-backups"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect();
+    assert_eq!(backups.len(), 1);
+    verify_backup(&backups[0], old.iter().count())
+        .await
+        .unwrap();
+    let original = open(&backups[0]).await.unwrap();
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT max(version) FROM _sqlx_migrations")
+            .fetch_one(&original)
+            .await
+            .unwrap(),
+        83
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM pragma_table_info('media_files') WHERE name='native_history'"
+        )
+        .fetch_one(&original)
+        .await
+        .unwrap(),
+        0
+    );
+    assert_eq!(sqlx::query_scalar::<_, i64>("SELECT count(*) FROM catabolic_source_guards g LEFT JOIN sqlite_schema s ON s.type='trigger' AND s.name=g.trigger_name WHERE s.sql IS NOT g.trigger_sql")
+        .fetch_one(&original).await.unwrap(), 0);
+    original.close().await;
+    upgraded.close().await;
+    let restarted = connect_catalog_control(&path).await.unwrap();
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT max(version) FROM _sqlx_migrations")
+            .fetch_one(&restarted)
+            .await
+            .unwrap(),
+        93
+    );
+    restarted.close().await;
+}
+
+#[tokio::test]
+async fn native_bootstrap_creates93_and_never_downgrades_existing97() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("fresh.sqlite3");
+    for _ in 0..2 {
+        let db = connect_native_bootstrap(&path).await.unwrap();
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT max(version) FROM _sqlx_migrations")
+                .fetch_one(&db)
+                .await
+                .unwrap(),
+            93
+        );
+        db.close().await;
+    }
+    let newer = root.path().join("newer.sqlite3");
+    let db = connect(&newer).await.unwrap();
+    db.close().await;
+    assert!(connect_native_bootstrap(&newer).await.is_err());
+    let db = open(&newer).await.unwrap();
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT max(version) FROM _sqlx_migrations")
+            .fetch_one(&db)
+            .await
+            .unwrap(),
+        97
+    );
+    db.close().await;
 }

@@ -11,7 +11,7 @@ function harness(storage = new Map(), fetch = async () => ({ok: true, status: 20
     sessionStorage: {getItem: key => storage.get(key), setItem: (key, value) => storage.set(key, value)},
     crypto: webcrypto, fetch, location: {reload() {}}, setTimeout: fn => fn(), Blob, ...extra,
   };
-  return runInNewContext(`${source}\n({submitCommand, keyFor, settleKey, bodyOf, pair, showPlan, edited})`, context);
+  return runInNewContext(`${source}\n({submitCommand, keyFor, settleKey, bodyOf, pair, showPlan, edited, pendingNativeJobIntents})`, context);
 }
 function form(inputs = []) {
   const status = {};
@@ -475,5 +475,323 @@ test('watched marks retry a progress-only conflict once and never a manual one',
       : selector === '.command-status' ? {setAttribute() {}} : {setAttribute() {}, removeAttribute() {}};
     await submitCommand(mark);
     assert.deepEqual(calls, expected, `rendered manual epoch ${epoch}, session ${session}`);
+  }
+});
+
+
+// Minimal processing DOM: the server supplies the slot only for the currently
+// supported native capability and permission. False new-action hints omit forms.
+function nativeJobPage({scope = 'a'.repeat(64), job = 'native1', offer = 'retry', ifMatch = '"r-7"', supported = true} = {}) {
+  const offered = offer ? form() : null;
+  if (offered) {
+    offered.dataset.command = `POST /api/v2/jobs/${job}/${offer}`;
+    if (offer === 'retry') offered.dataset.ifMatch = ifMatch;
+  }
+  const slot = {dataset: {jobControlRecovery: job, jobControlScope: scope}, children: [],
+    append(child) { child.parentElement = this; this.children.push(child); }};
+  const cell = {
+    querySelector: selector => supported && selector === '[data-job-control-recovery]' ? slot : null,
+    querySelectorAll: () => [...(offered ? [offered] : []), ...slot.children],
+  };
+  slot.parentElement = cell;
+  if (offered) offered.closest = () => cell;
+  const createElement = tag => {
+    const node = {tag, dataset: {}, className: '', children: [], disabled: false,
+      setAttribute(name, value) { this[name] = name === 'disabled' ? true : value; },
+      removeAttribute(name) { if (name === 'disabled') this.disabled = false; else delete this[name]; },
+      append(...children) { for (const child of children) { child.parentElement = this; this.children.push(child); } },
+      closest: () => cell,
+      querySelectorAll: () => [],
+      querySelector(selector) {
+        if (selector === '.command-status') return this.children.find(child => child.className === 'command-status') ?? null;
+        if (selector === 'button[type="submit"]') return this.children.find(child => child.tag === 'button') ?? null;
+        return null;
+      },
+    };
+    node.classList = {contains: name => node.className.split(' ').includes(name)};
+    return node;
+  };
+  const document = {
+    querySelector: selector => selector === 'meta[name="motion-csrf"]' ? {content: 'current-session-csrf'} : null,
+    querySelectorAll: selector => supported && selector === '[data-job-control-recovery]' ? [slot] : [],
+    createElement, addEventListener() {},
+  };
+  return {offered, slot, document};
+}
+
+const nativeIdentity = (scope, operation = 'retry', ifMatch = '"r-7"', job = 'native1') =>
+  `native-job ${scope} POST /api/v2/jobs/${job}/${operation} ${ifMatch} null`;
+
+test('native lost-ACK retry keeps its exact key and reviewed ETag after new-action hints become false', async () => {
+  const storage = new Map();
+  const sent = [];
+  const fetch = async (path, options) => {
+    sent.push({path, ...options});
+    if (sent.length === 1) throw new Error('lost ACK');
+    // An old receipt is not the current job phase: the bridge reloads rather
+    // than rendering this historical response as a fresh status.
+    return {ok: true, status: 200, json: async () => ({phase: 'queued', revision: '8'})};
+  };
+  const first = nativeJobPage();
+  await harness(storage, fetch, {document: first.document}).submitCommand(first.offered);
+  const pending = JSON.parse(storage.get('motion:pending-idempotency-keys'));
+  assert.equal(Object.keys(pending)[0], nativeIdentity('a'.repeat(64)));
+  assert.match(sent[0].headers['Idempotency-Key'], /^[0-9a-f]{32}$/);
+
+  const refreshed = nativeJobPage({offer: null, ifMatch: '"r-99"'});
+  let reloads = 0;
+  const bridge = harness(storage, fetch, {document: refreshed.document, location: {reload() { reloads++; }}});
+  assert.equal(refreshed.slot.children.length, 1);
+  const recovery = refreshed.slot.children[0];
+  assert.equal(recovery.querySelector('button[type="submit"]').textContent, 'Check previous retry request');
+  assert.equal(recovery.dataset.ifMatch, '"r-7"');
+  await bridge.submitCommand(recovery);
+  assert.equal(sent.length, 2);
+  assert.equal(sent[1].path, '/api/v2/jobs/native1/retry');
+  assert.equal(sent[1].headers['Idempotency-Key'], sent[0].headers['Idempotency-Key']);
+  assert.equal(sent[1].headers['If-Match'], '"r-7"');
+  assert.equal(sent[1].headers['X-CSRF-Token'], 'current-session-csrf');
+  assert.equal(sent[1].body, undefined);
+  assert.equal(reloads, 1);
+  assert.deepEqual(JSON.parse(storage.get('motion:pending-idempotency-keys')), {});
+  await bridge.submitCommand(recovery);
+  assert.equal(sent.length, 2, 'settled recovery cannot mint a new action');
+});
+
+test('native capability withdrawal hides recovery without discarding the uncertain identity', async () => {
+  const scope = 'a'.repeat(64);
+  const identity = nativeIdentity(scope);
+  const key = 'b'.repeat(32);
+  const storage = new Map([['motion:pending-idempotency-keys', JSON.stringify({[identity]: key})]]);
+  const withdrawn = nativeJobPage({supported: false, offer: null});
+  let calls = 0;
+  const fetch = async (_, options) => {
+    calls++;
+    assert.equal(options.headers['Idempotency-Key'], key);
+    assert.equal(options.headers['If-Match'], '"r-7"');
+    throw new Error('still uncertain');
+  };
+  harness(storage, fetch, {document: withdrawn.document});
+  assert.equal(withdrawn.slot.children.length, 0);
+  assert.equal(calls, 0);
+  assert.equal(JSON.parse(storage.get('motion:pending-idempotency-keys'))[identity], key);
+  const restored = nativeJobPage({offer: null});
+  const bridge = harness(storage, fetch, {document: restored.document});
+  assert.equal(restored.slot.children.length, 1);
+  await bridge.submitCommand(restored.slot.children[0]);
+  await bridge.submitCommand(restored.slot.children[0]);
+  assert.equal(calls, 2, 'only explicit checks send and reuse the same uncertain intent');
+});
+
+test('native pending recovery takes precedence over a newly rendered retry revision', async () => {
+  const identity = nativeIdentity('a'.repeat(64));
+  const key = 'c'.repeat(32);
+  const storage = new Map([['motion:pending-idempotency-keys', JSON.stringify({[identity]: key})]]);
+  const page = nativeJobPage({ifMatch: '"r-30"'});
+  const sent = [];
+  const bridge = harness(storage, async (_, options) => {
+    sent.push(options);
+    return {ok: false, status: 409, json: async () => ({code: 'native_publication_unknown'})};
+  }, {document: page.document});
+  assert.equal(page.offered.hidden, true, 'do not offer a second intent while the first is uncertain');
+  const recovery = page.slot.children[0];
+  await bridge.submitCommand(recovery);
+  await bridge.submitCommand(recovery);
+  assert.equal(sent.length, 1, 'domain conflicts must not trigger a blind retry');
+  assert.equal(sent[0].headers['If-Match'], '"r-7"');
+  assert.equal(sent[0].headers['Idempotency-Key'], key);
+  assert.equal(recovery.querySelector('button[type="submit"]').disabled, true);
+  assert.deepEqual(JSON.parse(storage.get('motion:pending-idempotency-keys')), {});
+});
+
+test('native recovery rejects other sessions, principals, profiles, servers and rows', () => {
+  const scope = 'a'.repeat(64);
+  const identity = nativeIdentity(scope);
+  const storage = new Map([['motion:pending-idempotency-keys', JSON.stringify({[identity]: 'd'.repeat(32)})]]);
+  for (const changed of [
+    {scope: 'b'.repeat(64)}, {scope: ''}, {job: 'other-job'}, {job: '../native1'}, {job: 'native1/retry'},
+  ]) {
+    const page = nativeJobPage({...changed, offer: null});
+    harness(storage, async () => { throw new Error('must not send'); }, {document: page.document});
+    assert.equal(page.slot.children.length, 0);
+  }
+  const otherOrigin = nativeJobPage({offer: null});
+  harness(new Map(), async () => { throw new Error('must not send'); }, {document: otherOrigin.document});
+  assert.equal(otherOrigin.slot.children.length, 0, 'another origin has no access to this tab storage');
+  assert.equal(JSON.parse(storage.get('motion:pending-idempotency-keys'))[identity], 'd'.repeat(32));
+});
+
+test('native recovery ignores malformed stored commands, preconditions, bodies and keys', () => {
+  const scope = 'a'.repeat(64);
+  const valid = nativeIdentity(scope);
+  const goodKey = 'e'.repeat(32);
+  for (const [identity, key] of [
+    [valid, 42], [valid, 'not-a-key'], [valid, null],
+    [valid.replace('POST', 'DELETE'), goodKey],
+    [valid.replace('/retry ', '/retry/extra '), goodKey],
+    [valid.replace('/api/v2/', 'https://example.com/api/v2/'), goodKey],
+    [valid.replace(' null', ' {}'), goodKey],
+    [valid.replace('"r-7"', '*'), goodKey],
+    [valid.replace('"r-7"', 'W/"r-7"'), goodKey],
+    [valid.replace('"r-7"', '"r-07"'), goodKey],
+    [nativeIdentity(scope, 'retry', ''), goodKey],
+    [nativeIdentity(scope, 'cancel', '"r-7"'), goodKey],
+    [valid.replace(`native-job ${scope} `, ''), goodKey],
+  ]) {
+    const page = nativeJobPage({offer: null});
+    const storage = new Map([['motion:pending-idempotency-keys', JSON.stringify({[identity]: key})]]);
+    harness(storage, async () => { throw new Error('must not send'); }, {document: page.document});
+    assert.equal(page.slot.children.length, 0, identity);
+  }
+  for (const raw of ['null', '[]', 'false', '{']) {
+    const page = nativeJobPage({offer: null});
+    harness(new Map([['motion:pending-idempotency-keys', raw]]), undefined, {document: page.document});
+    assert.equal(page.slot.children.length, 0);
+  }
+});
+
+test('native recovery never replaces a missing identity or reuses one after context withdrawal', async () => {
+  for (const change of ['storage', 'scope', 'command', 'etag']) {
+    const identity = nativeIdentity('a'.repeat(64));
+    const key = 'f'.repeat(32);
+    const storage = new Map([['motion:pending-idempotency-keys', JSON.stringify({[identity]: key})]]);
+    const page = nativeJobPage({offer: null});
+    let calls = 0;
+    const bridge = harness(storage, async () => { calls++; return {ok: true, status: 204}; }, {document: page.document});
+    const recovery = page.slot.children[0];
+    if (change === 'storage') storage.set('motion:pending-idempotency-keys', '{}');
+    if (change === 'scope') page.slot.dataset.jobControlScope = '0'.repeat(64);
+    if (change === 'command') recovery.dataset.command = 'POST /api/v2/jobs/native1/cancel';
+    if (change === 'etag') recovery.dataset.ifMatch = '"r-22"';
+    await bridge.submitCommand(recovery);
+    assert.equal(calls, 0, change);
+    assert.equal(recovery.querySelector('button[type="submit"]').disabled, true);
+    assert.deepEqual(JSON.parse(storage.get('motion:pending-idempotency-keys')), change === 'storage' ? {} : {[identity]: key});
+  }
+});
+
+test('native cancel recovery sends only its original operation and has no retry precondition', async () => {
+  const identity = nativeIdentity('a'.repeat(64), 'cancel', '');
+  const key = '1'.repeat(32);
+  const page = nativeJobPage({offer: null});
+  const storage = new Map([['motion:pending-idempotency-keys', JSON.stringify({[identity]: key})]]);
+  const sent = [];
+  const bridge = harness(storage, async (path, options) => {
+    sent.push({path, ...options});
+    return {ok: true, status: 200, json: async () => ({phase: 'cancelling'})};
+  }, {document: page.document});
+  const recovery = page.slot.children[0];
+  assert.equal(recovery.querySelector('button[type="submit"]').textContent, 'Check previous cancel request');
+  await bridge.submitCommand(recovery);
+  assert.equal(sent.length, 1);
+  assert.equal(sent[0].path, '/api/v2/jobs/native1/cancel');
+  assert.equal(sent[0].headers['Idempotency-Key'], key);
+  assert.equal(sent[0].headers['If-Match'], undefined);
+});
+
+
+test('native lost ACK survives pre-receipt refusals and later restores exact recovery', async () => {
+  for (const status of [400, 401, 403, 404, 405, 408, 415, 422, 425, 428, 429, 500, 503]) {
+    const storage = new Map();
+    const sent = [];
+    const fetch = async (path, options) => {
+      sent.push({path, ...options});
+      if (sent.length === 1) throw new Error('lost ACK');
+      if (sent.length === 2) return {ok: false, status, json: async () => ({code: 'pre_receipt_refusal'})};
+      return {ok: true, status: 200, json: async () => ({phase: 'queued', revision: '8'})};
+    };
+    const initial = nativeJobPage();
+    await harness(storage, fetch, {document: initial.document}).submitCommand(initial.offered);
+    const identity = nativeIdentity('a'.repeat(64));
+    const key = JSON.parse(storage.get('motion:pending-idempotency-keys'))[identity];
+    const denied = nativeJobPage({offer: null});
+    const refusedBridge = harness(storage, fetch, {document: denied.document});
+    await refusedBridge.submitCommand(denied.slot.children[0]);
+    assert.equal(JSON.parse(storage.get('motion:pending-idempotency-keys'))[identity], key, `status ${status}`);
+    assert.equal(denied.slot.children[0].querySelector('button[type="submit"]').disabled, false);
+    assert.match(denied.slot.children[0].querySelector('.command-status').textContent, /earlier request is still unresolved/);
+    // A later supported read, after permission/visibility/service recovery,
+    // must still offer the original intent, not create a fresh attempt.
+    const restored = nativeJobPage({offer: null, ifMatch: '"r-99"'});
+    const restoredBridge = harness(storage, fetch, {document: restored.document});
+    assert.equal(restored.slot.children.length, 1, `status ${status}`);
+    await restoredBridge.submitCommand(restored.slot.children[0]);
+    assert.equal(sent.length, 3);
+    for (const request of sent) {
+      assert.equal(request.path, '/api/v2/jobs/native1/retry');
+      assert.equal(request.headers['Idempotency-Key'], key);
+      assert.equal(request.headers['If-Match'], '"r-7"');
+      assert.equal(request.body, undefined);
+    }
+    assert.deepEqual(JSON.parse(storage.get('motion:pending-idempotency-keys')), {});
+  }
+});
+
+test('same offered native form retains its lost-ACK key through later auth refusals', async () => {
+  for (const status of [401, 403, 404]) {
+    const storage = new Map();
+    const page = nativeJobPage();
+    const sent = [];
+    const bridge = harness(storage, async (_, options) => {
+      sent.push(options);
+      if (sent.length === 1) throw new Error('lost ACK');
+      if (sent.length === 2) return {ok: false, status, json: async () => ({})};
+      return {ok: true, status: 204};
+    }, {document: page.document});
+    await bridge.submitCommand(page.offered);
+    await bridge.submitCommand(page.offered);
+    const identity = nativeIdentity('a'.repeat(64));
+    assert.equal(JSON.parse(storage.get('motion:pending-idempotency-keys'))[identity], sent[0].headers['Idempotency-Key']);
+    await bridge.submitCommand(page.offered);
+    assert.equal(sent.length, 3);
+    assert.equal(new Set(sent.map(options => options.headers['Idempotency-Key'])).size, 1);
+    assert.ok(sent.every(options => options.headers['If-Match'] === '"r-7"'));
+    assert.deepEqual(JSON.parse(storage.get('motion:pending-idempotency-keys')), {});
+  }
+});
+
+test('native receipt conflicts retain uncertain identity while domain 409 and 412 settle it', async () => {
+  for (const recoveryForm of [false, true]) {
+    for (const [status, code, settles] of [
+      [409, 'idempotency_key_reused', false],
+      [409, 'idempotent_replay_unavailable', false],
+      [412, 'idempotency_key_reused', false],
+      [412, 'idempotent_replay_unavailable', false],
+      [409, 'native_publication_unknown', true],
+      [412, 'precondition_failed', true],
+    ]) {
+      const storage = new Map();
+      const firstPage = nativeJobPage();
+      const sent = [];
+      const fetch = async (_, options) => {
+        sent.push(options);
+        if (sent.length === 1) throw new Error('lost ACK');
+        if (sent.length === 2) return {ok: false, status, json: async () => ({code})};
+        return {ok: true, status: 204};
+      };
+      let bridge = harness(storage, fetch, {document: firstPage.document});
+      await bridge.submitCommand(firstPage.offered);
+      let command = firstPage.offered;
+      if (recoveryForm) {
+        const nextPage = nativeJobPage({offer: null});
+        bridge = harness(storage, fetch, {document: nextPage.document});
+        command = nextPage.slot.children[0];
+      }
+      await bridge.submitCommand(command);
+      const identity = nativeIdentity('a'.repeat(64));
+      const pending = JSON.parse(storage.get('motion:pending-idempotency-keys'));
+      assert.equal(pending[identity], settles ? undefined : sent[0].headers['Idempotency-Key'], `${recoveryForm}: ${status} ${code}`);
+      assert.equal(sent.length, 2, 'no automatic retries');
+      if (!settles) {
+        const text = command.querySelector('.command-status').textContent;
+        assert.match(text, /earlier request is still unresolved/);
+        assert.ok(!text.includes('then try again'), 'receipt conflict must not invite a fresh intent');
+        await bridge.submitCommand(command);
+        assert.equal(sent.length, 3);
+        assert.equal(sent[2].headers['Idempotency-Key'], sent[0].headers['Idempotency-Key']);
+        assert.equal(sent[2].headers['If-Match'], '"r-7"');
+        assert.deepEqual(JSON.parse(storage.get('motion:pending-idempotency-keys')), {});
+      }
+    }
   }
 });

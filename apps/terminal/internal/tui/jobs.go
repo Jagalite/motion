@@ -26,17 +26,100 @@ func (c jobConfirm) open() bool { return c.job != "" }
 // jobReviewed answers an inspection. A retry asks for one first, so that
 // the confirmation shows, and the request carries, the reviewed revision.
 type jobReviewed struct {
-	epoch  int
-	review int
-	job    api.Tagged[api.Job]
-	retry  bool
-	err    error
+	epoch       int
+	review      int
+	jobsRequest int
+	job         api.Tagged[api.Job]
+	retry       bool
+	err         error
 }
 
 type jobActionDone struct {
 	epoch  int
 	action operations.JobAction
 	err    error
+}
+
+// readOnlyJobs restricts offers, never grants permission. A failed refresh is
+// not an older server, and withdrawal cannot turn a native server into legacy.
+func (m Model) readOnlyJobs() bool {
+	if s := m.cache.slots[keySession]; s == nil || s.err != nil {
+		return true
+	}
+	caps := m.caps()
+	if caps == nil || !operations.JobControlsSupported(*caps) {
+		return true
+	}
+	native := operations.UsesNativeJobs(*caps)
+	return (m.nativeJobsSeen && !native) || (native && !m.allows(api.PermProcessingRequest))
+}
+
+func (m Model) shownJob(id string) (api.Job, bool) {
+	jobs, _ := data[[]api.Job](m, keyJobs)
+	for _, job := range jobs {
+		if job.ID == id {
+			return job, true
+		}
+	}
+	return api.Job{}, false
+}
+
+func (m Model) jobActionAvailable(kind operations.JobActionKind, id string) bool {
+	if m.readOnlyJobs() {
+		return false
+	}
+	if _, pending := m.jobs.Pending(kind, id); pending {
+		return true // exact replay, not a fresh phase-dependent request
+	}
+	job, ok := m.shownJob(id)
+	return ok && operations.JobActionAvailable(*m.caps(), job, kind)
+}
+
+func (m Model) canCancelJob(id string) bool {
+	return m.jobActionAvailable(operations.CancelJob, id)
+}
+
+func (m Model) canRetryJob(id string) bool {
+	return m.jobActionAvailable(operations.RetryJob, id)
+}
+
+// jobHelpAvailable keeps general legacy help while advertising only supported
+// native row actions (or retained exact replays) in mixed job history.
+func (m Model) jobHelpAvailable(kind operations.JobActionKind) bool {
+	if m.readOnlyJobs() {
+		return false
+	}
+	if !operations.UsesNativeJobs(*m.caps()) {
+		return true
+	}
+	jobs, _ := data[[]api.Job](m, keyJobs)
+	for _, job := range jobs {
+		if m.jobActionAvailable(kind, job.ID) {
+			return true
+		}
+	}
+	return false
+}
+
+// refreshJobControls withdraws only unsubmitted UI state. Never discard an
+// uncertain intent on capability/permission withdrawal: its original key and
+// If-Match can be resumed if support returns under the same credential.
+func (m *Model) refreshJobControls() {
+	if caps := m.caps(); caps != nil && operations.UsesNativeJobs(*caps) {
+		m.nativeJobsSeen = true
+	}
+	if m.readOnlyJobs() {
+		m.confirm = jobConfirm{}
+		m.review++
+		if m.reviewCancel != nil {
+			m.reviewCancel()
+			m.reviewCancel = nil
+		}
+		return
+	}
+	if m.confirm.open() && !m.jobActionAvailable(m.confirm.kind, m.confirm.job) {
+		m.confirm = jobConfirm{}
+	}
 }
 
 // inspectJob reads the job's current state and revision, superseding any
@@ -49,16 +132,23 @@ func (m *Model) inspectJob(id string, retry bool) tea.Cmd {
 	ctx, cancel := context.WithTimeout(m.ctx, loadTimeout)
 	m.reviewCancel = cancel
 	backend, epoch, review := m.backend, m.epoch, m.review
+	jobsRequest := 0
+	if s := m.cache.slots[keyJobs]; s != nil {
+		jobsRequest = s.request
+	}
 	return tea.Batch(m.spin(), func() tea.Msg {
 		defer cancel()
 		job, err := operations.InspectJob(ctx, backend, id)
-		return jobReviewed{epoch: epoch, review: review, job: job, retry: retry, err: err}
+		return jobReviewed{epoch: epoch, review: review, jobsRequest: jobsRequest, job: job, retry: retry, err: err}
 	})
 }
 
 // askRetry confirms a retry: an unresolved earlier retry is resubmitted as
 // it was; otherwise the job is inspected first.
 func (m *Model) askRetry(id string) tea.Cmd {
+	if !m.canRetryJob(id) {
+		return m.say("Retry is unavailable for this job on this server.", true)
+	}
 	if a, ok := m.jobs.Pending(operations.RetryJob, id); ok {
 		m.confirm = jobConfirm{kind: operations.RetryJob, job: id, etag: a.IfMatch, resume: true}
 		return nil
@@ -67,6 +157,9 @@ func (m *Model) askRetry(id string) tea.Cmd {
 }
 
 func (m *Model) askCancel(id string) {
+	if !m.canCancelJob(id) {
+		return
+	}
 	_, resume := m.jobs.Pending(operations.CancelJob, id)
 	m.confirm = jobConfirm{kind: operations.CancelJob, job: id, resume: resume}
 }
@@ -83,14 +176,22 @@ func (m *Model) reviewed(msg jobReviewed) tea.Cmd {
 	if msg.err != nil {
 		return tea.Batch(m.say("Couldn't read the job: "+refusal(msg.err), true), m.load(keyJobs))
 	}
+	if msg.retry && m.nativeJobsSeen {
+		if s := m.cache.slots[keyJobs]; s == nil || s.request != msg.jobsRequest {
+			return nil // request hints may change without a job revision change
+		}
+	}
 	m.replaceJob(msg.job.Value)
 	if !msg.retry {
 		return m.say("Job details refreshed.", false)
 	}
 	// Ask only while the job is still the one in view and nothing else is
 	// asking; otherwise the review is shown but no retry is offered.
-	if m.route.page != pageProcessing || m.selectedID() != msg.job.Value.ID || m.confirm.open() || m.access != nil {
+	if !m.canRetryJob(msg.job.Value.ID) || m.route.page != pageProcessing || m.selectedID() != msg.job.Value.ID || m.confirm.open() || m.access != nil {
 		return nil
+	}
+	if shown, ok := m.shownJob(msg.job.Value.ID); !ok || newerRevision(shown.Revision, msg.job.Value.Revision) {
+		return nil // a later observation superseded this review
 	}
 	m.confirm = jobConfirm{kind: operations.RetryJob, job: msg.job.Value.ID, etag: msg.job.ETag, phase: msg.job.Value.Phase}
 	return nil
@@ -146,6 +247,17 @@ func newerRevision(a, b string) bool {
 func (m *Model) confirmed() tea.Cmd {
 	c := m.confirm
 	m.confirm = jobConfirm{}
+	if !c.open() {
+		return nil
+	}
+	if !m.jobActionAvailable(c.kind, c.job) {
+		return m.say("This job action is no longer available; the request was not sent.", true)
+	}
+	if c.resume {
+		if _, pending := m.jobs.Pending(c.kind, c.job); !pending {
+			return nil // never turn a vanished replay into a fresh intent
+		}
+	}
 	if _, busy := m.acting[c.job]; busy {
 		return nil
 	}
@@ -180,6 +292,9 @@ func (m *Model) jobActionFinished(msg jobActionDone) tea.Cmd {
 	var unknown *operations.UncertainError
 	switch {
 	case errors.As(msg.err, &unknown):
+		if m.readOnlyJobs() {
+			return tea.Batch(m.say("The "+noun+" may have been applied; its original request is retained while controls are unavailable.", true), m.load(keyJobs))
+		}
 		return tea.Batch(m.say("The "+noun+" may have been applied; press "+again+" again to resubmit the same request.", true), m.load(keyJobs))
 	case msg.err != nil:
 		return tea.Batch(m.say("Couldn't "+verb+" the job: "+refusal(msg.err), true), m.load(keyJobs))

@@ -10,6 +10,8 @@ use axum::{
 use serde::Serialize;
 use std::{collections::BTreeMap, sync::atomic::Ordering};
 
+mod native_diagnostics;
+
 /// The reviewed contract, served verbatim. The JSON form is generated from
 /// the YAML by `scripts/contract_json.rb`; a test checks they stay in step.
 pub const CONTRACT_YAML: &[u8] = include_bytes!("../../contracts/Motion_Server_API_v2.yaml");
@@ -204,7 +206,7 @@ pub async fn capabilities(
         ("retention_seconds", "86400".into()),
     ]);
     let (oidc_enabled,email_enabled):(bool,bool)=sqlx::query_as("SELECT EXISTS(SELECT 1 FROM signin_providers WHERE enabled=1) AND s.reviewed_epoch=x.restore_epoch AND s.public_origin IS NOT NULL,coalesce(json_extract(s.email_json,'$.enabled'),0) AND s.reviewed_epoch=x.restore_epoch AND s.public_origin IS NOT NULL FROM signin_settings s CROSS JOIN server_identity x").fetch_one(&app.db).await?;
-    let features = vec![
+    let mut features = vec![
         api,
         feature("identity.pairing", true, true),
         feature("identity.access_management", true, true),
@@ -232,6 +234,156 @@ pub async fn capabilities(
         metrics,
         sessions,
     ];
+    if app.native_catalog.is_some() {
+        // The native backend never advertises legacy route implementations as
+        // available. Full catalog.v2 remains off while richer adapters land.
+        for feature in &mut features {
+            if !matches!(
+                feature.id,
+                "api.v2.identity"
+                    | "identity.browser_sessions"
+                    | "identity.oidc"
+                    | "identity.email_codes"
+                    | "identity.action_proofs"
+                    | "identity.trusted_private_ingress"
+                    | "access.restricted_mode"
+                    | "access.household_viewer"
+            ) {
+                feature.enabled = false;
+            }
+        }
+        // playback.v2 is the existing player-launch negotiation contract, not
+        // a claim that every legacy presentation family is native-admitted.
+        // Replace (do not merge) the legacy limits so config cannot advertise
+        // HLS/components/subtitle routes which the outer router still refuses.
+        let playback = features.iter_mut().find(|f| f.id == "playback.v2").unwrap();
+        playback.enabled = true;
+        playback.limits = BTreeMap::from([
+            ("routes", "original,prepared".into()),
+            ("timeline_binding", "whole".into()),
+            ("subtitles", "off".into()),
+            ("components", "unsupported".into()),
+            ("adaptive_bitrate", "disabled".into()),
+            ("hdr", "original_passthrough_for_compatible_clients".into()),
+            ("tickets", "file_or_delivery_generation_playback".into()),
+            ("playhead", "heartbeat_ordered_observation".into()),
+            ("viewing_restart", "recoverable".into()),
+            ("controls", "seek_whole_original".into()),
+            (
+                "admission",
+                "current_principal_scope_source_and_client_compatibility".into(),
+            ),
+            (
+                "unsupported",
+                "replan,hls,interval,multipart,components,subtitles,adaptive_bitrate,cast".into(),
+            ),
+        ]);
+        let mut native = feature("catalog.native_plain_works", true, true);
+        native.limits.insert(
+            "scope",
+            "unrestricted principals; qualified root no-file works only".into(),
+        );
+        native.limits.insert(
+            "serving_contract",
+            crate::native_catalog::SERVING_CONTRACT_VERSION.to_string(),
+        );
+        native
+            .limits
+            .insert("operations", "create,get,browse,search,replace".into());
+        native.limits.insert(
+            "unsupported",
+            crate::native_catalog::unsupported_serving_routes().join(","),
+        );
+        features.push(native);
+        let mut sources = feature("catalog.native_source_bindings", true, true);
+        sources.limits.insert(
+            "operations",
+            "create,get,list,delete,explicit_scans,scan_status,scan_cancel,scan_schedules".into(),
+        );
+        features.push(sources);
+        let mut diagnostics = feature("admin.native_diagnostics", true, true);
+        diagnostics.limits = BTreeMap::from([
+            ("operations", "GET /admin/diagnostics".into()),
+            ("authorization", "current_system_admin".into()),
+            (
+                "workload",
+                "recorded_native_scan_demands_and_processing_admissions".into(),
+            ),
+            ("failure_history_max", "100".into()),
+            (
+                "authority",
+                "observations_only_not_execution_or_catalog_grants".into(),
+            ),
+        ]);
+        features.push(diagnostics);
+        let mut auth_reads = feature("admin.native_auth_reads", true, true);
+        auth_reads.limits = BTreeMap::from([
+            ("method", "GET".into()),
+            (
+                "routes",
+                super::admin_reads::AUTH_ROUTES
+                    .iter()
+                    .copied()
+                    .chain(["/admin/auth/users/{id}"])
+                    .collect::<Vec<_>>()
+                    .join(","),
+            ),
+            ("authorization", "current_system_admin".into()),
+            ("mail_activity_detail", "stable_presence_marker_only".into()),
+            (
+                "authority",
+                "descriptive_application_state_not_library_or_access_grants".into(),
+            ),
+            (
+                "unsupported_operations",
+                "mutations,provider_tests,email_tests,email_diagnostics,restore_review_mutation"
+                    .into(),
+            ),
+        ]);
+        features.push(auth_reads);
+        features.push(feature("profiles.preferences", true, true));
+        let mut jobs = feature("processing.native_job_reads", true, true);
+        jobs.limits = BTreeMap::from([
+            ("operations", "list,get".into()),
+            ("kinds", "rendition".into()),
+            ("visibility", "current_admin_or_requester".into()),
+            ("state", "recorded_phase_and_attempt".into()),
+            (
+                "results",
+                "historical_ids_not_catalog_or_byte_authority".into(),
+            ),
+            ("unsupported_operations", "cancel,retry".into()),
+            ("unsupported_kinds", "scan,metadata,backup,preview".into()),
+        ]);
+        features.push(jobs);
+        let mut controls = feature("processing.native_preparation_controls", true, true);
+        controls.limits = BTreeMap::from([
+            ("contract_version", "1".into()),
+            ("operations", "cancel,retry".into()),
+            ("cohort", "native_preparation".into()),
+            (
+                "authorization",
+                "current_owner_or_admin_and_processing_request".into(),
+            ),
+            (
+                "cancellation",
+                "cooperative_not_confirmed_termination".into(),
+            ),
+            (
+                "retry",
+                "reviewed_original_preparation_current_admission".into(),
+            ),
+            (
+                "hints",
+                "per_row_new_requests_not_replay_or_authority".into(),
+            ),
+            (
+                "unsupported_kinds",
+                "legacy_history,scan,metadata,backup,preview".into(),
+            ),
+        ]);
+        features.push(controls);
+    }
     let mut runtime_hashes = BTreeMap::new();
     if let Some(hash) = app
         .access
@@ -291,12 +443,17 @@ pub async fn diagnostics(State(app): State<App>, caller: Caller) -> Result<Respo
             Some(playscale_core::access::Permission::SystemAdmin),
         )
         .await?;
-    let (queued,running):(i64,i64)=sqlx::query_as("SELECT coalesce(sum(phase='queued'),0),coalesce(sum(phase IN ('admitted','running','validating','publishing','cancelling')),0) FROM (SELECT phase FROM jobs UNION ALL SELECT phase FROM processing_jobs)")
+    let (queued, running, errors) = if app.native_catalog.is_some() {
+        native_diagnostics::workload_in(&mut tx).await?
+    } else {
+        let (queued,running):(i64,i64)=sqlx::query_as("SELECT coalesce(sum(phase='queued'),0),coalesce(sum(phase IN ('admitted','running','validating','publishing','cancelling')),0) FROM (SELECT phase FROM jobs UNION ALL SELECT phase FROM processing_jobs)")
         .fetch_one(&mut *tx).await?;
-    // Worker error text can contain physical paths and tool output. Report
-    // stable failure identities, never raw subprocess messages.
-    let errors:Vec<String>=sqlx::query_scalar("SELECT kind || ':' || id || ':' || phase FROM (SELECT 'scan' AS kind,id,phase,created_at AS changed FROM jobs WHERE phase='failed' UNION ALL SELECT 'processing',id,phase,updated_at FROM processing_jobs WHERE phase='failed') ORDER BY changed DESC,id LIMIT 100")
+        // Worker error text can contain physical paths and tool output. Report
+        // stable failure identities, never raw subprocess messages.
+        let errors:Vec<String>=sqlx::query_scalar("SELECT kind || ':' || id || ':' || phase FROM (SELECT 'scan' AS kind,id,phase,created_at AS changed FROM jobs WHERE phase='failed' UNION ALL SELECT 'processing',id,phase,updated_at FROM processing_jobs WHERE phase='failed') ORDER BY changed DESC,id LIMIT 100")
         .fetch_all(&mut *tx).await?;
+        (queued, running, errors)
+    };
     tx.commit().await?;
     Ok(Json(serde_json::json!({
         "server_epoch":app.access.server_epoch,

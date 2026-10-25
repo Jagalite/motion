@@ -6,7 +6,7 @@ use crate::{App, api::PresentationIdentity, v2};
 use axum::{
     Router,
     body::{Body, to_bytes},
-    extract::{Request, State},
+    extract::{FromRequestParts, Request, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
 };
@@ -72,6 +72,69 @@ fn tag(v: &Value) -> UiResult<String> {
         .map_err(|_| UiError::Unavailable)?;
     Ok(v2::etag(revision).to_str().unwrap().to_owned())
 }
+/// Recognize only the separately advertised native control contract. Job reads,
+/// rendition kind and the legacy processing capability are not control grants.
+fn native_job_controls_enabled(capabilities: &Value) -> bool {
+    let Some(features) = capabilities["features"].as_array() else {
+        return false;
+    };
+    let mut matches = features
+        .iter()
+        .filter(|feature| feature["id"] == "processing.native_preparation_controls");
+    let Some(feature) = matches.next() else {
+        return false;
+    };
+    matches.next().is_none()
+        && feature["implemented"] == true
+        && feature["enabled"] == true
+        && feature["limits"]["contract_version"] == "1"
+        && feature["limits"]["cohort"] == "native_preparation"
+        && feature["limits"]["operations"] == "cancel,retry"
+}
+
+/// Presentation of server-owned decisions only. Native phase/publication/attempt
+/// policy lives in production core and the authorized Job read, not this view.
+fn job_row(v: &Value, native: bool, native_controls: bool, can_request: bool) -> UiResult<JobRow> {
+    let phase = text(v, "phase");
+    let descriptor = &v["controls"];
+    let recognized = descriptor["family"] == "native_preparation"
+        && descriptor["version"].as_u64() == Some(1)
+        && descriptor["cohort"] == true
+        && descriptor["cancel_request_available"].is_boolean()
+        && descriptor["retry_request_available"].is_boolean();
+    let controls_available = can_request && (!native || (native_controls && recognized));
+    let (cancel_request_available, retry_request_available) = if native {
+        (
+            controls_available && descriptor["cancel_request_available"] == true,
+            controls_available && descriptor["retry_request_available"] == true,
+        )
+    } else {
+        // Preserve the existing legacy display behavior. This is not native policy.
+        (
+            controls_available
+                && !matches!(
+                    phase.as_str(),
+                    "completed" | "failed" | "cancelled" | "interrupted" | "cancelling"
+                ),
+            controls_available && matches!(phase.as_str(), "failed" | "cancelled"),
+        )
+    };
+    Ok(JobRow {
+        id: text(v, "id"),
+        kind: text(v, "kind"),
+        phase,
+        progress_percent: v["progress"]
+            .as_f64()
+            .map(|p| (p * 100.).clamp(0., 100.) as u8),
+        error_code: v["error_code"].as_str().map(str::to_owned),
+        etag: tag(v)?,
+        controls_available,
+        cancel_request_available,
+        retry_request_available,
+        native_control_recovery: native && native_controls && can_request,
+    })
+}
+
 fn strings(v: &Value) -> Vec<String> {
     v.as_array()
         .map(|a| {
@@ -250,7 +313,7 @@ impl Queries {
         if let Some(peer) = self.peer {
             request.extensions_mut().insert(peer);
         }
-        let response = v2::router()
+        let response = v2::router(self.app.clone())
             .with_state(self.app.clone())
             .oneshot(request)
             .await
@@ -325,18 +388,37 @@ impl Queries {
         }) else {
             return (None, vec![]);
         };
-        let tracks: Option<String> = sqlx::query_scalar(
-            "SELECT tracks_json FROM media_files WHERE id=? AND revision=? AND available=1 AND generated=0",
-        )
-        .bind(&file)
-        .bind(&revision)
-        .fetch_optional(&self.app.db)
-        .await
-        .ok()
-        .flatten();
-        let streams: Vec<crate::db::Track> = tracks
-            .and_then(|t| serde_json::from_str(&t).ok())
-            .unwrap_or_default();
+        let streams: Vec<crate::db::Track> = if self.app.native_catalog.is_some() {
+            let Ok(streams) = self
+                .native_audio_tracks(timeline, &version, &file, &revision)
+                .await
+            else {
+                return (None, vec![]);
+            };
+            streams
+        } else {
+            // The service boundary must independently refuse a persisted native
+            // binding without its runtime, even if an earlier DTO was admitted.
+            let Ok(mut tx) = v2::playback::begin_catalog_application(&self.app, false).await else {
+                return (None, vec![]);
+            };
+            let tracks: Option<String> = sqlx::query_scalar(
+                "SELECT tracks_json FROM media_files WHERE id=? AND revision=? AND available=1 AND generated=0",
+            )
+            .bind(&file)
+            .bind(&revision)
+            .fetch_optional(&mut *tx)
+            .await
+            .ok()
+            .flatten();
+            let streams: Vec<crate::db::Track> = tracks
+                .and_then(|t| serde_json::from_str(&t).ok())
+                .unwrap_or_default();
+            if tx.commit().await.is_err() {
+                return (None, vec![]);
+            }
+            streams
+        };
         let options = streams
             .iter()
             .filter(|t| t.kind == "audio")
@@ -355,6 +437,79 @@ impl Queries {
             })
             .collect();
         (Some((version, file, revision)), options)
+    }
+
+    /// A prior DTO is an identity selection, not a continuing authorization
+    /// lease. Resolve that exact selection again under fresh native custody.
+    async fn native_audio_tracks(
+        &self,
+        timeline: &str,
+        version: &str,
+        file: &str,
+        revision: &str,
+    ) -> UiResult<Vec<crate::db::Track>> {
+        use playscale_core::access::{self, Permission};
+        let mut request = Request::builder()
+            .uri("/catalog/timelines")
+            .body(Body::empty())
+            .map_err(|_| UiError::Unavailable)?;
+        *request.headers_mut() = self.headers.clone();
+        if let Some(ingress) = self.ingress {
+            request.extensions_mut().insert(ingress);
+        }
+        if let Some(peer) = self.peer {
+            request.extensions_mut().insert(peer);
+        }
+        let (mut parts, _) = request.into_parts();
+        let caller = v2::auth::Caller::from_request_parts(&mut parts, &self.app)
+            .await
+            .map_err(|_| UiError::Denied)?;
+        let mut tx = v2::playback::begin_catalog_application(&self.app, false)
+            .await
+            .map_err(|_| UiError::Unavailable)?;
+        let principal = caller
+            .reauthorize(&mut tx, Some(Permission::CatalogRead))
+            .await
+            .map_err(|_| UiError::Denied)?;
+        v2::playback::readable_timeline(&mut tx, &principal, timeline)
+            .await
+            .map_err(|_| UiError::Unavailable)?;
+        if !v2::playback::native_version_ready(&mut tx, version)
+            .await
+            .map_err(|_| UiError::Unavailable)?
+        {
+            return Err(UiError::Unavailable);
+        }
+        let facts = v2::content::file_facts(&mut tx, file)
+            .await
+            .map_err(|_| UiError::Unavailable)?
+            .ok_or(UiError::Unavailable)?;
+        if facts.revision != revision
+            || !access::catalog_scope(&principal).admits(facts.library_ids.iter())
+        {
+            return Err(UiError::Denied);
+        }
+        let exact: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM media_versions v JOIN version_files b ON b.version_id=v.id JOIN media_files f ON f.id=b.file_id WHERE v.id=? AND v.timeline_id=? AND v.origin='original' AND b.part=1 AND b.file_id=? AND b.file_revision=? AND f.revision=b.file_revision AND f.generated=0 AND f.available=1)")
+            .bind(version).bind(timeline).bind(file).bind(revision).fetch_one(&mut *tx).await.map_err(|_| UiError::Unavailable)?;
+        if !exact {
+            return Err(UiError::Unavailable);
+        }
+        let encoded: String = sqlx::query_scalar("SELECT p.mapping_json FROM catabolic_projection_files p JOIN catabolic_projection_state s ON s.singleton=1 AND s.generation=p.generation WHERE p.file_id=? AND p.available=1")
+            .bind(file).fetch_one(&mut *tx).await.map_err(|_| UiError::Unavailable)?;
+        let mapping: motion_catalog_backend::occurrence_bridge::OccurrenceMapping =
+            serde_json::from_str(&encoded).map_err(|_| UiError::Unavailable)?;
+        if mapping.motion_file["id"] != file
+            || mapping.motion_file["revision"] != revision
+            || mapping.motion_file["generated"] != 0
+        {
+            return Err(UiError::Unavailable);
+        }
+        let raw = mapping.motion_file["tracks_json"]
+            .as_str()
+            .ok_or(UiError::Unavailable)?;
+        let tracks = serde_json::from_str(raw).map_err(|_| UiError::Unavailable)?;
+        tx.commit().await.map_err(|_| UiError::Unavailable)?;
+        Ok(tracks)
     }
 
     /// Every row of a paged list, bounded to `pages` pages of 200. Callers
@@ -1070,23 +1225,22 @@ impl UiQueryFacade for Queries {
                 .collect()
         })
     }
-    fn jobs<'a>(&'a self, _: &'a UiPrincipal) -> BoxFuture<'a, UiResult<Vec<JobRow>>> {
+    fn jobs<'a>(&'a self, who: &'a UiPrincipal) -> BoxFuture<'a, UiResult<Vec<JobRow>>> {
         Box::pin(async move {
+            let native = self.app.native_catalog.is_some();
+            // A failed capability read cannot imply legacy support. Keep the
+            // authorized history visible, but omit all native new-action offers.
+            let native_controls = if native {
+                self.read("/system/capabilities")
+                    .await
+                    .is_ok_and(|value| native_job_controls_enabled(&value))
+            } else {
+                false
+            };
             self.list("/jobs?limit=200")
                 .await?
                 .iter()
-                .map(|v| {
-                    Ok(JobRow {
-                        id: text(v, "id"),
-                        kind: text(v, "kind"),
-                        phase: text(v, "phase"),
-                        progress_percent: v["progress"]
-                            .as_f64()
-                            .map(|p| (p * 100.).clamp(0., 100.) as u8),
-                        error_code: v["error_code"].as_str().map(str::to_owned),
-                        etag: tag(v)?,
-                    })
-                })
+                .map(|v| job_row(v, native, native_controls, who.can("processing:request")))
                 .collect()
         })
     }
@@ -1880,5 +2034,144 @@ mod version_label_tests {
             super::version_label("Original", &labeled, &[]),
             "Original · Director's cut · #c1"
         );
+    }
+}
+
+#[cfg(test)]
+mod native_job_presentation_tests {
+    use super::{job_row, native_job_controls_enabled};
+    use serde_json::{Value, json};
+
+    fn capability() -> Value {
+        json!({"features": [{
+            "id": "processing.native_preparation_controls", "implemented": true, "enabled": true,
+            "limits": {"contract_version": "1", "cohort": "native_preparation", "operations": "cancel,retry"}
+        }]})
+    }
+
+    fn job() -> Value {
+        json!({"id": "native1", "kind": "rendition", "phase": "failed", "revision": "7",
+            "controls": {"family": "native_preparation", "version": 1, "cohort": true,
+                "cancel_request_available": false, "retry_request_available": true}})
+    }
+
+    #[test]
+    fn only_recognized_enabled_native_control_capability_activates_the_view() {
+        assert!(native_job_controls_enabled(&capability()));
+        for caps in [
+            Value::Null,
+            json!({"features": []}),
+            json!({"features": [
+                {"id": "processing.native_job_reads", "implemented": true, "enabled": true},
+                {"id": "processing.renditions", "implemented": true, "enabled": true}
+            ]}),
+        ] {
+            assert!(!native_job_controls_enabled(&caps));
+        }
+        for (pointer, replacement) in [
+            ("/features/0/enabled", json!(false)),
+            ("/features/0/implemented", json!(false)),
+            ("/features/0/enabled", json!("true")),
+            ("/features/0/limits/contract_version", json!("2")),
+            ("/features/0/limits/contract_version", json!(1)),
+            ("/features/0/limits/cohort", json!("rendition")),
+            ("/features/0/limits/operations", json!("list,get")),
+        ] {
+            let mut caps = capability();
+            *caps.pointer_mut(pointer).unwrap() = replacement;
+            assert!(!native_job_controls_enabled(&caps), "{pointer}: {caps}");
+        }
+        let mut duplicate = capability();
+        let feature = duplicate["features"][0].clone();
+        duplicate["features"].as_array_mut().unwrap().push(feature);
+        assert!(!native_job_controls_enabled(&duplicate));
+    }
+
+    #[test]
+    fn native_rows_require_complete_descriptors_and_never_infer_from_kind() {
+        let supported = job_row(&job(), true, true, true).unwrap();
+        assert!(supported.controls_available && supported.retry_request_available);
+        assert!(!supported.cancel_request_available);
+        assert_eq!(supported.etag, "\"r-7\"");
+        for descriptor in [
+            Value::Null,
+            json!({}),
+            json!({"family": "native_preparation", "version": 1, "cohort": true, "retry_request_available": true}),
+            json!({"family": "native_preparation", "version": 2, "cohort": true, "cancel_request_available": false, "retry_request_available": true}),
+            json!({"family": "native_preparation", "version": "1", "cohort": true, "cancel_request_available": false, "retry_request_available": true}),
+            json!({"family": "legacy_rendition", "version": 1, "cohort": true, "cancel_request_available": false, "retry_request_available": true}),
+            json!({"family": "native_preparation", "version": 1, "cohort": false, "cancel_request_available": true, "retry_request_available": true}),
+            json!({"family": "native_preparation", "version": 1, "cohort": true, "cancel_request_available": false, "retry_request_available": "true"}),
+        ] {
+            let mut value = job();
+            value["controls"] = descriptor;
+            let row = job_row(&value, true, true, true).unwrap();
+            assert!(
+                !row.controls_available
+                    && !row.cancel_request_available
+                    && !row.retry_request_available,
+                "{value}"
+            );
+            assert!(
+                row.native_control_recovery,
+                "only an existing uncertain intent may be recovered"
+            );
+        }
+    }
+
+    #[test]
+    fn native_hints_are_action_specific_and_withdrawal_does_not_become_legacy() {
+        let mut value = job();
+        value["controls"]["retry_request_available"] = json!(false);
+        let row = job_row(&value, true, true, true).unwrap();
+        assert!(row.controls_available && row.native_control_recovery);
+        assert!(
+            !row.cancel_request_available && !row.retry_request_available,
+            "failed does not override an attempt/output/publication barrier"
+        );
+        for phase in ["queued", "running", "committing", "completed", "cancelled"] {
+            value["phase"] = json!(phase);
+            let row = job_row(&value, true, true, true).unwrap();
+            assert!(!row.cancel_request_available && !row.retry_request_available);
+            assert!(
+                row.native_control_recovery,
+                "advanced phase does not erase an uncertain exact request"
+            );
+        }
+        value["phase"] = json!("running");
+        value["controls"]["cancel_request_available"] = json!(true);
+        let row = job_row(&value, true, true, true).unwrap();
+        assert!(row.cancel_request_available && !row.retry_request_available);
+        for (enabled, permitted) in [(false, true), (true, false), (false, false)] {
+            let row = job_row(&value, true, enabled, permitted).unwrap();
+            assert!(!row.controls_available && !row.native_control_recovery);
+            assert!(!row.cancel_request_available && !row.retry_request_available);
+        }
+        let restored = job_row(&value, true, true, true).unwrap();
+        assert!(restored.cancel_request_available && restored.native_control_recovery);
+    }
+
+    #[test]
+    fn legacy_job_display_keeps_its_existing_phase_behavior() {
+        for (phase, cancel, retry) in [
+            ("queued", true, false),
+            ("running", true, false),
+            ("completed", false, false),
+            ("failed", false, true),
+            ("cancelled", false, true),
+            ("cancelling", false, false),
+            ("interrupted", false, false),
+        ] {
+            let mut value = job();
+            value["phase"] = json!(phase);
+            value.as_object_mut().unwrap().remove("controls");
+            let row = job_row(&value, false, false, true).unwrap();
+            assert!(row.controls_available);
+            assert_eq!(
+                (row.cancel_request_available, row.retry_request_available),
+                (cancel, retry)
+            );
+            assert!(!row.native_control_recovery);
+        }
     }
 }

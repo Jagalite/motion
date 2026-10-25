@@ -2,6 +2,24 @@
 //! lifecycle. Decisions live in `playscale_core::delivery`; this adapter runs one
 //! supervised FFmpeg per generation under an interactive execution reservation,
 //! reports atomically published segments, and serves only what the reducer offers.
+/// Final native HLS disclosure fence. The actual request authority resolves in
+/// v2; the same writer then covers exact native source/representation validation.
+pub(crate) async fn native_hls_release_fence(
+    app: &App,
+    id: &str,
+    generation: &str,
+    principal: &playscale_core::access::Principal,
+    tx: sqlx::Transaction<'static, sqlx::Sqlite>,
+) -> Result<sqlx::Transaction<'static, sqlx::Sqlite>, ApiError> {
+    native_hls::release_fence(app, id, generation, principal, tx).await
+}
+pub(crate) mod native_hls;
+pub(crate) mod native_previews;
+pub(crate) mod native_subtitles;
+#[cfg(all(test, unix))]
+mod native_subtitles_tests;
+pub(crate) mod supervised_descriptor;
+
 use crate::{
     App,
     api::{ApiError, admin, json},
@@ -105,6 +123,11 @@ pub struct Runtime {
     /// Concurrent subtitle conversions (each reads the whole source once).
     subtitle_slots: Arc<tokio::sync::Semaphore>,
     copy_probe_slots: Arc<tokio::sync::Semaphore>,
+    /// Native-only actual allocation owners: 8 anonymous output generations,
+    /// 2 bounded publication readers (<10 MiB each), 4 response buffers (8 MiB).
+    native_output_slots: Arc<tokio::sync::Semaphore>,
+    native_observe_slots: Arc<tokio::sync::Semaphore>,
+    native_buffer_slots: Arc<tokio::sync::Semaphore>,
     stopping: std::sync::atomic::AtomicBool,
     /// Bytes sent to clients for all deliveries since this process started.
     pub bytes_sent: Arc<std::sync::atomic::AtomicU64>,
@@ -165,6 +188,8 @@ struct Session {
     /// v1 (operator) deliveries, which v2 callers can never observe.
     owner: Option<Owner>,
     source: Source,
+    /// Private native HLS descriptor authority; never reconstructed from rows.
+    native_input: Option<Arc<native_hls::Input>>,
     /// The validated sources of a multipart timeline's later parts, in order
     /// (the first is `source`); empty for one file.
     parts: Vec<Source>,
@@ -194,6 +219,9 @@ impl Runtime {
             admission_slots: Arc::new(tokio::sync::Semaphore::new(MAX_ADMISSIONS)),
             subtitle_slots: Arc::new(tokio::sync::Semaphore::new(2)),
             copy_probe_slots: Arc::new(tokio::sync::Semaphore::new(2)),
+            native_output_slots: Arc::new(tokio::sync::Semaphore::new(8)),
+            native_observe_slots: Arc::new(tokio::sync::Semaphore::new(2)),
+            native_buffer_slots: Arc::new(tokio::sync::Semaphore::new(4)),
             stopping: std::sync::atomic::AtomicBool::new(false),
             bytes_sent: Arc::default(),
             finishing: Mutex::default(),
@@ -389,10 +417,18 @@ async fn record<'e>(
 
 /// A delivery this process no longer holds: its last recorded state.
 async fn recorded(app: &App, id: &str) -> Result<Option<(String, String, Delivery)>, ApiError> {
+    let mut conn = app.db.acquire().await?;
+    recorded_in(&mut conn, id).await
+}
+
+async fn recorded_in(
+    conn: &mut sqlx::SqliteConnection,
+    id: &str,
+) -> Result<Option<(String, String, Delivery)>, ApiError> {
     let row: Option<(String, String, String)> =
         sqlx::query_as("SELECT file_id,file_revision,state_json FROM delivery_sessions WHERE id=?")
             .bind(id)
-            .fetch_optional(&app.db)
+            .fetch_optional(conn)
             .await?;
     row.map(|(file, revision, state)| {
         serde_json::from_str(&state)
@@ -447,6 +483,10 @@ fn dispatch(app: &App, session: &Arc<Session>, inner: &mut Inner, effects: Vec<E
                 generation,
                 below_index,
             } => {
+                if let Some(input) = &session.native_input {
+                    input.discard(generation, Some(below_index));
+                    continue; // Anonymous native outputs have no pathname leaves to discard.
+                }
                 let directory = session.directory(app, generation);
                 tokio::task::spawn_blocking(move || {
                     discard(&directory, below_index);
@@ -455,9 +495,14 @@ fn dispatch(app: &App, session: &Arc<Session>, inner: &mut Inner, effects: Vec<E
                 });
             }
             Effect::Cleanup { generation } => {
+                if let Some(input) = &session.native_input {
+                    input.discard(generation, None);
+                }
                 inner.workers.remove(&generation);
                 let directory = session.directory(app, generation);
+                let retained = session.native_input.as_ref().map(|_| session.clone());
                 tokio::task::spawn_blocking(move || {
+                    let _retained = retained;
                     if directory.exists()
                         && let Err(error) = std::fs::remove_dir_all(&directory)
                     {
@@ -1622,7 +1667,21 @@ async fn observe(
     max_bitrate_bps: Option<u64>,
     recent: &mut Vec<(u64, u64)>,
     mut low: Option<&mut LowVariant>,
+    lease: &Arc<execution::Lease>,
+    successful_exit: bool,
 ) -> bool {
+    if session.native_input.is_some() {
+        return native_hls::observe(
+            app,
+            session,
+            generation,
+            reported,
+            start_ms,
+            lease,
+            successful_exit,
+        )
+        .await;
+    }
     // Stop writing before the volume drops below the configured free-space floor.
     let floor = app.storage.settings.min_free_bytes;
     let space = {
@@ -1914,6 +1973,14 @@ async fn run_generation(
             None => return,
         }
     };
+    if let Some(input) = &session.native_input {
+        if !playscale_core::delivery::native_whole_hls(&pin)
+            || pin.recipe_digest.as_deref() != Some(RECIPE)
+            || native_hls::validate(&app, input).await.is_err()
+        {
+            return fail(&app, &session);
+        }
+    }
     let operation = pin.operation;
     // A hardware encode also needs a hardware session, held exactly as long as
     // the CPU reservation: released only after the encoder's exit is confirmed.
@@ -1974,9 +2041,24 @@ async fn run_generation(
                 .collect(),
         )
     };
+    let native_output_capacity = if session.native_input.is_some() {
+        match app
+            .processing
+            .deliveries
+            .native_output_slots
+            .clone()
+            .try_acquire_owned()
+        {
+            Ok(slot) => Some(slot),
+            Err(_) => return fail(&app, &session),
+        }
+    } else {
+        None
+    };
     let prepared = {
         let directory = directory.clone();
         let source = session.source.clone();
+        let native_input = session.native_input.clone();
         let later = session.parts.clone();
         let parts = durations.len();
         let floor = app.storage.settings.min_free_bytes;
@@ -1992,7 +2074,10 @@ async fn run_generation(
                     std::fs::create_dir_all(directory.join(LOW_VARIANT))?;
                 }
                 crate::storage::require_space(&directory, GENERATION_RESERVE_BYTES, floor)?;
-                let input = source_valid(&source)?;
+                let input = match &native_input {
+                    Some(input) => input.descriptor()?,
+                    None => source_valid(&source)?,
+                };
                 anyhow::ensure!(
                     later.len() + 1 == parts.max(1),
                     "part sources do not match the pin"
@@ -2001,8 +2086,15 @@ async fn run_generation(
                     .iter()
                     .map(source_valid)
                     .collect::<anyhow::Result<Vec<_>>>()?;
-                let (witness, held) = execution::Witness::create(&directory.join(".owner"))?;
-                anyhow::Ok((input, later, witness, held))
+                let native_outputs = native_output_capacity
+                    .map(|capacity| native_hls::prepare(&directory, capacity))
+                    .transpose()?;
+                let (witness, held) = if native_input.is_some() {
+                    execution::Witness::create_anchored(&directory.join(".owner"))?
+                } else {
+                    execution::Witness::create(&directory.join(".owner"))?
+                };
+                anyhow::Ok((input, later, witness, held, native_outputs))
             },
             move || {
                 stopped(&late_app, &late_session);
@@ -2016,7 +2108,7 @@ async fn run_generation(
         };
         prepared
     };
-    let (input, later, witness, held) = match prepared {
+    let (input, later, witness, held, native_outputs) = match prepared {
         Ok(Ok(prepared)) => prepared,
         Ok(Err(error)) => {
             tracing::warn!(delivery=%session.id, generation, %error, "delivery generation not started");
@@ -2120,43 +2212,68 @@ async fn run_generation(
     // Relative filter inputs (a burned subtitle) resolve from the generation
     // directory, so executables given as relative paths are resolved against
     // the server's own working directory first; bare names still use PATH.
+    let mut encoder_arguments = arguments(
+        operation,
+        pin.recipe_digest.as_deref() == Some(VIDEOTOOLBOX_RECIPE),
+        // Logical time is file time offset by the interval's start.
+        seek_ms + pin.clip.map_or(0, |clip| clip.start_ms),
+        pin.clip.map(|clip| clip.end_ms),
+        audio,
+        pinned_burn(&pin),
+        burn_from,
+        part_inputs.as_deref().zip(session.canvas),
+        pin.max_bitrate_bps
+            .and_then(|b| playscale_core::playback_session::rate_cap(b, PEAK_WINDOW_MS)),
+        pin.adaptive,
+        pin.tone_map,
+        &directory,
+    );
+    if session.native_input.is_some() && native_hls::arguments(&mut encoder_arguments).is_err() {
+        return fail(&app, &session);
+    }
     let mut supervisor = Command::new(resolved_executable(&app.processing.supervisor));
     supervisor.current_dir(&directory);
     supervisor
         .arg("--internal-ffmpeg-supervisor")
         .arg(resolved_executable(&app.processing.settings.ffmpeg))
-        .args(arguments(
-            operation,
-            pin.recipe_digest.as_deref() == Some(VIDEOTOOLBOX_RECIPE),
-            // Logical time is file time offset by the interval's start.
-            seek_ms + pin.clip.map_or(0, |clip| clip.start_ms),
-            pin.clip.map(|clip| clip.end_ms),
-            audio,
-            pinned_burn(&pin),
-            burn_from,
-            part_inputs.as_deref().zip(session.canvas),
-            pin.max_bitrate_bps
-                .and_then(|b| playscale_core::playback_session::rate_cap(b, PEAK_WINDOW_MS)),
-            pin.adaptive,
-            pin.tone_map,
-            &directory,
-        ))
+        .args(encoder_arguments)
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .kill_on_drop(false);
     // fd 3: the validated source; fd 4: the execution witness; fd 5 onward:
-    // the validated later parts of a multipart timeline.
+    // the validated later parts of a multipart timeline; native whole-file
+    // generations instead inherit their anonymous media/manifest at fd 5/6.
     #[cfg(unix)]
     {
         let mut inherited = vec![&input, &held.0];
         inherited.extend(later.iter());
+        if let Some(outputs) = &native_outputs {
+            inherited.extend([&outputs.media, &outputs.manifest]);
+            native_hls::configure(&mut supervisor);
+        }
         execution::inherit(&mut supervisor, &inherited);
+    }
+    if let Some(input) = &session.native_input {
+        // Preparation may have stalled. No child is started from the old
+        // admission/source observation, even though its descriptor is retained.
+        if native_hls::validate(&app, input).await.is_err()
+            || native_outputs
+                .as_ref()
+                .is_none_or(|outputs| input.register(generation, outputs.clone()).is_err())
+        {
+            return fail(&app, &session);
+        }
     }
     if stop.is_cancelled() {
         return stopped(&app, &session);
     }
-    if let Err(error) = lease.started(&directory.join(".owner")).and_then(|()| {
+    let registered = if session.native_input.is_some() {
+        lease.started_retained(&witness)
+    } else {
+        lease.started(&directory.join(".owner"))
+    };
+    if let Err(error) = registered.and_then(|()| {
         hardware_lease.as_ref().map_or(Ok(()), |hardware| {
             hardware.started(&directory.join(".owner"))
         })
@@ -2178,7 +2295,9 @@ async fn run_generation(
     if let Some(mut stderr) = child.stderr.take() {
         // Drain continuously; retain a bounded tail for diagnostics.
         let id = session.id.clone();
+        let retained = session.native_input.as_ref().map(|_| session.clone());
         tokio::spawn(async move {
+            let _retained = retained;
             let mut tail = Vec::new();
             let mut buffer = [0u8; 4096];
             while let Ok(n) = stderr.read(&mut buffer).await {
@@ -2269,6 +2388,8 @@ async fn run_generation(
                             pin.max_bitrate_bps,
                             &mut recent,
                             low.as_mut(),
+                            &lease,
+                            false,
                         ),
                     ) => observed,
                 };
@@ -2298,6 +2419,53 @@ async fn run_generation(
         }
     };
     drop(heartbeat);
+    if session.native_input.is_some() {
+        let success = exit
+            .as_ref()
+            .is_some_and(|status| status.as_ref().is_ok_and(|status| status.success()));
+        let child = if exit.is_some() { None } else { Some(child) };
+        let (final_app, final_session, final_lease) = (app.clone(), session.clone(), lease.clone());
+        execution::confirm_exit(
+            &lease,
+            child,
+            Some(witness),
+            execution::TERMINATION_DEADLINE,
+            move || {
+                // This callback runs only on actual child/witness exit, also
+                // after a late reaper. Its owned task retains native authority,
+                // output descriptors and I/O capacity through final inspection.
+                tokio::spawn(async move {
+                    let mut reported = 0;
+                    let finished = if success {
+                        matches!(
+                            tokio::time::timeout(
+                                OBSERVE_DEADLINE,
+                                native_hls::observe(
+                                    &final_app,
+                                    &final_session,
+                                    generation,
+                                    &mut reported,
+                                    start_ms,
+                                    &final_lease,
+                                    true
+                                )
+                            )
+                            .await,
+                            Ok(true)
+                        )
+                    } else {
+                        false
+                    };
+                    if !finished {
+                        let _ = apply(&final_app, &final_session, Input::Failed { generation });
+                    }
+                    let _ = apply(&final_app, &final_session, Input::Stopped { generation });
+                });
+            },
+        )
+        .await;
+        return;
+    }
     let (app2, session2) = (app.clone(), session.clone());
     match exit {
         Some(status) => {
@@ -2317,6 +2485,8 @@ async fn run_generation(
                     pin.max_bitrate_bps,
                     &mut recent,
                     low.as_mut(),
+                    &lease,
+                    status.as_ref().is_ok_and(|status| status.success()),
                 ),
             )
             .await;
@@ -2358,9 +2528,15 @@ async fn run_generation(
 /// Fail current generations whose source is no longer an available, enabled,
 /// unchanged catalog file (e.g. after library detach or a rescan).
 async fn revalidate(app: &App, session: &Arc<Session>) {
+    if let Some(input) = &session.native_input {
+        if native_hls::validate(app, input).await.is_err() {
+            let _ = apply(app, session, Input::Close);
+        }
+        return;
+    }
     if let Some(owner) = &session.owner {
         let allowed = async {
-            let mut tx = app.db.begin().await.map_err(crate::v2::Problem::from)?;
+            let mut tx = crate::v2::playback::begin_catalog_application(app, false).await?;
             let device = crate::v2::auth::load_device(&mut tx, &owner.principal).await?;
             // Observed only while the deployment admits the household viewer.
             let household =
@@ -2369,8 +2545,7 @@ async fn revalidate(app: &App, session: &Arc<Session>) {
                 } else {
                     None
                 };
-            let file = crate::v2::content::file_facts(&mut tx, &owner.file).await?;
-            Ok::<_, crate::v2::Problem>(playscale_core::playback_session::may_continue(
+            let principal = playscale_core::playback_session::continuation_principal(
                 owner,
                 device.as_ref().map(|d| &d.device),
                 household.as_ref().map(|(library_ids, profile_ids)| {
@@ -2379,8 +2554,17 @@ async fn revalidate(app: &App, session: &Arc<Session>) {
                         profile_ids,
                     }
                 }),
-                file.as_ref(),
-            ))
+            );
+            let Some(principal) = principal else {
+                return Ok(false);
+            };
+            crate::v2::playback::require_native_scope(&mut tx, &principal).await?;
+            let file =
+                crate::v2::content::transport_file_facts(&mut tx, &principal, &owner.file).await?;
+            let allowed =
+                playscale_core::playback_session::may_control(owner, &principal, file.as_ref());
+            tx.commit().await?;
+            Ok::<_, crate::v2::Problem>(allowed)
         }
         .await;
         // Observation failures cannot keep unauthorized execution alive.
@@ -2454,6 +2638,12 @@ pub async fn worker(app: App, stop: CancellationToken) -> anyhow::Result<()> {
                         }
                     }
                     finishing(&app, &session, stopped);
+                    if session.native_input.is_some() {
+                        // Stop lookup/admission, not actual custody. The live
+                        // worker/reaper and body/I/O owners retain their Arcs;
+                        // native revocation drains only after those release.
+                        app.processing.deliveries.sessions.lock().unwrap().remove(&session.id);
+                    }
                 }
                 // Graceful HTTP shutdown is still sending responses: wait for
                 // them briefly, and keep retrying failed writes. Rows left
@@ -3715,6 +3905,19 @@ pub trait AdmissionAuthority: Send + Sync + 'static {
     fn fresh(&self) -> Result<(), ApiError> {
         Ok(())
     }
+    /// Prepare source authority only for a new, currently fresh admission.
+    /// Exact receipt replay must not reopen a source or repeat preparation.
+    /// The admission owner retains the same writer across this await; this
+    /// callback must not dispatch an encoder. Freshness is checked again after
+    /// preparation and immediately before durable admission.
+    fn prepare_new<'a>(
+        &'a self,
+        _: &'a mut sqlx::SqliteConnection,
+        _: &'a CreateRequest,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), ApiError>> + Send + 'a>>
+    {
+        Box::pin(async { Ok(()) })
+    }
 }
 struct LegacyAdmin;
 impl AdmissionAuthority for LegacyAdmin {
@@ -3733,6 +3936,7 @@ impl AdmissionAuthority for LegacyAdmin {
 /// A v2 admission: the plan's owner and route. The authority adapter rechecks
 /// the plan (`playback_session::admit`) inside the admission transaction.
 pub(crate) struct Planned {
+    pub native_input: Option<native_hls::Slot>,
     pub owner: Owner,
     pub version: String,
     pub route: Route,
@@ -3791,6 +3995,15 @@ pub(crate) fn live_owner(app: &App, id: &str) -> Option<Owner> {
         .session(id)
         .ok()
         .and_then(|s| s.owner.clone())
+}
+
+/// Selects the private descriptor-owned HLS response boundary, never a public
+/// route or a path-based source fallback.
+pub(crate) fn native_hls_session(app: &App, id: &str) -> bool {
+    app.processing
+        .deliveries
+        .session(id)
+        .is_ok_and(|session| session.native_input.is_some())
 }
 
 /// Current view of a live delivery.
@@ -3925,6 +4138,20 @@ pub(crate) struct Selection {
 }
 
 /// Stage a seek (`selection` None keeps the newest pin) or a planned replan.
+/// Row selection only, never authorization. Native callers must first retain
+/// current transport/version proof and principal custody on this connection.
+async fn replan_file(
+    conn: &mut sqlx::SqliteConnection,
+    file: &str,
+    native: bool,
+) -> Result<Option<db::ItemRow>, sqlx::Error> {
+    sqlx::query_as("SELECT * FROM catalog_files WHERE id=? AND available=1 AND (? OR library_id IN (SELECT id FROM libraries WHERE enabled=1))")
+        .bind(file)
+        .bind(native)
+        .fetch_optional(conn)
+        .await
+}
+
 /// The replacement pin is validated against the current catalog row and the
 /// core live-route rule before the reducer stages it.
 pub(crate) async fn change_live(
@@ -3953,9 +4180,10 @@ pub(crate) async fn change_live(
                     .map(|g| (g.pin.clone(), d.timeline.clone()))
             };
             let (basis, timeline) = basis.ok_or_else(|| error(core::Error::GenerationConflict))?;
-            let file: db::ItemRow = sqlx::query_as("SELECT * FROM catalog_files WHERE id=? AND available=1 AND library_id IN (SELECT id FROM libraries WHERE enabled=1)")
-                .bind(&session.file_id)
-                .fetch_optional(&mut *conn)
+            // The sole v2 caller has already checked current native transport,
+            // version and actor authority under this same application writer.
+            // Legacy enabled is scan scheduling, not native source lifecycle.
+            let file = replan_file(conn, &session.file_id, app.native_catalog.is_some())
                 .await?
                 .ok_or_else(ApiError::not_found)?;
             if file.revision != session.revision {
@@ -4227,6 +4455,37 @@ pub(crate) fn change_replay(
     replayed_change(&session.inner.lock().unwrap(), receipt)
 }
 
+/// Narrow native control cohort. The caller holds the current application
+/// writer; all enabled v2 changes serialize through that same writer.
+pub(crate) fn whole_byte_control(app: &App, id: &str) -> Result<bool, ApiError> {
+    let session = app.processing.deliveries.session(id)?;
+    let inner = session.inner.lock().unwrap();
+    whole_byte_control_state(&inner.delivery, &session.file_id, &session.revision)
+}
+fn whole_byte_control_state(d: &Delivery, file: &str, revision: &str) -> Result<bool, ApiError> {
+    // Preserve core terminal conflict before checking the narrower native cohort.
+    // The caller has already authorized and consulted durable replay.
+    if d.status.fenced() {
+        return Err(error(core::Error::DeliveryClosed));
+    }
+    Ok(d.active.is_some()
+        && d.active.into_iter().chain(d.pending).all(|n| {
+            d.generations.get(&n).is_some_and(|g| {
+                matches!(g.pin.operation, Operation::Original | Operation::Prepared)
+                    && g.pin
+                        .tracks
+                        .iter()
+                        .all(|track| !track.starts_with("subtitle") || track == "subtitle:none")
+                    && g.pin.max_bitrate_bps.is_none()
+                    && !g.pin.adaptive
+                    && g.pin.source_file == file
+                    && g.pin.source_revision == revision
+                    && g.pin.clip.is_none()
+                    && g.pin.parts.is_empty()
+            })
+        }))
+}
+
 /// The v2 owner of a delivery: held live, or recorded at its admission.
 pub(crate) async fn owner(
     app: &App,
@@ -4254,11 +4513,15 @@ pub(crate) async fn owner(
 }
 
 /// Current view of a delivery: live, or its last recorded (fenced) state.
-pub(crate) async fn any_view(app: &App, id: &str) -> Result<Option<DeliveryView>, ApiError> {
+pub(crate) async fn any_view(
+    app: &App,
+    conn: &mut sqlx::SqliteConnection,
+    id: &str,
+) -> Result<Option<DeliveryView>, ApiError> {
     if let Some(view) = live_view(app, id) {
         return Ok(Some(view));
     }
-    Ok(recorded(app, id)
+    Ok(recorded_in(conn, id)
         .await?
         .map(|(file, revision, d)| view_of(app, id, &file, &revision, &d)))
 }
@@ -4309,6 +4572,27 @@ async fn admit_owned(
     let original = planned
         .as_ref()
         .is_some_and(|p| matches!(p.route, Route::Original | Route::Prepared));
+    if app.native_catalog.is_some()
+        && !original
+        && !planned.as_ref().is_some_and(|p| {
+            p.native_input.is_some()
+                && p.route == Route::Transcode
+                && p.clip.is_none()
+                && p.parts.is_empty()
+                && p.sidecar.is_none()
+                && p.burn.is_none()
+                && p.max_bitrate_bps.is_none()
+                && !p.adaptive
+                && r.subtitle_track.is_none()
+        })
+    {
+        // No legacy probe, source reopen or hardware warm-up may precede this gate.
+        return Err(ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "native_delivery_route_unavailable",
+            "Native HLS has no admitted descriptor owner",
+        ));
+    }
     let version = planned.as_ref().map(|p| p.version.clone());
     use playscale_core::delivery_admission::{self as admission, Decision, Identity, Receipt};
     use sha2::{Digest, Sha256};
@@ -4428,6 +4712,34 @@ async fn admit_owned(
         }
     }
     authority.fresh()?;
+    authority.prepare_new(&mut transaction, &r).await?;
+    authority.fresh()?;
+    let native_input = planned
+        .as_ref()
+        .and_then(|p| p.native_input.as_ref())
+        .and_then(|slot| slot.lock().unwrap().clone());
+    if app.native_catalog.is_some() && !original && native_input.is_none() {
+        return Err(ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "native_delivery_route_unavailable",
+            "Native HLS has no admitted descriptor owner",
+        ));
+    }
+    if let Some(input) = &native_input {
+        let p = planned.as_ref().ok_or_else(ApiError::not_found)?;
+        if !input.matches(&p.owner, &p.version)
+            || p.route != Route::Transcode
+            || p.clip.is_some()
+            || !p.parts.is_empty()
+            || p.sidecar.is_some()
+            || p.burn.is_some()
+            || p.adaptive
+            || p.max_bitrate_bps.is_some()
+            || r.subtitle_track.is_some()
+        {
+            return Err(ApiError::not_found());
+        }
+    }
     let artifacts = app
         .processing
         .artifacts
@@ -4447,8 +4759,8 @@ async fn admit_owned(
         ));
     }
 
-    let file: db::ItemRow = sqlx::query_as("SELECT * FROM catalog_files WHERE id=? AND available=1 AND library_id IN (SELECT id FROM libraries WHERE enabled=1)")
-        .bind(&r.file_id)
+    let file: db::ItemRow = sqlx::query_as("SELECT * FROM catalog_files WHERE id=? AND available=1 AND (? OR library_id IN (SELECT id FROM libraries WHERE enabled=1))")
+        .bind(&r.file_id).bind(native_input.is_some())
         .fetch_optional(&mut *transaction)
         .await?
         .ok_or_else(ApiError::not_found)?;
@@ -4610,11 +4922,15 @@ async fn admit_owned(
     if duration_ms.is_none() && !original {
         return Err(ApiError::bad("Live conversion requires a probed duration"));
     }
-    let (root, root_identity): (String, String) =
+    let (root, root_identity): (String, String) = if native_input.is_some() {
+        // These legacy descriptors are deliberately inert for native workers.
+        (String::new(), String::new())
+    } else {
         sqlx::query_as("SELECT root,root_identity FROM libraries WHERE id=?")
             .bind(&file.library_id)
             .fetch_one(&mut *transaction)
-            .await?;
+            .await?
+    };
     if !cfg!(unix) && !original {
         // Encoder input is the inherited validated descriptor (Unix only).
         return Err(ApiError::new(
@@ -4657,12 +4973,19 @@ async fn admit_owned(
         runtime.now_ms(),
     )
     .map_err(error)?;
+    if native_input.is_some()
+        && (!playscale_core::delivery::native_whole_hls(&delivery.generations[&1].pin)
+            || delivery.generations[&1].pin.recipe_digest.as_deref() != Some(RECIPE))
+    {
+        return Err(ApiError::not_found());
+    }
     let session = Arc::new(Session {
         id: new_id(),
         _artifacts: artifacts,
         file_id: file.id.clone(),
         revision: file.revision.clone(),
         owner: planned.as_ref().map(|p| p.owner.clone()),
+        native_input: native_input.clone(),
         stream_rates: serde_json::from_str::<Vec<db::Track>>(&file.tracks_json)
             .map(|tracks| {
                 (
@@ -4700,9 +5023,17 @@ async fn admit_owned(
             .collect(),
         source: Source {
             root: root.into(),
-            relative: file.relative_path.clone().into(),
+            relative: if native_input.is_some() {
+                PathBuf::new()
+            } else {
+                file.relative_path.clone().into()
+            },
             root_identity,
-            fingerprint: file.fingerprint.clone(),
+            fingerprint: if native_input.is_some() {
+                String::new()
+            } else {
+                file.fingerprint.clone()
+            },
         },
         inner: Mutex::new(Inner {
             delivery: delivery.clone(),
@@ -4781,6 +5112,10 @@ async fn admit_owned(
     tokio::fs::create_dir(&directory)
         .await
         .map_err(ApiError::internal)?;
+    if let Err(error) = authority.fresh() {
+        let _ = tokio::fs::remove_dir(&directory).await;
+        return Err(error);
+    }
     if let Err(error) = transaction.commit().await {
         let _ = tokio::fs::remove_dir(&directory).await;
         return Err(error.into());
@@ -5071,6 +5406,16 @@ async fn admit_stream(
             "Too many open streams",
         )
     })?;
+    if let Some(input) = &session.native_input {
+        native_hls::validate(app, input).await?;
+        if !local(
+            &session.inner.lock().unwrap().delivery,
+            app.processing.deliveries.now_ms(),
+        ) {
+            return Err(ApiError::not_found());
+        }
+        return Ok((session, permit));
+    }
     let current: Option<String> = sqlx::query_scalar("SELECT revision FROM catalog_files WHERE id=? AND available=1 AND library_id IN (SELECT id FROM libraries WHERE enabled=1)")
         .bind(&session.file_id)
         .fetch_optional(&app.db)
@@ -5096,6 +5441,23 @@ pub async fn playlist(
     .await
 }
 
+/// Bind a native master playlist's admitted bytes to actual session/transfer
+/// custody. The v2 adapter still supplies the final real-request auth fence.
+pub(crate) async fn native_hls_playlist_body(
+    app: &App,
+    id: &str,
+    generation: &str,
+    text: String,
+) -> Result<axum::body::Body, ApiError> {
+    let generation = generation_number(generation)?;
+    let (session, permit) = admit_stream(app, id, |delivery, now| {
+        delivery.serves(generation, now)
+            && delivery.generations[&generation].pin.operation.segmented()
+    })
+    .await?;
+    native_hls::text_body(app, session, permit, text)
+}
+
 /// The media playlist of a serving segmented generation, with URIs relative
 /// to wherever the caller serves it.
 pub(crate) async fn playlist_with(
@@ -5109,7 +5471,7 @@ pub(crate) async fn playlist_with(
     let serves = |d: &Delivery, now| {
         d.serves(generation, now) && d.generations[&generation].pin.operation.segmented()
     };
-    let (session, _permit) = admit_stream(app, id, serves).await?;
+    let (session, permit) = admit_stream(app, id, serves).await?;
     let text = {
         let inner = session.inner.lock().unwrap();
         let d = &inner.delivery;
@@ -5119,6 +5481,10 @@ pub(crate) async fn playlist_with(
         }
         core::media_playlist(&d.generations[&generation], segment_uri, init_uri)
     };
+    if session.native_input.is_some() {
+        let body = native_hls::text_body(app, session, permit, text)?;
+        return Ok((stream_headers("application/vnd.apple.mpegurl"), body).into_response());
+    }
     Ok((stream_headers("application/vnd.apple.mpegurl"), text).into_response())
 }
 
@@ -5197,6 +5563,12 @@ pub(crate) async fn init_codecs(
         d.serves(generation, now) && d.generations[&generation].next_segment > 0
     })
     .await?;
+    if session.native_input.is_some() {
+        if variant.is_some() {
+            return Err(ApiError::not_found());
+        }
+        return native_hls::codecs(app, session, generation, permit).await;
+    }
     let directory = session.directory(app, generation);
     let path = variant
         .map_or(directory.clone(), |v| directory.join(v))
@@ -5294,6 +5666,10 @@ pub async fn init(
         d.serves(generation, now) && d.generations[&generation].next_segment > 0
     })
     .await?;
+    if session.native_input.is_some() {
+        return native_hls::serve_output(&app, session, generation, "init.mp4".into(), permit)
+            .await;
+    }
     file(permit, session.directory(&app, generation).join("init.mp4")).await
 }
 
@@ -5932,6 +6308,16 @@ pub async fn segment(
         .ok_or_else(ApiError::not_found)?;
     let (session, permit) =
         admit_stream(&app, &id, |d, now| d.fetchable(generation, index, now)).await?;
+    if session.native_input.is_some() {
+        return native_hls::serve_output(
+            &app,
+            session,
+            generation,
+            format!("seg{index}.m4s"),
+            permit,
+        )
+        .await;
+    }
     file(
         permit,
         session
@@ -5943,6 +6329,125 @@ pub async fn segment(
 
 #[cfg(test)]
 mod tests {
+    // This proves the production selector, not a fabricated native admission.
+    // Native descriptor custody currently requires enabled=1; lifecycle denial
+    // is covered separately using the real source-withdrawal HTTP fixture.
+    #[tokio::test]
+    async fn replan_row_selection_does_not_treat_native_scan_scheduling_as_authority() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = crate::db::connect(&dir.path().join("selector.sqlite"))
+            .await
+            .unwrap();
+        sqlx::raw_sql("INSERT INTO libraries(id,name,root,root_identity,enabled) VALUES('source','Source','/selector-only','test',0);
+            INSERT INTO items(id,title,kind) VALUES('work','Work','video');
+            INSERT INTO editions(id,item_id,label) VALUES('edition','work','Original');
+            INSERT INTO media_files(id,edition_id,library_id,relative_path,revision,fingerprint,bytes) VALUES('file','edition','source','file.mp4','revision','fingerprint',1);")
+            .execute(&db).await.unwrap();
+        let mut conn = db.acquire().await.unwrap();
+        assert!(
+            replan_file(&mut conn, "file", false)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            replan_file(&mut conn, "file", true)
+                .await
+                .unwrap()
+                .unwrap()
+                .revision,
+            "revision"
+        );
+        sqlx::query("UPDATE media_files SET available=0 WHERE id='file'")
+            .execute(&mut *conn)
+            .await
+            .unwrap();
+        assert!(
+            replan_file(&mut conn, "file", true)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        sqlx::query("UPDATE media_files SET available=1 WHERE id='file'")
+            .execute(&mut *conn)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE libraries SET enabled=1 WHERE id='source'")
+            .execute(&mut *conn)
+            .await
+            .unwrap();
+        assert!(
+            replan_file(&mut conn, "file", false)
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn native_control_preserves_core_terminal_conflicts_without_widening_pin_cohort() {
+        let (initial, _) = Delivery::admit(
+            "timeline".into(),
+            Pin {
+                source_file: "file".into(),
+                source_revision: "revision".into(),
+                tracks: tracks(None, None),
+                operation: Operation::Original,
+                recipe_digest: None,
+                clip: None,
+                parts: vec![],
+                max_bitrate_bps: None,
+                adaptive: false,
+                tone_map: None,
+            },
+            0,
+            Some(60_000),
+            0,
+        )
+        .unwrap();
+        assert!(matches!(
+            whole_byte_control_state(&initial, "file", "revision"),
+            Ok(true)
+        ));
+        assert!(matches!(
+            whole_byte_control_state(&initial, "other", "revision"),
+            Ok(false)
+        ));
+        let mut prepared = initial.clone();
+        for generation in prepared.generations.values_mut() {
+            generation.pin.operation = Operation::Prepared;
+        }
+        assert!(matches!(
+            whole_byte_control_state(&prepared, "file", "revision"),
+            Ok(true)
+        ));
+        for generation in prepared.generations.values_mut() {
+            generation.pin.tracks.push("subtitle-sidecar:test".into());
+        }
+        assert!(matches!(
+            whole_byte_control_state(&prepared, "file", "revision"),
+            Ok(false)
+        ));
+        let mut generated = initial.clone();
+        for generation in generated.generations.values_mut() {
+            generation.pin.operation = Operation::VideoTranscode;
+        }
+        assert!(matches!(
+            whole_byte_control_state(&generated, "file", "revision"),
+            Ok(false)
+        ));
+        for event in [Input::Close, Input::Interrupt] {
+            let (terminal, _) = core::transition(&initial, &event).unwrap();
+            assert!(terminal.status.fenced());
+            let denied = match whole_byte_control_state(&terminal, "file", "revision") {
+                Ok(_) => panic!("terminal delivery escaped existing conflict"),
+                Err(error) => error,
+            };
+            assert_eq!(denied.parts().0, StatusCode::CONFLICT);
+            assert_eq!(denied.parts().1, "delivery_closed");
+        }
+    }
+
     #[tokio::test]
     async fn subtitle_admission_survives_cancelled_blocking_waiter() {
         let slots = std::sync::Arc::new(tokio::sync::Semaphore::new(1));

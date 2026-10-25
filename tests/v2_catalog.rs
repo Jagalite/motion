@@ -44,6 +44,7 @@ impl Fixture {
         std::fs::create_dir(&state).unwrap();
         let app = App {
             health: Arc::new(playscale::operations::Health::new(false)),
+            native_catalog: None,
             db,
             admin_token: Arc::new(OPERATOR.into()),
             origin: Arc::new(ORIGIN.into()),
@@ -91,6 +92,51 @@ impl Fixture {
             .body(body.map(|v| Body::from(v.to_string())).unwrap_or_default())
             .unwrap();
         let response = api::router(self.app.clone(), None)
+            .oneshot(request)
+            .await
+            .unwrap();
+        let status = response.status();
+        let headers = response.headers().clone();
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let body = if bytes.is_empty() {
+            Value::Null
+        } else {
+            serde_json::from_slice(&bytes)
+                .unwrap_or_else(|_| Value::String(String::from_utf8_lossy(&bytes).into()))
+        };
+        Reply {
+            status,
+            headers,
+            body,
+        }
+    }
+
+    async fn edition_adapter(
+        &self,
+        method: &str,
+        path: &str,
+        body: Option<Value>,
+        headers: &[(&str, &str)],
+    ) -> Reply {
+        let mut request = Request::builder()
+            .method(method)
+            .uri(path)
+            .header("host", "127.0.0.1:8787");
+        if body.is_some() {
+            request = request.header("content-type", "application/json");
+        }
+        for (k, v) in headers {
+            request = request.header(*k, *v);
+        }
+        let request = request
+            .body(body.map(|v| Body::from(v.to_string())).unwrap_or_default())
+            .unwrap();
+        let response = axum::Router::new()
+            .route(
+                "/api/v2/catalog/items/{id}/editions",
+                axum::routing::post(playscale::v2::catalog::create_edition),
+            )
+            .with_state(self.app.clone())
             .oneshot(request)
             .await
             .unwrap();
@@ -2968,4 +3014,1434 @@ async fn later_manual_marker_correction_supersedes_earlier_value() {
     assert_eq!(ids(&page), [second.body["id"].as_str().unwrap()]);
     let all = f.call("GET", path, None, &[("authorization", &op)]).await;
     assert_eq!(all.body["items"].as_array().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn native_plain_work_http_uses_native_owner_and_survives_restart() {
+    let mut f = Fixture::new().await;
+    let scoped_reader = f.device(&["catalog:read"], &[&f.a]).await;
+    sqlx::raw_sql(
+        "DELETE FROM library_sources; DELETE FROM catalog_libraries; DELETE FROM libraries;",
+    )
+    .execute(&f.app.db)
+    .await
+    .unwrap();
+    let path = f._dir.path().join("native.sqlite3");
+    motion_catalog_backend::initialize(path.clone())
+        .await
+        .unwrap();
+    let backend = motion_catalog_backend::NativeCatalog::bind(
+        f.app.db.clone(),
+        path.clone(),
+        motion_catalog_backend::inspect(path.clone())
+            .await
+            .unwrap()
+            .identity,
+    )
+    .await
+    .unwrap();
+    backend.freeze_motion_source("http-empty", 0).await.unwrap();
+    backend.capture_motion_import("http-empty").await.unwrap();
+    backend.stage_import("http-empty").await.unwrap();
+    backend.prepare_motion_cutover("http-empty").await.unwrap();
+    backend
+        .activate_motion_cutover(std::time::Duration::from_secs(5))
+        .await
+        .unwrap();
+    drop(backend);
+    for (method, path) in [
+        ("GET", "/api/v2/catalog/items"),
+        ("GET", "/api/v2/profiles"),
+        ("POST", "/api/v2/catalog/items"),
+    ] {
+        let denied = f
+            .call(
+                method,
+                path,
+                if method == "POST" {
+                    Some(json!({"kind":"movie","title":"Must not use legacy","library_ids":[]}))
+                } else {
+                    None
+                },
+                &[
+                    ("authorization", bearer(OPERATOR).as_str()),
+                    ("idempotency-key", "bound-without-runtime-0001"),
+                ],
+            )
+            .await;
+        assert_eq!(
+            denied.status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "{path}: {:?}",
+            denied.body
+        );
+        assert_eq!(denied.body["code"], "native_runtime_unavailable");
+    }
+
+    f.app.native_catalog = Some(Arc::new(
+        playscale::native_catalog::Runtime::open(f.app.db.clone(), path.clone(), "default".into())
+            .await
+            .unwrap(),
+    ));
+    let auth = bearer(OPERATOR);
+    let headers = [
+        ("authorization", auth.as_str()),
+        ("idempotency-key", "native-create-one"),
+    ];
+    let body = json!({"kind":"movie","title":"Native Movie","library_ids":[]});
+    let created = f
+        .call(
+            "POST",
+            "/api/v2/catalog/items",
+            Some(body.clone()),
+            &headers,
+        )
+        .await;
+    assert_eq!(created.status, StatusCode::CREATED, "{:?}", created.body);
+    let id = created.body["id"].as_str().unwrap();
+    let legacy_count: i64 = sqlx::query_scalar("SELECT count(*) FROM items")
+        .fetch_one(&f.app.db)
+        .await
+        .unwrap();
+    assert_eq!(
+        legacy_count, 1,
+        "native row is materialized only as disposable FK/read projection"
+    );
+    let projected: (String, i64) = sqlx::query_as("SELECT id,catalog_revision FROM items")
+        .fetch_one(&f.app.db)
+        .await
+        .unwrap();
+    assert_eq!(projected.0, id);
+    assert_eq!(projected.1, 1);
+    assert!(
+        sqlx::query("UPDATE items SET title='forged legacy title' WHERE id=?")
+            .bind(id)
+            .execute(&f.app.db)
+            .await
+            .is_err(),
+        "ordinary connections cannot mutate native-authoritative projection"
+    );
+    let projected_generation: i64 =
+        sqlx::query_scalar("SELECT generation FROM catabolic_projection_state WHERE singleton=1")
+            .fetch_one(&f.app.db)
+            .await
+            .unwrap();
+    assert!(projected_generation > 0);
+    let got = f
+        .call(
+            "GET",
+            &format!("/api/v2/catalog/items/{id}"),
+            None,
+            &headers[..1],
+        )
+        .await;
+    assert_eq!(got.status, StatusCode::OK, "{:?}", got.body);
+    assert_eq!(got.body["title"], "Native Movie");
+    assert_eq!(got.body["availability"], "unknown");
+    for suffix in ["editions", "timelines"] {
+        let path = format!("/api/v2/catalog/items/{id}/{suffix}");
+        let details = f.call("GET", &path, None, &headers[..1]).await;
+        assert_eq!(details.status, StatusCode::OK, "{path}: {:?}", details.body);
+        assert_eq!(details.body["items"], json!([]));
+        let anonymous = f.call("GET", &path, None, &[]).await;
+        assert_eq!(anonymous.status, StatusCode::UNAUTHORIZED);
+        let write = f.call("POST", &path, Some(json!({})), &headers).await;
+        assert_eq!(write.status, StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    // A permitted library that has disappeared grants no unmapped native work.
+    let hidden = f
+        .call(
+            "GET",
+            &format!("/api/v2/catalog/items/{id}"),
+            None,
+            &[("authorization", scoped_reader.as_str())],
+        )
+        .await;
+    assert_eq!(hidden.status, StatusCode::NOT_FOUND, "{:?}", hidden.body);
+    let empty = f
+        .call(
+            "GET",
+            "/api/v2/catalog/items",
+            None,
+            &[("authorization", scoped_reader.as_str())],
+        )
+        .await;
+    assert_eq!(empty.status, StatusCode::OK, "{:?}", empty.body);
+    assert!(ids(&empty).is_empty());
+
+    let page = f
+        .call("GET", "/api/v2/catalog/items", None, &headers[..1])
+        .await;
+    assert_eq!(page.status, StatusCode::OK, "{:?}", page.body);
+    assert_eq!(page.body["items"].as_array().unwrap().len(), 1);
+    let replay = f
+        .call(
+            "POST",
+            "/api/v2/catalog/items",
+            Some(body.clone()),
+            &headers,
+        )
+        .await;
+    assert_eq!(replay.status, StatusCode::CREATED, "{:?}", replay.body);
+    assert_eq!(replay.body, created.body);
+    assert_eq!(replay.headers["idempotent-replayed"], "true");
+    let changed = f
+        .call(
+            "POST",
+            "/api/v2/catalog/items",
+            Some(json!({"kind":"movie","title":"Changed","library_ids":[]})),
+            &headers,
+        )
+        .await;
+    assert_eq!(changed.status, StatusCode::CONFLICT);
+    let blocked = f
+        .call(
+            "GET",
+            &format!("/api/v2/catalog/items/{id}/files"),
+            None,
+            &headers[..1],
+        )
+        .await;
+    assert_eq!(blocked.status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(blocked.body["code"], "native_route_unavailable");
+    let etag = got.headers["etag"].to_str().unwrap();
+    let replaced = f
+        .call(
+            "PUT",
+            &format!("/api/v2/catalog/items/{id}"),
+            Some(json!({"kind":"movie","title":"Updated Native Movie","library_ids":[]})),
+            &[("authorization", auth.as_str()), ("if-match", etag)],
+        )
+        .await;
+    assert_eq!(replaced.status, StatusCode::OK, "{:?}", replaced.body);
+    assert_eq!(replaced.body["title"], "Updated Native Movie");
+    let lost_response_retry = f
+        .call(
+            "PUT",
+            &format!("/api/v2/catalog/items/{id}"),
+            Some(json!({"kind":"movie","title":"Updated Native Movie","library_ids":[]})),
+            &[("authorization", auth.as_str()), ("if-match", etag)],
+        )
+        .await;
+    assert_eq!(
+        lost_response_retry.status,
+        StatusCode::OK,
+        "{:?}",
+        lost_response_retry.body
+    );
+    assert_eq!(
+        lost_response_retry.body, replaced.body,
+        "exact saved native command must replay before a new CAS head is captured"
+    );
+
+    let stale = f
+        .call(
+            "PUT",
+            &format!("/api/v2/catalog/items/{id}"),
+            Some(json!({"kind":"movie","title":"Stale Edit","library_ids":[]})),
+            &[("authorization", auth.as_str()), ("if-match", etag)],
+        )
+        .await;
+    assert_eq!(
+        stale.status,
+        StatusCode::PRECONDITION_FAILED,
+        "{:?}",
+        stale.body
+    );
+    f.app
+        .native_catalog
+        .take()
+        .unwrap()
+        .shutdown()
+        .await
+        .unwrap();
+    f.app.native_catalog = Some(Arc::new(
+        playscale::native_catalog::Runtime::open(f.app.db.clone(), path, "default".into())
+            .await
+            .unwrap(),
+    ));
+    let reopened = f
+        .call(
+            "GET",
+            &format!("/api/v2/catalog/items/{id}"),
+            None,
+            &headers[..1],
+        )
+        .await;
+    assert_eq!(reopened.status, StatusCode::OK, "{:?}", reopened.body);
+    assert_eq!(reopened.body, replaced.body);
+    f.app
+        .native_catalog
+        .take()
+        .unwrap()
+        .shutdown()
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn native_sources_register_replay_and_never_write_legacy_catalog() {
+    let mut f = Fixture::new().await;
+    sqlx::raw_sql(
+        "DELETE FROM library_sources; DELETE FROM catalog_libraries; DELETE FROM libraries;",
+    )
+    .execute(&f.app.db)
+    .await
+    .unwrap();
+    let path = f._dir.path().join("native.sqlite3");
+    motion_catalog_backend::initialize(path.clone())
+        .await
+        .unwrap();
+    let backend = motion_catalog_backend::NativeCatalog::bind(
+        f.app.db.clone(),
+        path.clone(),
+        motion_catalog_backend::inspect(path.clone())
+            .await
+            .unwrap()
+            .identity,
+    )
+    .await
+    .unwrap();
+    backend
+        .freeze_motion_source("sources-empty", 0)
+        .await
+        .unwrap();
+    backend
+        .capture_motion_import("sources-empty")
+        .await
+        .unwrap();
+    backend.stage_import("sources-empty").await.unwrap();
+    backend
+        .prepare_motion_cutover("sources-empty")
+        .await
+        .unwrap();
+    backend
+        .activate_motion_cutover(std::time::Duration::from_secs(5))
+        .await
+        .unwrap();
+    drop(backend);
+    f.app.native_catalog = Some(Arc::new(
+        playscale::native_catalog::Runtime::open(f.app.db.clone(), path.clone(), "default".into())
+            .await
+            .unwrap(),
+    ));
+    let auth = bearer(OPERATOR);
+    let headers = [
+        ("authorization", auth.as_str()),
+        ("idempotency-key", "native-source-one"),
+    ];
+    let body =
+        json!({"name":"Movies","root_path":f._dir.path().join("media"),"exclusions":["Extras/"]});
+    let created = f
+        .call("POST", "/api/v2/sources", Some(body.clone()), &headers)
+        .await;
+    assert_eq!(created.status, StatusCode::CREATED, "{:?}", created.body);
+    let id = created.body["id"].as_str().unwrap();
+    assert_eq!(created.body["exclusions"], json!(["Extras"]));
+    let legacy: i64 = sqlx::query_scalar("SELECT count(*) FROM libraries")
+        .fetch_one(&f.app.db)
+        .await
+        .unwrap();
+    assert_eq!(legacy, 0);
+    let replay = f
+        .call("POST", "/api/v2/sources", Some(body.clone()), &headers)
+        .await;
+    assert_eq!(replay.status, StatusCode::CREATED, "{:?}", replay.body);
+    assert_eq!(replay.body, created.body);
+    // Simulate expiry of the HTTP retry acknowledgment while preserving the
+    // durable source intent/binding. Replay cannot allocate another identity.
+    sqlx::query("DELETE FROM idempotency_records WHERE operation='createSource'")
+        .execute(&f.app.db)
+        .await
+        .unwrap();
+    let recovered = f
+        .call("POST", "/api/v2/sources", Some(body.clone()), &headers)
+        .await;
+    assert_eq!(
+        recovered.status,
+        StatusCode::CREATED,
+        "{:?}",
+        recovered.body
+    );
+    assert_eq!(recovered.body, created.body);
+    let registered: i64 = sqlx::query_scalar("SELECT count(*) FROM catabolic_source_registry")
+        .fetch_one(&f.app.db)
+        .await
+        .unwrap();
+    assert_eq!(registered, 1);
+    let changed = f
+        .call(
+            "POST",
+            "/api/v2/sources",
+            Some(json!({"name":"Other","root_path":f._dir.path().join("media"),"exclusions":[]})),
+            &headers,
+        )
+        .await;
+    assert_eq!(changed.status, StatusCode::CONFLICT);
+    let got = f
+        .call("GET", &format!("/api/v2/sources/{id}"), None, &headers[..1])
+        .await;
+    assert_eq!(got.status, StatusCode::OK);
+    assert_eq!(got.body, created.body);
+    let list = f.call("GET", "/api/v2/sources", None, &headers[..1]).await;
+    assert_eq!(list.status, StatusCode::OK, "{:?}", list.body);
+    assert_eq!(list.body["items"].as_array().unwrap().len(), 1);
+    let library_headers = [headers[0], ("idempotency-key", "native-library-one")];
+    let library_body = json!({"name":"Films","kind":"movies","language":"en","source_ids":[id]});
+    let library = f
+        .call(
+            "POST",
+            "/api/v2/libraries",
+            Some(library_body.clone()),
+            &library_headers,
+        )
+        .await;
+    assert_eq!(library.status, StatusCode::CREATED, "{:?}", library.body);
+    let library_id = library.body["id"].as_str().unwrap();
+    let library_replay = f
+        .call(
+            "POST",
+            "/api/v2/libraries",
+            Some(library_body.clone()),
+            &library_headers,
+        )
+        .await;
+    assert_eq!(
+        library_replay.status,
+        StatusCode::CREATED,
+        "{:?}",
+        library_replay.body
+    );
+    assert_eq!(library_replay.body, library.body);
+    let library_read = f
+        .call(
+            "GET",
+            &format!("/api/v2/libraries/{library_id}"),
+            None,
+            &headers[..1],
+        )
+        .await;
+    assert_eq!(
+        library_read.status,
+        StatusCode::OK,
+        "{:?}",
+        library_read.body
+    );
+    assert_eq!(library_read.body, library.body);
+    let library_list = f
+        .call("GET", "/api/v2/libraries", None, &headers[..1])
+        .await;
+    assert_eq!(
+        library_list.status,
+        StatusCode::OK,
+        "{:?}",
+        library_list.body
+    );
+    assert_eq!(library_list.body["items"], json!([library.body]));
+    let legacy_libraries: i64 = sqlx::query_scalar("SELECT count(*) FROM catalog_libraries")
+        .fetch_one(&f.app.db)
+        .await
+        .unwrap();
+    assert_eq!(
+        legacy_libraries, 0,
+        "native library definitions never use legacy ownership"
+    );
+    let accepted_scan = f
+        .call(
+            "POST",
+            &format!("/api/v2/libraries/{library_id}/scans"),
+            Some(json!({"mode":"incremental","require_complete":true})),
+            &library_headers,
+        )
+        .await;
+    assert_eq!(
+        accepted_scan.status,
+        StatusCode::ACCEPTED,
+        "{:?}",
+        accepted_scan.body
+    );
+    let request_id = accepted_scan.body["id"].as_str().unwrap();
+    let durable: (String, String) =
+        sqlx::query_as("SELECT id,library_id FROM catabolic_scan_requests WHERE id=?")
+            .bind(request_id)
+            .fetch_one(&f.app.db)
+            .await
+            .unwrap();
+    assert_eq!(durable, (request_id.to_owned(), library_id.to_owned()));
+    let scan_read = f
+        .call(
+            "GET",
+            &format!("/api/v2/scans/{request_id}"),
+            None,
+            &headers[..1],
+        )
+        .await;
+    assert_eq!(scan_read.status, StatusCode::OK, "{:?}", scan_read.body);
+    assert_eq!(scan_read.body["library_id"], library_id);
+    let legacy_requests: i64 = sqlx::query_scalar("SELECT count(*) FROM scan_requests")
+        .fetch_one(&f.app.db)
+        .await
+        .unwrap();
+    assert_eq!(
+        legacy_requests, 0,
+        "native acceptance must not queue a legacy scan"
+    );
+    let deleted = f
+        .call(
+            "DELETE",
+            &format!("/api/v2/sources/{id}"),
+            None,
+            &headers[..1],
+        )
+        .await;
+    assert_eq!(deleted.status, StatusCode::PRECONDITION_REQUIRED);
+    assert_eq!(deleted.body["code"], "precondition_required");
+    let unchanged = f
+        .call("GET", &format!("/api/v2/sources/{id}"), None, &headers[..1])
+        .await;
+    assert_eq!(unchanged.status, StatusCode::OK);
+    assert_eq!(unchanged.body, created.body);
+    let lifecycle = motion_catalog_backend::source_lifecycle::current_in(
+        &mut *f.app.db.acquire().await.unwrap(),
+        id,
+    )
+    .await
+    .unwrap();
+    assert_eq!(lifecycle.epoch, 0);
+    assert_eq!(
+        lifecycle.state,
+        playscale_core::source_lifecycle::State::Active
+    );
+    f.app
+        .native_catalog
+        .take()
+        .unwrap()
+        .shutdown()
+        .await
+        .unwrap();
+    f.app.native_catalog = Some(Arc::new(
+        playscale::native_catalog::Runtime::open(f.app.db.clone(), path, "default".into())
+            .await
+            .unwrap(),
+    ));
+    let restarted = f
+        .call("GET", &format!("/api/v2/sources/{id}"), None, &headers[..1])
+        .await;
+    assert_eq!(restarted.status, StatusCode::OK);
+    assert_eq!(restarted.body, created.body);
+    let library_restarted = f
+        .call(
+            "GET",
+            &format!("/api/v2/libraries/{library_id}"),
+            None,
+            &headers[..1],
+        )
+        .await;
+    assert_eq!(
+        library_restarted.status,
+        StatusCode::OK,
+        "{:?}",
+        library_restarted.body
+    );
+    assert_eq!(library_restarted.body, library.body);
+    let scope_count: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM catabolic_server_scopes WHERE library_id=?")
+            .bind(library_id)
+            .fetch_one(&f.app.db)
+            .await
+            .unwrap();
+    assert_eq!(
+        scope_count, 1,
+        "restart reuses exact saved scope acknowledgment"
+    );
+    f.app
+        .native_catalog
+        .take()
+        .unwrap()
+        .shutdown()
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn imported_work_revisions_never_recycle_motion_cas_tokens() {
+    let mut f = Fixture::new().await;
+    sqlx::raw_sql(
+        "DELETE FROM library_sources; DELETE FROM catalog_libraries; DELETE FROM libraries;",
+    )
+    .execute(&f.app.db)
+    .await
+    .unwrap();
+    f.item("imported-work", "Imported Movie", &[]).await;
+    sqlx::query(
+        "INSERT INTO item_structure(item_id,media_type,revision) VALUES('imported-work','movie',1)",
+    )
+    .execute(&f.app.db)
+    .await
+    .unwrap();
+    sqlx::query("UPDATE items SET catalog_revision=9 WHERE id='imported-work'")
+        .execute(&f.app.db)
+        .await
+        .unwrap();
+    let path = f._dir.path().join("native.sqlite3");
+    motion_catalog_backend::initialize(path.clone())
+        .await
+        .unwrap();
+    let backend = motion_catalog_backend::NativeCatalog::bind(
+        f.app.db.clone(),
+        path.clone(),
+        motion_catalog_backend::inspect(path.clone())
+            .await
+            .unwrap()
+            .identity,
+    )
+    .await
+    .unwrap();
+    backend
+        .freeze_motion_source("revision-import", 0)
+        .await
+        .unwrap();
+    backend
+        .capture_motion_import("revision-import")
+        .await
+        .unwrap();
+    backend.stage_import("revision-import").await.unwrap();
+    backend
+        .prepare_motion_cutover("revision-import")
+        .await
+        .unwrap();
+    backend
+        .activate_motion_cutover(std::time::Duration::from_secs(5))
+        .await
+        .unwrap();
+    drop(backend);
+    f.app.native_catalog = Some(Arc::new(
+        playscale::native_catalog::Runtime::open(f.app.db.clone(), path.clone(), "default".into())
+            .await
+            .unwrap(),
+    ));
+    let auth = bearer(OPERATOR);
+    let got = f
+        .call(
+            "GET",
+            "/api/v2/catalog/items/imported-work",
+            None,
+            &[("authorization", &auth)],
+        )
+        .await;
+    assert_eq!(got.status, StatusCode::OK, "{:?}", got.body);
+    assert_eq!(
+        got.body["revision"], "9",
+        "cutover preserves the current Motion CAS token"
+    );
+    let old_tag = got.headers["etag"].to_str().unwrap();
+    let replaced = f
+        .call(
+            "PUT",
+            "/api/v2/catalog/items/imported-work",
+            Some(json!({"kind":"movie","title":"Native Edit","library_ids":[]})),
+            &[("authorization", &auth), ("if-match", old_tag)],
+        )
+        .await;
+    assert_eq!(replaced.status, StatusCode::OK, "{:?}", replaced.body);
+    let revised: u64 = replaced.body["revision"].as_str().unwrap().parse().unwrap();
+    assert!(revised > 9);
+    let stale = f
+        .call(
+            "PUT",
+            "/api/v2/catalog/items/imported-work",
+            Some(json!({"kind":"movie","title":"Stale Edit","library_ids":[]})),
+            &[("authorization", &auth), ("if-match", old_tag)],
+        )
+        .await;
+    assert_eq!(
+        stale.status,
+        StatusCode::PRECONDITION_FAILED,
+        "{:?}",
+        stale.body
+    );
+    let cached: i64 =
+        sqlx::query_scalar("SELECT catalog_revision FROM items WHERE id='imported-work'")
+            .fetch_one(&f.app.db)
+            .await
+            .unwrap();
+    assert_eq!(cached as u64, revised);
+    f.app
+        .native_catalog
+        .take()
+        .unwrap()
+        .shutdown()
+        .await
+        .unwrap();
+    f.app.native_catalog = Some(Arc::new(
+        playscale::native_catalog::Runtime::open(f.app.db.clone(), path, "default".into())
+            .await
+            .unwrap(),
+    ));
+    let restarted = f
+        .call(
+            "GET",
+            "/api/v2/catalog/items/imported-work",
+            None,
+            &[("authorization", &auth)],
+        )
+        .await;
+    assert_eq!(restarted.status, StatusCode::OK);
+    assert_eq!(restarted.body, replaced.body);
+    f.app
+        .native_catalog
+        .take()
+        .unwrap()
+        .shutdown()
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn native_relationship_http_preserves_aggregate_cas_and_exact_edge_replay() {
+    let mut f = Fixture::new().await;
+    sqlx::raw_sql(
+        "DELETE FROM library_sources; DELETE FROM catalog_libraries; DELETE FROM libraries;",
+    )
+    .execute(&f.app.db)
+    .await
+    .unwrap();
+    let path = f._dir.path().join("native.sqlite3");
+    motion_catalog_backend::initialize(path.clone())
+        .await
+        .unwrap();
+    let backend = motion_catalog_backend::NativeCatalog::bind(
+        f.app.db.clone(),
+        path.clone(),
+        motion_catalog_backend::inspect(path.clone())
+            .await
+            .unwrap()
+            .identity,
+    )
+    .await
+    .unwrap();
+    backend.freeze_motion_source("edge-empty", 0).await.unwrap();
+    backend.capture_motion_import("edge-empty").await.unwrap();
+    backend.stage_import("edge-empty").await.unwrap();
+    backend.prepare_motion_cutover("edge-empty").await.unwrap();
+    backend
+        .activate_motion_cutover(std::time::Duration::from_secs(5))
+        .await
+        .unwrap();
+    drop(backend);
+    f.app.native_catalog = Some(Arc::new(
+        playscale::native_catalog::Runtime::open(f.app.db.clone(), path.clone(), "default".into())
+            .await
+            .unwrap(),
+    ));
+
+    let auth = bearer(OPERATOR);
+    let mut works = Vec::new();
+    for (key, title) in [
+        ("native-edge-work-a-0001", "A"),
+        ("native-edge-work-b-0001", "B"),
+    ] {
+        let created = f
+            .call(
+                "POST",
+                "/api/v2/catalog/items",
+                Some(json!({"kind":"movie","title":title,"library_ids":[]})),
+                &[("authorization", auth.as_str()), ("idempotency-key", key)],
+            )
+            .await;
+        assert_eq!(created.status, StatusCode::CREATED, "{:?}", created.body);
+        works.push(created.body["id"].as_str().unwrap().to_owned());
+    }
+    let uri = format!("/api/v2/catalog/items/{}", works[0]);
+    let before = f
+        .call("GET", &uri, None, &[("authorization", auth.as_str())])
+        .await;
+    assert_eq!(before.status, StatusCode::OK, "{:?}", before.body);
+    let source_etag = before.headers["etag"].to_str().unwrap().to_owned();
+    let endpoint = format!("{uri}/relationships");
+    let request =
+        json!({"source_item_id":works[0],"target_item_id":works[1],"kind":"part_of","position":0});
+    let headers = [
+        ("authorization", auth.as_str()),
+        ("idempotency-key", "native-edge-create-0001"),
+        ("if-match", source_etag.as_str()),
+    ];
+    let created = f
+        .call("POST", &endpoint, Some(request.clone()), &headers)
+        .await;
+    assert_eq!(created.status, StatusCode::CREATED, "{:?}", created.body);
+    let edge = created.body["id"].as_str().unwrap().to_owned();
+    let edge_uri = format!("/api/v2/catalog/relationships/{edge}");
+    let after = f
+        .call("GET", &uri, None, &[("authorization", auth.as_str())])
+        .await;
+    assert_eq!(after.status, StatusCode::OK, "{:?}", after.body);
+    assert!(
+        after.body["revision"]
+            .as_str()
+            .unwrap()
+            .parse::<u64>()
+            .unwrap()
+            > before.body["revision"]
+                .as_str()
+                .unwrap()
+                .parse::<u64>()
+                .unwrap()
+    );
+    let replay = f
+        .call("POST", &endpoint, Some(request.clone()), &headers)
+        .await;
+    assert_eq!(replay.status, StatusCode::CREATED, "{:?}", replay.body);
+    assert_eq!(replay.body, created.body);
+    let edge_read = f
+        .call("GET", &edge_uri, None, &[("authorization", auth.as_str())])
+        .await;
+    assert_eq!(edge_read.status, StatusCode::OK, "{:?}", edge_read.body);
+    assert_eq!(edge_read.body, created.body);
+    let listed = f
+        .call("GET", &endpoint, None, &[("authorization", auth.as_str())])
+        .await;
+    assert_eq!(listed.status, StatusCode::OK, "{:?}", listed.body);
+    assert_eq!(listed.body["items"].as_array().unwrap().len(), 1);
+    let target_uri = format!("/api/v2/catalog/items/{}", works[1]);
+    let target = f
+        .call(
+            "GET",
+            &target_uri,
+            None,
+            &[("authorization", auth.as_str())],
+        )
+        .await;
+    assert_eq!(target.status, StatusCode::OK, "{:?}", target.body);
+    let target_etag = target.headers["etag"].to_str().unwrap().to_owned();
+    let cycle=f.call("POST",&format!("{target_uri}/relationships"),Some(json!({"source_item_id":works[1],"target_item_id":works[0],"kind":"part_of","position":null})),&[("authorization",auth.as_str()),("idempotency-key","native-edge-cycle-0001"),("if-match",target_etag.as_str())]).await;
+    assert_eq!(cycle.status, StatusCode::CONFLICT, "{:?}", cycle.body);
+    let unchanged = f
+        .call(
+            "GET",
+            &target_uri,
+            None,
+            &[("authorization", auth.as_str())],
+        )
+        .await;
+    assert_eq!(unchanged.body["revision"], target.body["revision"]);
+    let stale=f.call("POST",&endpoint,Some(json!({"source_item_id":works[0],"target_item_id":works[1],"kind":"extra_of","position":null})),&[("authorization",auth.as_str()),("idempotency-key","native-edge-stale-0001"),("if-match",source_etag.as_str())]).await;
+    assert_eq!(
+        stale.status,
+        StatusCode::PRECONDITION_FAILED,
+        "{:?}",
+        stale.body
+    );
+    let denied = f.call("GET", &edge_uri, None, &[]).await;
+    assert_eq!(denied.status, StatusCode::UNAUTHORIZED);
+    let wrong = f
+        .call(
+            "DELETE",
+            &edge_uri,
+            None,
+            &[("authorization", auth.as_str()), ("if-match", "\"r-999\"")],
+        )
+        .await;
+    assert_eq!(
+        wrong.status,
+        StatusCode::PRECONDITION_FAILED,
+        "{:?}",
+        wrong.body
+    );
+    let edge_etag = edge_read.headers["etag"].to_str().unwrap().to_owned();
+    let deleted = f
+        .call(
+            "DELETE",
+            &edge_uri,
+            None,
+            &[
+                ("authorization", auth.as_str()),
+                ("if-match", edge_etag.as_str()),
+            ],
+        )
+        .await;
+    assert_eq!(deleted.status, StatusCode::NO_CONTENT, "{:?}", deleted.body);
+    let replay = f
+        .call(
+            "DELETE",
+            &edge_uri,
+            None,
+            &[
+                ("authorization", auth.as_str()),
+                ("if-match", edge_etag.as_str()),
+            ],
+        )
+        .await;
+    assert_eq!(replay.status, StatusCode::NO_CONTENT, "{:?}", replay.body);
+    let missing = f
+        .call("GET", &edge_uri, None, &[("authorization", auth.as_str())])
+        .await;
+    assert_eq!(missing.status, StatusCode::NOT_FOUND);
+    let final_work = f
+        .call("GET", &uri, None, &[("authorization", auth.as_str())])
+        .await;
+    assert_eq!(final_work.status, StatusCode::OK, "{:?}", final_work.body);
+    assert!(
+        final_work.body["revision"]
+            .as_str()
+            .unwrap()
+            .parse::<u64>()
+            .unwrap()
+            > after.body["revision"]
+                .as_str()
+                .unwrap()
+                .parse::<u64>()
+                .unwrap()
+    );
+    f.app
+        .native_catalog
+        .take()
+        .unwrap()
+        .shutdown()
+        .await
+        .unwrap();
+    f.app.native_catalog = Some(Arc::new(
+        playscale::native_catalog::Runtime::open(f.app.db.clone(), path, "default".into())
+            .await
+            .unwrap(),
+    ));
+    let restarted = f
+        .call("GET", &uri, None, &[("authorization", auth.as_str())])
+        .await;
+    assert_eq!(restarted.status, StatusCode::OK, "{:?}", restarted.body);
+    assert_eq!(restarted.body["revision"], final_work.body["revision"]);
+    f.app
+        .native_catalog
+        .take()
+        .unwrap()
+        .shutdown()
+        .await
+        .unwrap();
+}
+
+/// Production handler qualification only: the public POST gate deliberately
+/// remains closed until this atomic owner/custody cohort is validated.
+#[tokio::test]
+async fn native_empty_edition_adapter_creates_replays_and_recovers_receipt_only() {
+    let mut f = Fixture::new().await;
+    sqlx::raw_sql(
+        "DELETE FROM library_sources; DELETE FROM catalog_libraries; DELETE FROM libraries;",
+    )
+    .execute(&f.app.db)
+    .await
+    .unwrap();
+    let native = f._dir.path().join("edition-native.sqlite3");
+    motion_catalog_backend::initialize(native.clone())
+        .await
+        .unwrap();
+    let backend = motion_catalog_backend::NativeCatalog::bind(
+        f.app.db.clone(),
+        native.clone(),
+        motion_catalog_backend::inspect(native.clone())
+            .await
+            .unwrap()
+            .identity,
+    )
+    .await
+    .unwrap();
+    backend
+        .freeze_motion_source("edition-empty", 0)
+        .await
+        .unwrap();
+    backend
+        .capture_motion_import("edition-empty")
+        .await
+        .unwrap();
+    backend.stage_import("edition-empty").await.unwrap();
+    backend
+        .prepare_motion_cutover("edition-empty")
+        .await
+        .unwrap();
+    backend
+        .activate_motion_cutover(std::time::Duration::from_secs(5))
+        .await
+        .unwrap();
+    drop(backend);
+    f.app.native_catalog = Some(Arc::new(
+        playscale::native_catalog::Runtime::open(
+            f.app.db.clone(),
+            native.clone(),
+            "default".into(),
+        )
+        .await
+        .unwrap(),
+    ));
+    let auth = bearer(OPERATOR);
+    let created = f
+        .call(
+            "POST",
+            "/api/v2/catalog/items",
+            Some(json!({"kind":"movie","title":"Edition owner","library_ids":[]})),
+            &[
+                ("authorization", &auth),
+                ("idempotency-key", "empty-edition-work-0001"),
+            ],
+        )
+        .await;
+    assert_eq!(created.status, StatusCode::CREATED, "{:?}", created.body);
+    let id = created.body["id"].as_str().unwrap().to_owned();
+    let item_path = format!("/api/v2/catalog/items/{id}");
+    let path = format!("{item_path}/editions");
+    let current = f
+        .call("GET", &item_path, None, &[("authorization", &auth)])
+        .await;
+    assert_eq!(current.status, StatusCode::OK, "{:?}", current.body);
+    let etag = current.headers["etag"].to_str().unwrap().to_owned();
+    let body = json!({"kind":"default","label":"Director cut"});
+    let headers = [
+        ("authorization", auth.as_str()),
+        ("if-match", etag.as_str()),
+        ("idempotency-key", "empty-edition-create-0001"),
+    ];
+    assert_eq!(
+        f.call("POST", &path, Some(body.clone()), &headers)
+            .await
+            .status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "public write is not yet qualified"
+    );
+    assert_eq!(
+        f.edition_adapter(
+            "POST",
+            &path,
+            Some(body.clone()),
+            &[
+                ("if-match", &etag),
+                ("idempotency-key", "empty-edition-anonymous-0001")
+            ]
+        )
+        .await
+        .status,
+        StatusCode::UNAUTHORIZED
+    );
+    let edition = f
+        .edition_adapter("POST", &path, Some(body.clone()), &headers)
+        .await;
+    assert_eq!(edition.status, StatusCode::CREATED, "{:?}", edition.body);
+    let edition_id = edition.body["id"].as_str().unwrap();
+    assert_eq!(edition.body["timeline_ids"], json!([edition_id]));
+    let list = f
+        .call("GET", &path, None, &[("authorization", &auth)])
+        .await;
+    assert_eq!(list.status, StatusCode::OK, "{:?}", list.body);
+    assert_eq!(list.body["items"].as_array().unwrap().len(), 1);
+    let timeline = f
+        .call(
+            "GET",
+            &format!("/api/v2/catalog/timelines/{edition_id}"),
+            None,
+            &[("authorization", &auth)],
+        )
+        .await;
+    assert_eq!(timeline.status, StatusCode::OK, "{:?}", timeline.body);
+    assert_eq!(timeline.body["duration_ms"], Value::Null);
+    let stale = f
+        .edition_adapter(
+            "POST",
+            &path,
+            Some(body.clone()),
+            &[
+                ("authorization", &auth),
+                ("if-match", &etag),
+                ("idempotency-key", "empty-edition-stale-0001"),
+            ],
+        )
+        .await;
+    assert_eq!(
+        stale.status,
+        StatusCode::PRECONDITION_FAILED,
+        "{:?}",
+        stale.body
+    );
+    let changed = f
+        .edition_adapter(
+            "POST",
+            &path,
+            Some(json!({"kind":"default","label":"Different"})),
+            &headers,
+        )
+        .await;
+    assert_eq!(changed.status, StatusCode::CONFLICT, "{:?}", changed.body);
+    drop(f.app.native_catalog.take());
+    f.app.native_catalog = Some(Arc::new(
+        playscale::native_catalog::Runtime::open(
+            f.app.db.clone(),
+            native.clone(),
+            "default".into(),
+        )
+        .await
+        .unwrap(),
+    ));
+    let replay = f
+        .edition_adapter("POST", &path, Some(body.clone()), &headers)
+        .await;
+    assert_eq!(replay.status, StatusCode::CREATED, "{:?}", replay.body);
+    assert_eq!(replay.body, edition.body);
+
+    // Abort the host acknowledgement after actual native commit. Restart must
+    // reconcile the full receipt, not dispatch again or guess the native head.
+    let current = f
+        .call("GET", &item_path, None, &[("authorization", &auth)])
+        .await;
+    let tag = current.headers["etag"].to_str().unwrap().to_owned();
+    sqlx::raw_sql("CREATE TRIGGER test_fail_edition_ack BEFORE INSERT ON catabolic_revision_bridges WHEN json_extract(NEW.proof_json,'$.kind')='native_empty_edition' BEGIN SELECT RAISE(ABORT,'simulated host ACK failure'); END;").execute(&f.app.db).await.unwrap();
+    let lost_headers = [
+        ("authorization", auth.as_str()),
+        ("if-match", tag.as_str()),
+        ("idempotency-key", "empty-edition-lost-ack-0001"),
+    ];
+    let lost = f
+        .edition_adapter(
+            "POST",
+            &path,
+            Some(json!({"kind":"default","label":"Lost ACK"})),
+            &lost_headers,
+        )
+        .await;
+    assert_eq!(
+        lost.status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "{:?}",
+        lost.body
+    );
+    sqlx::raw_sql("DROP TRIGGER test_fail_edition_ack;")
+        .execute(&f.app.db)
+        .await
+        .unwrap();
+    drop(f.app.native_catalog.take());
+    f.app.native_catalog = Some(Arc::new(
+        playscale::native_catalog::Runtime::open(f.app.db.clone(), native, "default".into())
+            .await
+            .unwrap(),
+    ));
+    let recovered = f
+        .edition_adapter(
+            "POST",
+            &path,
+            Some(json!({"kind":"default","label":"Lost ACK"})),
+            &lost_headers,
+        )
+        .await;
+    assert_eq!(
+        recovered.status,
+        StatusCode::CREATED,
+        "{:?}",
+        recovered.body
+    );
+    let all = f
+        .call("GET", &path, None, &[("authorization", &auth)])
+        .await;
+    assert_eq!(all.status, StatusCode::OK, "{:?}", all.body);
+    assert_eq!(all.body["items"].as_array().unwrap().len(), 2);
+    assert_ne!(recovered.body["id"], edition.body["id"]);
+}
+
+#[tokio::test]
+async fn native_library_replace_detaches_exact_scope_and_survives_restart() {
+    let mut f = Fixture::new().await;
+    sqlx::raw_sql(
+        "DELETE FROM library_sources; DELETE FROM catalog_libraries; DELETE FROM libraries;",
+    )
+    .execute(&f.app.db)
+    .await
+    .unwrap();
+    let path = f._dir.path().join("native.sqlite3");
+    motion_catalog_backend::initialize(path.clone())
+        .await
+        .unwrap();
+    let backend = motion_catalog_backend::NativeCatalog::bind(
+        f.app.db.clone(),
+        path.clone(),
+        motion_catalog_backend::inspect(path.clone())
+            .await
+            .unwrap()
+            .identity,
+    )
+    .await
+    .unwrap();
+    backend
+        .freeze_motion_source("library-replace-empty", 0)
+        .await
+        .unwrap();
+    backend
+        .capture_motion_import("library-replace-empty")
+        .await
+        .unwrap();
+    backend.stage_import("library-replace-empty").await.unwrap();
+    backend
+        .prepare_motion_cutover("library-replace-empty")
+        .await
+        .unwrap();
+    backend
+        .activate_motion_cutover(std::time::Duration::from_secs(5))
+        .await
+        .unwrap();
+    drop(backend);
+    f.app.native_catalog = Some(Arc::new(
+        playscale::native_catalog::Runtime::open(f.app.db.clone(), path.clone(), "default".into())
+            .await
+            .unwrap(),
+    ));
+
+    let auth = bearer(OPERATOR);
+    let mut sources = Vec::new();
+    let mut libraries = Vec::new();
+    for (name, leaf) in [("Library A", "media"), ("Library B", "other")] {
+        let key = format!("source-replace-{leaf}");
+        let source = f
+            .call(
+                "POST",
+                "/api/v2/sources",
+                Some(json!({"name":name,"root_path":f._dir.path().join(leaf),"exclusions":[]})),
+                &[("authorization", &auth), ("idempotency-key", &key)],
+            )
+            .await;
+        assert_eq!(source.status, StatusCode::CREATED, "{:?}", source.body);
+        let source_id = source.body["id"].as_str().unwrap().to_owned();
+        sources.push(source_id.clone());
+        let key = format!("library-replace-{leaf}");
+        let library = f
+            .call(
+                "POST",
+                "/api/v2/libraries",
+                Some(json!({"name":name,"kind":"movies","language":"en","source_ids":[source_id]})),
+                &[("authorization", &auth), ("idempotency-key", &key)],
+            )
+            .await;
+        assert_eq!(library.status, StatusCode::CREATED, "{:?}", library.body);
+        libraries.push(library.body["id"].as_str().unwrap().to_owned());
+    }
+    let busy = f
+        .call(
+            "DELETE",
+            &format!("/api/v2/sources/{}", sources[0]),
+            None,
+            &[("authorization", &auth), ("if-match", "\"r-1\"")],
+        )
+        .await;
+    assert_eq!(busy.status, StatusCode::CONFLICT, "{:?}", busy.body);
+    let scoped = f
+        .device(&["catalog:read", "sources:manage"], &[&libraries[0]])
+        .await;
+    let target = format!("/api/v2/libraries/{}", libraries[0]);
+    let foreign =
+        json!({"name":"Library A","kind":"movies","language":"en","source_ids":[sources[1]]});
+    let denied = f
+        .call(
+            "PUT",
+            &target,
+            Some(foreign),
+            &[("authorization", &scoped), ("if-match", "\"r-1\"")],
+        )
+        .await;
+    assert_eq!(denied.status, StatusCode::NOT_FOUND, "{:?}", denied.body);
+    let detached = json!({"name":"Detached A","kind":"movies","language":"en","source_ids":[]});
+    let result = f
+        .call(
+            "PUT",
+            &target,
+            Some(detached.clone()),
+            &[("authorization", &scoped), ("if-match", "\"r-1\"")],
+        )
+        .await;
+    assert_eq!(result.status, StatusCode::OK, "{:?}", result.body);
+    assert_eq!(result.body["revision"], "2");
+    assert_eq!(result.body["source_ids"], json!([]));
+    let replay = f
+        .call(
+            "PUT",
+            &target,
+            Some(detached.clone()),
+            &[("authorization", &scoped), ("if-match", "\"r-1\"")],
+        )
+        .await;
+    assert_eq!(replay.status, StatusCode::OK, "{:?}", replay.body);
+    assert_eq!(replay.body, result.body);
+    let stale = f
+        .call(
+            "PUT",
+            &target,
+            Some(json!({"name":"Different","kind":"movies","language":"en","source_ids":[]})),
+            &[("authorization", &scoped), ("if-match", "\"r-1\"")],
+        )
+        .await;
+    assert_eq!(
+        stale.status,
+        StatusCode::PRECONDITION_FAILED,
+        "{:?}",
+        stale.body
+    );
+    // Detachment is current source authority withdrawal from this library, not
+    // source deletion. The restricted manager cannot re-add a now-foreign source.
+    let readd = f
+        .call(
+            "PUT",
+            &target,
+            Some(
+                json!({"name":"Readded","kind":"movies","language":"en","source_ids":[sources[0]]}),
+            ),
+            &[("authorization", &scoped), ("if-match", "\"r-2\"")],
+        )
+        .await;
+    assert_eq!(readd.status, StatusCode::NOT_FOUND, "{:?}", readd.body);
+    let other = f
+        .call(
+            "GET",
+            &format!("/api/v2/libraries/{}", libraries[1]),
+            None,
+            &[("authorization", &scoped)],
+        )
+        .await;
+    assert_eq!(other.status, StatusCode::NOT_FOUND);
+    let scopes:Vec<(i64,String)>=sqlx::query_as("SELECT library_revision,source_mappings_json FROM catabolic_server_scopes WHERE library_id=? ORDER BY library_revision").bind(&libraries[0]).fetch_all(&f.app.db).await.unwrap();
+    assert_eq!(scopes.len(), 2);
+    assert_eq!(scopes[0].0, 1);
+    assert_eq!(scopes[1], (2, "[]".into()));
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM catalog_libraries")
+            .fetch_one(&f.app.db)
+            .await
+            .unwrap(),
+        0
+    );
+    let source_target = format!("/api/v2/sources/{}", sources[0]);
+    let before_generation: i64 =
+        sqlx::query_scalar("SELECT generation FROM catabolic_projection_state WHERE singleton=1")
+            .fetch_one(&f.app.db)
+            .await
+            .unwrap();
+    let stale_delete = f
+        .call(
+            "DELETE",
+            &source_target,
+            None,
+            &[("authorization", &auth), ("if-match", "\"r-0\"")],
+        )
+        .await;
+    assert_eq!(
+        stale_delete.status,
+        StatusCode::PRECONDITION_FAILED,
+        "{:?}",
+        stale_delete.body
+    );
+    let deleted = f
+        .call(
+            "DELETE",
+            &source_target,
+            None,
+            &[("authorization", &auth), ("if-match", "\"r-1\"")],
+        )
+        .await;
+    assert_eq!(deleted.status, StatusCode::NO_CONTENT, "{:?}", deleted.body);
+    let replay_delete = f
+        .call(
+            "DELETE",
+            &source_target,
+            None,
+            &[("authorization", &auth), ("if-match", "\"r-1\"")],
+        )
+        .await;
+    assert_eq!(
+        replay_delete.status,
+        StatusCode::NO_CONTENT,
+        "{:?}",
+        replay_delete.body
+    );
+    assert_eq!(
+        f.call("GET", &source_target, None, &[("authorization", &auth)])
+            .await
+            .status,
+        StatusCode::NOT_FOUND
+    );
+    let after_generation: i64 =
+        sqlx::query_scalar("SELECT generation FROM catabolic_projection_state WHERE singleton=1")
+            .fetch_one(&f.app.db)
+            .await
+            .unwrap();
+    assert_eq!(
+        before_generation, after_generation,
+        "withdrawal must not invent native missing-file observations"
+    );
+    let reuse = f
+        .call(
+            "POST",
+            "/api/v2/sources",
+            Some(
+                json!({"name":"Library A","root_path":f._dir.path().join("media"),"exclusions":[]}),
+            ),
+            &[
+                ("authorization", &auth),
+                ("idempotency-key", "source-replace-media"),
+            ],
+        )
+        .await;
+    assert_eq!(reuse.status, StatusCode::CONFLICT, "{:?}", reuse.body);
+    let mut lifecycle_tx = f.app.db.begin_with("BEGIN IMMEDIATE").await.unwrap();
+    assert!(
+        motion_catalog_backend::source_lifecycle::require_active_in(&mut lifecycle_tx, &sources[0])
+            .await
+            .is_err()
+    );
+    let preserved =
+        motion_catalog_backend::source_lifecycle::current_in(&mut lifecycle_tx, &sources[0])
+            .await
+            .unwrap();
+    assert_eq!(
+        preserved.state,
+        playscale_core::source_lifecycle::State::Tombstoned
+    );
+    lifecycle_tx.commit().await.unwrap();
+    f.app
+        .native_catalog
+        .take()
+        .unwrap()
+        .shutdown()
+        .await
+        .unwrap();
+    f.app.native_catalog = Some(Arc::new(
+        playscale::native_catalog::Runtime::open(f.app.db.clone(), path, "default".into())
+            .await
+            .unwrap(),
+    ));
+    assert_eq!(
+        f.call("GET", &source_target, None, &[("authorization", &auth)])
+            .await
+            .status,
+        StatusCode::NOT_FOUND
+    );
+    let replay_after_restart = f
+        .call(
+            "DELETE",
+            &source_target,
+            None,
+            &[("authorization", &auth), ("if-match", "\"r-1\"")],
+        )
+        .await;
+    assert_eq!(
+        replay_after_restart.status,
+        StatusCode::NO_CONTENT,
+        "{:?}",
+        replay_after_restart.body
+    );
+    let restarted = f
+        .call("GET", &target, None, &[("authorization", &scoped)])
+        .await;
+    assert_eq!(restarted.status, StatusCode::OK, "{:?}", restarted.body);
+    assert_eq!(restarted.body, result.body);
+    let second = f
+        .call(
+            "GET",
+            &format!("/api/v2/libraries/{}", libraries[1]),
+            None,
+            &[("authorization", &auth)],
+        )
+        .await;
+    assert_eq!(second.status, StatusCode::OK, "{:?}", second.body);
+    assert_eq!(second.body["source_ids"], json!([sources[1]]));
 }

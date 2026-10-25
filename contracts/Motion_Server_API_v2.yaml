@@ -15171,6 +15171,8 @@ components:
           maxItems: 1000
         requester_id:
           $ref: '#/components/schemas/Id'
+        controls:
+          $ref: '#/components/schemas/NativePreparationJobControls'
       required:
       - id
       - revision
@@ -15181,6 +15183,29 @@ components:
       - error_code
       - result_ids
       - requester_id
+    NativePreparationJobControls:
+      type: object
+      additionalProperties: false
+      description: Advisory new-request hints for retained native preparation jobs, never authority. Exact replay retains the original key and reviewed If-Match even if these hints become false. Fresh retry still validates current preparation, native source and queue capacity.
+      properties:
+        family:
+          type: string
+          const: native_preparation
+        version:
+          type: integer
+          const: 1
+        cohort:
+          type: boolean
+        cancel_request_available:
+          type: boolean
+        retry_request_available:
+          type: boolean
+      required:
+      - family
+      - version
+      - cohort
+      - cancel_request_available
+      - retry_request_available
     Recipe:
       type: object
       additionalProperties: false

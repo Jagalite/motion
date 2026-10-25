@@ -1,7 +1,7 @@
 //! Preparation transport over the durable processing service. Publication uses
 //! the same persisted identity and current authorization under the writer lock.
 use super::{Body, PageQuery, Problem, Scope, auth::Caller, etag, idempotency_key, page};
-use crate::{App, db::begin_write};
+use crate::App;
 use axum::{
     Json, Router,
     extract::{Query, State},
@@ -12,6 +12,8 @@ use axum::{
 use playscale_core::access::{self, Idempotent, Permission};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+
+mod native_renditions;
 
 pub fn routes() -> Router<App> {
     Router::new()
@@ -246,8 +248,15 @@ pub(crate) async fn exact_binding(
     timeline: &str,
     file: &str,
     revision: &str,
-) -> Result<bool, sqlx::Error> {
-    sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM version_files b JOIN media_versions v ON v.id=b.version_id JOIN timelines t ON t.id=v.timeline_id JOIN media_files f ON f.id=b.file_id WHERE v.timeline_id=? AND b.file_id=? AND b.file_revision=? AND v.origin='original' AND f.edition_id=t.edition_id AND b.start_ms IS NULL AND b.end_ms IS NULL AND (SELECT count(*) FROM version_files p WHERE p.version_id=v.id)=1)").bind(timeline).bind(file).bind(revision).fetch_one(conn).await
+) -> Result<bool, Problem> {
+    let versions: Vec<String> = sqlx::query_scalar("SELECT v.id FROM version_files b JOIN media_versions v ON v.id=b.version_id JOIN timelines t ON t.id=v.timeline_id JOIN media_files f ON f.id=b.file_id WHERE v.timeline_id=? AND b.file_id=? AND b.file_revision=? AND v.origin='original' AND f.edition_id=t.edition_id AND b.start_ms IS NULL AND b.end_ms IS NULL AND (SELECT count(*) FROM version_files p WHERE p.version_id=v.id)=1 ORDER BY v.id")
+        .bind(timeline).bind(file).bind(revision).fetch_all(&mut *conn).await?;
+    for version in versions {
+        if super::playback::native_version_ready(conn, &version).await? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 pub(crate) async fn publication_facts(
@@ -280,15 +289,22 @@ pub(crate) async fn publication_facts(
     let facts = super::content::file_facts(conn, &job.source_file_id)
         .await
         .map_err(|e| anyhow::anyhow!("{}", e.code))?;
-    let source_in_scope = principal.as_ref().is_some_and(|p| {
-        facts.as_ref().is_some_and(|f| {
-            f.library_ids
-                .iter()
-                .any(|id| access::catalog_scope(p).library(id))
-        })
-    });
+    let native_scope_valid = match &principal {
+        Some(principal) => super::playback::require_native_scope(conn, principal)
+            .await
+            .is_ok(),
+        None => false,
+    };
+    let source_in_scope = native_scope_valid
+        && principal.as_ref().is_some_and(|p| {
+            facts
+                .as_ref()
+                .is_some_and(|f| access::catalog_scope(p).admits(f.library_ids.iter()))
+        });
     let enabled:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM media_files f JOIN libraries l ON l.id=f.library_id WHERE f.id=? AND f.available=1 AND l.enabled=1 AND f.generated=0)").bind(&job.source_file_id).fetch_one(&mut *conn).await?;
-    let binding = exact_binding(conn, &timeline, &job.source_file_id, &job.source_revision).await?;
+    let binding = exact_binding(conn, &timeline, &job.source_file_id, &job.source_revision)
+        .await
+        .map_err(|e| anyhow::anyhow!("{}", e.code))?;
     Ok(Some((
         timeline,
         playscale_core::processing::PreparationFacts {
@@ -378,6 +394,15 @@ pub(crate) async fn selection(
     use playscale_core::components::{
         Kind, SubtitleOccurrence, embedded_track, subtitle_occurrence,
     };
+    if super::playback::native_bound(conn).await?
+        && (requested.audio_component_id.is_some() || requested.subtitle_component_id.is_some())
+    {
+        return Err(Problem::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "native_components_unavailable",
+            "Native component selection is not qualified",
+        ));
+    }
     let version: String = sqlx::query_scalar(
         "SELECT v.id FROM version_files b JOIN media_versions v ON v.id=b.version_id \
          WHERE v.timeline_id=? AND b.file_id=? AND b.file_revision=? AND v.origin='original' \
@@ -546,10 +571,11 @@ async fn prepare(
         input.tracks.subtitle_component_id.is_some() || input.tracks.subtitle_track_id.is_some();
     kept_subtitle_problem(&input.tracks.subtitle_policy, explicit_subtitle)?;
     let _guard = app.jobs.lock().await;
-    let mut tx = begin_write(&app.db).await?;
+    let mut tx = super::playback::begin_catalog_application(&app, true).await?;
     let principal = caller
         .reauthorize(&mut tx, Some(Permission::ProcessingRequest))
         .await?;
+    super::playback::require_native_scope(&mut tx, &principal).await?;
     let record = Scope {
         principal: &principal.id,
         operation: "createPreparation",
@@ -563,6 +589,15 @@ async fn prepare(
         crate::now(),
     )? == Idempotent::Replay
     {
+        if app.native_catalog.is_some() {
+            super::playback::readable_timeline(&mut tx, &principal, &input.timeline_id).await?;
+            let facts = super::content::file_facts(&mut tx, &input.source.file_id)
+                .await?
+                .ok_or_else(Problem::not_found)?;
+            if !access::catalog_scope(&principal).admits(facts.library_ids.iter()) {
+                return Err(Problem::not_found());
+            }
+        }
         let stored = stored.unwrap();
         let mut response = (stored.status, Json(stored.body)).into_response();
         response
@@ -575,11 +610,7 @@ async fn prepare(
     let facts = super::content::file_facts(&mut tx, &input.source.file_id)
         .await?
         .ok_or_else(Problem::not_found)?;
-    if !facts
-        .library_ids
-        .iter()
-        .any(|id| access::catalog_scope(&principal).library(id))
-    {
+    if !access::catalog_scope(&principal).admits(facts.library_ids.iter()) {
         return Err(Problem::not_found());
     }
     let source:crate::db::ItemRow=sqlx::query_as("SELECT * FROM catalog_files WHERE id=? AND generated=0 AND available=1 AND library_id IN (SELECT id FROM libraries WHERE enabled=1)").bind(&input.source.file_id).fetch_optional(&mut *tx).await?.ok_or_else(Problem::not_found)?;
@@ -668,6 +699,18 @@ async fn prepare(
     let id = crate::new_id();
     sqlx::query("INSERT INTO processing_jobs(id,source_file_id,source_revision,recipe,backend,idempotency_key,phase,created_at,updated_at,requester_id,video_profile) VALUES (?,?,?,?,?,?,'queued',?,?,?,?)").bind(&id).bind(&input.source.file_id).bind(&input.source.file_revision).bind(&input.recipe_id).bind(&input.backend).bind(format!("v2-{id}")).bind(crate::now()).bind(crate::now()).bind(&principal.id).bind(input.video_profile.as_ref().map(sqlx::types::Json)).execute(&mut *tx).await?;
     sqlx::query("INSERT INTO preparations(job_id,timeline_id,recipe_digest,tracks_json,credential_hash,ingress_id) VALUES (?,?,?,?,?,?)").bind(&id).bind(&input.timeline_id).bind(&digest).bind(serde_json::to_string(&tracks_record).map_err(Problem::internal)?).bind(caller.credential().map(|(hash,_)|hash)).bind(caller.ingress_device_id()).execute(&mut *tx).await?;
+    if app.native_catalog.is_some() {
+        crate::native_processing::capture_admission(
+            &app,
+            &mut tx,
+            &id,
+            &input.timeline_id,
+            &input.source.file_id,
+            &input.source.file_revision,
+        )
+        .await
+        .map_err(Problem::internal)?;
+    }
     let value = super::jobs::row(&mut tx, &id, &principal).await?.wire();
     record
         .save(
@@ -710,11 +753,14 @@ async fn renditions(
             "timeline_id must be a valid ID",
         ));
     }
+    if app.native_catalog.is_some() {
+        return native_renditions::list(&app, &caller, query).await;
+    }
     let q = PageQuery {
         cursor: query.cursor,
         limit: query.limit,
     };
-    let mut tx = app.db.begin().await?;
+    let mut tx = super::playback::begin_catalog_application(&app, false).await?;
     let limit = q.limit()?;
     let (clause, all, ids) =
         super::scope_clause(&access::catalog_scope(&caller.principal), "f.library_id");

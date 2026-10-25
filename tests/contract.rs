@@ -33,6 +33,49 @@ fn contract() -> Value {
     serde_json::from_str(v2::system::CONTRACT_JSON).unwrap()
 }
 
+#[test]
+fn native_preparation_control_hints_are_optional_versioned_and_not_authority() {
+    let document = contract();
+    let job = &document["components"]["schemas"]["Job"];
+    assert_eq!(job["additionalProperties"], false);
+    assert_eq!(
+        job["properties"]["controls"]["$ref"],
+        "#/components/schemas/NativePreparationJobControls"
+    );
+    assert!(
+        !job["required"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|field| field == "controls")
+    );
+    let controls = &document["components"]["schemas"]["NativePreparationJobControls"];
+    assert_eq!(controls["properties"]["version"]["const"], 1);
+    assert_eq!(
+        controls["properties"]["family"]["const"],
+        "native_preparation"
+    );
+    assert!(
+        controls["description"]
+            .as_str()
+            .unwrap()
+            .contains("never authority")
+    );
+    assert!(
+        controls["description"]
+            .as_str()
+            .unwrap()
+            .contains("Exact replay")
+    );
+    for field in [
+        "cohort",
+        "cancel_request_available",
+        "retry_request_available",
+    ] {
+        assert_eq!(controls["properties"][field]["type"], "boolean");
+    }
+}
+
 /// `(method, path) -> operationId` for every contract operation.
 fn operations(contract: &Value) -> BTreeMap<(String, String), String> {
     let mut out = BTreeMap::new();
@@ -94,6 +137,7 @@ async fn app(dir: &Path) -> App {
     std::fs::create_dir(&state).unwrap();
     App {
         health: Arc::new(playscale::operations::Health::new(false)),
+        native_catalog: None,
         db,
         admin_token: Arc::new("contract-test-operator-token-0123456789".into()),
         origin: Arc::new("http://127.0.0.1:8787".into()),
@@ -136,7 +180,7 @@ async fn served(app: App, contract: &Value) -> BTreeSet<(String, String)> {
     let router: Router = Router::new()
         .nest(
             "/api/v2",
-            v2::router().route_layer(middleware::from_fn(mark_matched)),
+            v2::router(app.clone()).route_layer(middleware::from_fn(mark_matched)),
         )
         .with_state(app);
     let mut served = BTreeSet::new();

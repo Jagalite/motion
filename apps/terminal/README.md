@@ -65,6 +65,21 @@ icon rail and narrow ones a breadcrumb; `tab` moves between sidebar and page,
 `esc` goes back, `/` searches, `?` lists every shortcut. The interface paints
 the Marquee charcoal palette; `NO_COLOR` gets plain text.
 
+Native job history is not a grant to control every rendition. The TUI offers
+controls only when `processing.native_preparation_controls` advertises the
+supported version and the selected job supplies a matching native preparation
+cohort and action hint. Legacy history and unknown/missing descriptors stay
+read-only. Cancellation is a cooperative request, not confirmed termination;
+retry remains subject to the server's current preparation checks.
+
+If an acknowledgement is lost, the TUI retains the original request key and
+reviewed revision even when the job's new-action hints change. Capability or
+permission withdrawal closes unsubmitted confirmations and pauses replay
+offers, but does not discard the uncertain request. If support returns for the
+same credential, retrying resubmits that exact intent. Sign-out still clears
+credential-scoped intents. Explicit CLI commands rely on authoritative server
+validation rather than requiring capability preflight, including keyed replay.
+
 ## Contract for scripts
 
 * `--json` writes one versioned object per result to stdout:

@@ -24,6 +24,9 @@ use stateless::{
     Check, Enumerate, Model, ModelCodec, ModelError, ModelMetadata, Transition, TransitionRef,
 };
 
+#[path = "downloads_model/packed.rs"]
+mod packed;
+
 const DURATION: u64 = 100_000;
 const MAX_SEQUENCES: u64 = 4;
 /// Small enough that a four-event log fills it before acknowledging.
@@ -760,7 +763,7 @@ impl ModelCodec for Downloads {
 #[test]
 fn offline_reconciliation_exhausts_bounded_interleavings() {
     let report = stateless::explore::enumerate(
-        &Downloads,
+        &packed::PackedDownloads::<true>::default(),
         stateless::explore::SearchConfig {
             max_states: 12_000_000,
             max_transitions: 200_000_000,

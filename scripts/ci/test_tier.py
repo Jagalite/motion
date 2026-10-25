@@ -6,7 +6,9 @@ full: only FULL_ONLY, the long-running suites (ci-full.yml: pushes to main,
       nightly, on demand, and pull requests touching production source,
       models/tests, clients, contracts, build inputs or workflows).
 
-Together the tiers cover `cargo test --workspace`. A target is full-only when
+Together the tiers cover `cargo test --workspace` using the explicit
+native-qualification profile so the real observer executable is link-stripped
+without changing local development defaults. A target is full-only when
 it explores a large Stateless graph in an unoptimized build or drives real
 FFmpeg live delivery end to end. Usage: python3 scripts/ci/test_tier.py fast|full [--print]
 """
@@ -33,11 +35,11 @@ def main():
         raise SystemExit(__doc__)
     tier, dry = sys.argv[1], '--print' in sys.argv
     targets = test_targets()
-    base = ['cargo', 'test', '--locked', '--workspace', '--no-fail-fast']
+    base = ['cargo', 'test', '--locked', '--profile', 'native-qualification', '--workspace', '--no-fail-fast']
     if tier == 'fast':
         chosen = [t for t in targets if t not in FULL_ONLY]
         commands = [base + ['--lib', '--bins'] + [a for t in chosen for a in ('--test', t)],
-                    ['cargo', 'test', '--locked', '--workspace', '--doc']]
+                    ['cargo', 'test', '--locked', '--profile', 'native-qualification', '--workspace', '--doc']]
     else:
         chosen = [t for t in targets if t in FULL_ONLY]
         commands = [base + [a for t in chosen for a in ('--test', t)]] if chosen else []

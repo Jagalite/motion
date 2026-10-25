@@ -361,7 +361,21 @@ pub async fn control(
     admin(&app, &headers)?;
     let r = json(body)?;
     let _lock = app.jobs.lock().await;
-    let old = load(&app, &id).await?;
+    let mut tx = app.db.begin_with("BEGIN IMMEDIATE").await?;
+    let old: ProcessingJob = sqlx::query_as("SELECT * FROM processing_jobs WHERE id=?")
+        .bind(&id)
+        .fetch_one(&mut *tx)
+        .await?;
+    if app.native_catalog.is_some()
+        && native_publication_reserved_in(&mut tx, &old)
+            .await
+            .map_err(ApiError::internal)?
+    {
+        return Err(ApiError::conflict(
+            "publication_committing",
+            "This native publication is reserved; reconcile its receipt before changing the attempt",
+        ));
+    }
     let input = match r.action.as_str() {
         "cancel" => Input::Cancel,
         "retry" if old.state().map_err(ApiError::internal)?.retryable() => Input::Retry,
@@ -384,8 +398,9 @@ pub async fn control(
     .bind(db::phase_name(next.phase))
     .bind(now())
     .bind(&id)
-    .execute(&app.db)
+    .execute(&mut *tx)
     .await?;
+    tx.commit().await?;
     Ok(Json(load(&app, &id).await?))
 }
 /// Witness files under `root` still held by live executions. Fails rather than
@@ -419,24 +434,30 @@ pub async fn recover(app: &App) -> anyhow::Result<()> {
             || {},
         );
     }
-    // A DB-only restore must not borrow another installation's disposable cache.
-    sqlx::query("UPDATE media_files SET available=0 WHERE generated=1 AND library_id IN (SELECT id FROM libraries WHERE managed=1 AND root<>?)")
+    if app.native_catalog.is_none() {
+        // A DB-only restore must not borrow another installation's disposable cache.
+        sqlx::query("UPDATE media_files SET available=0 WHERE generated=1 AND library_id IN (SELECT id FROM libraries WHERE managed=1 AND root<>?)")
         .bind(app.processing.root.to_string_lossy().as_ref()).execute(&app.db).await?;
-    sqlx::query("UPDATE processing_jobs SET expired=1 WHERE phase='completed' AND output_file_id IN (SELECT id FROM media_files WHERE generated=1 AND available=0)").execute(&app.db).await?;
+        sqlx::query("UPDATE processing_jobs SET expired=1 WHERE phase='completed' AND output_file_id IN (SELECT id FROM media_files WHERE generated=1 AND available=0)").execute(&app.db).await?;
+    }
     let rows: Vec<ProcessingJob> =
         sqlx::query_as("SELECT * FROM processing_jobs WHERE phase IN ('running','cancelling')")
             .fetch_all(&app.db)
             .await?;
     for row in rows {
+        let mut tx = app.db.begin_with("BEGIN IMMEDIATE").await?;
+        let row: ProcessingJob = sqlx::query_as("SELECT * FROM processing_jobs WHERE id=?")
+            .bind(&row.id)
+            .fetch_one(&mut *tx)
+            .await?;
+        if app.native_catalog.is_some() && native_publication_reserved_in(&mut tx, &row).await? {
+            tx.rollback().await?;
+            continue;
+        }
         let (next, _) = transition(&row.state()?, Input::Recover);
-        sqlx::query(
-            "UPDATE processing_jobs SET phase=?,progress_seconds=0,updated_at=? WHERE id=?",
-        )
-        .bind(db::phase_name(next.phase))
-        .bind(now())
-        .bind(row.id)
-        .execute(&app.db)
-        .await?;
+        sqlx::query("UPDATE processing_jobs SET phase=?,progress_seconds=0,updated_at=? WHERE id=? AND attempt=?")
+            .bind(db::phase_name(next.phase)).bind(now()).bind(&row.id).bind(row.attempt).execute(&mut *tx).await?;
+        tx.commit().await?;
     }
     Ok(())
 }
@@ -606,6 +627,122 @@ async fn command(
     }
     result
 }
+async fn native_publication_reserved_in(
+    db: &mut sqlx::SqliteConnection,
+    job: &ProcessingJob,
+) -> anyhow::Result<bool> {
+    Ok(sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM catabolic_generated_publications WHERE job_id=? AND attempt=? AND command_json IS NOT NULL AND acknowledged=0)")
+        .bind(&job.id).bind(job.attempt).fetch_one(db).await?)
+}
+async fn native_attempt_retained(app: &App, job_id: &str, attempt: i64) -> anyhow::Result<bool> {
+    if app.native_catalog.is_none() {
+        return Ok(false);
+    }
+    Ok(sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM catabolic_generated_publications WHERE job_id=? AND attempt=? AND acknowledged=0)")
+        .bind(job_id).bind(attempt).fetch_one(&app.db).await?)
+}
+async fn render_source(
+    app: &App,
+    job: &ProcessingJob,
+) -> anyhow::Result<(
+    db::ItemRow,
+    String,
+    String,
+    Option<sqlx::Transaction<'static, sqlx::Sqlite>>,
+)> {
+    if let Some(runtime) = &app.native_catalog {
+        runtime.rebuild_projection().await?;
+    }
+    let mut fence = app.db.begin_with("BEGIN IMMEDIATE").await?;
+    if let Some(runtime) = &app.native_catalog {
+        runtime.validate_projection(&mut fence).await?;
+        let (_, facts) = crate::v2::processing::publication_facts(&mut fence, job)
+            .await?
+            .context("native render has no authorized preparation")?;
+        facts.admit().map_err(anyhow::Error::msg)?;
+        let current: ProcessingJob = sqlx::query_as("SELECT * FROM processing_jobs WHERE id=?")
+            .bind(&job.id)
+            .fetch_one(&mut *fence)
+            .await?;
+        anyhow::ensure!(
+            current.attempt == job.attempt
+                && current.phase == "running"
+                && current.source_file_id == job.source_file_id
+                && current.source_revision == job.source_revision,
+            "native processing source attempt changed"
+        );
+        anyhow::ensure!(
+            !native_publication_reserved_in(&mut fence, job).await?,
+            "native publication already reserved; reconcile instead of rerendering"
+        );
+        crate::native_processing::validate_admission_in(runtime, &mut fence, job).await?;
+    }
+    let source: db::ItemRow = sqlx::query_as("SELECT * FROM catalog_files WHERE id=? AND available=1 AND generated=0 AND library_id IN (SELECT id FROM libraries WHERE enabled=1)")
+        .bind(&job.source_file_id).fetch_one(&mut *fence).await?;
+    anyhow::ensure!(
+        source.revision == job.source_revision,
+        "stale source revision"
+    );
+    let (root, identity): (String, String) =
+        sqlx::query_as("SELECT root,root_identity FROM libraries WHERE id=?")
+            .bind(&source.library_id)
+            .fetch_one(&mut *fence)
+            .await?;
+    if app.native_catalog.is_some() {
+        Ok((source, root, identity, Some(fence)))
+    } else {
+        fence.rollback().await?;
+        Ok((source, root, identity, None))
+    }
+}
+async fn finish_native_failure(app: &App, job: &ProcessingJob) -> anyhow::Result<()> {
+    let _lock = app.jobs.lock().await;
+    let mut tx = app.db.begin_with("BEGIN IMMEDIATE").await?;
+    let current: ProcessingJob = sqlx::query_as("SELECT * FROM processing_jobs WHERE id=?")
+        .bind(&job.id)
+        .fetch_one(&mut *tx)
+        .await?;
+    if native_publication_reserved_in(&mut tx, &current).await? {
+        // This is parked, not failed, cancelled, or completed. The immutable
+        // command may already have effects: only receipt reconciliation may
+        // resolve it. Keep its state/attempt/bytes and service other jobs.
+        tx.rollback().await?;
+        tracing::warn!(job_id=%current.id, attempt=current.attempt,
+            "native publication parked: exact receipt reconciliation required");
+        return Ok(());
+    }
+    let previous = current.state()?;
+    let (next, effects) = transition(
+        &previous,
+        Input::Finished {
+            attempt: job.attempt.try_into()?,
+            success: false,
+        },
+    );
+    anyhow::ensure!(
+        !effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::Publish { .. })),
+        "failed native render cannot publish"
+    );
+    if next != previous {
+        sqlx::query(
+            "UPDATE processing_jobs SET phase=?,error=?,updated_at=? WHERE id=? AND attempt=?",
+        )
+        .bind(db::phase_name(next.phase))
+        .bind(
+            (db::phase_name(next.phase) == "failed")
+                .then_some("processing_failed: native render or publication validation failed"),
+        )
+        .bind(now())
+        .bind(&job.id)
+        .bind(job.attempt)
+        .execute(&mut *tx)
+        .await?;
+    }
+    tx.commit().await?;
+    Ok(())
+}
 async fn convert(
     app: &App,
     job: &ProcessingJob,
@@ -614,20 +751,8 @@ async fn convert(
     lease: &crate::execution::Lease,
 ) -> anyhow::Result<(scan::Found, String)> {
     active(app, job, stop).await?;
-    let source: db::ItemRow =
-        sqlx::query_as("SELECT * FROM catalog_files WHERE id=? AND available=1 AND generated=0 AND library_id IN (SELECT id FROM libraries WHERE enabled=1)")
-            .bind(&job.source_file_id)
-            .fetch_one(&app.db)
-            .await?;
-    anyhow::ensure!(
-        source.revision == job.source_revision,
-        "stale source revision"
-    );
-    let (root, identity): (String, String) =
-        sqlx::query_as("SELECT root,root_identity FROM libraries WHERE id=?")
-            .bind(&source.library_id)
-            .fetch_one(&app.db)
-            .await?;
+    let previous_retained = native_attempt_retained(app, &job.id, job.attempt - 1).await?;
+    let (source, root, identity, source_fence) = render_source(app, job).await?;
     let duration = source
         .duration_seconds
         .filter(|d| d.is_finite() && *d > 0.0)
@@ -647,8 +772,9 @@ async fn convert(
     let snapshot = blocking(permit.clone(), move || {
         use sha2::{Digest, Sha256};
         use std::io::{Read, Write};
+        let _source_writer_custody = source_fence;
         std::fs::create_dir_all(&cache)?;
-        if previous > 0 {
+        if previous > 0 && !previous_retained {
             let old = stage.parent().unwrap().join(previous.to_string());
             if old.exists() {
                 std::fs::remove_dir_all(old)?;
@@ -710,7 +836,10 @@ async fn convert(
         tokio::select! {
             result=&mut snapshot=>{result?;break;},
             _=tokio::time::sleep(Duration::from_millis(200))=>{
-                if let Err(error)=active(app,job,stop).await {copy_stop.cancel();let _=snapshot.await;return Err(error);}
+                let alive = if app.native_catalog.is_some() {
+                    if stop.is_cancelled() { Err(anyhow::anyhow!("processing stopped during native source snapshot")) } else { Ok(()) }
+                } else { active(app,job,stop).await };
+                if let Err(error)=alive {copy_stop.cancel();let _=snapshot.await;return Err(error);}
             }
         }
     }
@@ -811,14 +940,25 @@ async fn convert(
         media_ms,
     )
     .await?;
-    let found = scan::inspect(
-        app.processing.root.clone(),
-        job.relative().join("output.mp4"),
-        &app.ffprobe,
-        stop.clone(),
-        permit.clone(),
-    )
-    .await?;
+    let found = if app.native_catalog.is_some() {
+        scan::inspect_native(
+            app.processing.root.clone(),
+            job.relative().join("output.mp4"),
+            &app.ffprobe,
+            stop.clone(),
+            permit.clone(),
+        )
+        .await?
+    } else {
+        scan::inspect(
+            app.processing.root.clone(),
+            job.relative().join("output.mp4"),
+            &app.ffprobe,
+            stop.clone(),
+            permit.clone(),
+        )
+        .await?
+    };
     let source_tracks: Vec<db::Track> = serde_json::from_str(&source.tracks_json)?;
     let observations = |tracks: &[db::Track]| {
         tracks
@@ -935,15 +1075,25 @@ async fn convert(
         Ok(())
     })
     .await?;
-    let library = db::add_managed_library(&app.db, "Generated media", &app.processing.root).await?;
+    let library = if app.native_catalog.is_some() {
+        String::new()
+    } else {
+        db::add_managed_library(&app.db, "Generated media", &app.processing.root)
+            .await?
+            .id
+    };
     tokio::fs::remove_file(directory.join("input")).await?;
-    Ok((found, library.id))
+    Ok((found, library))
 }
 async fn finish(
     app: &App,
     job: &ProcessingJob,
     result: Option<(scan::Found, String)>,
 ) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        app.native_catalog.is_none(),
+        "native processing cannot use legacy catalog publication"
+    );
     let _lock = app.jobs.lock().await;
     let mut tx = crate::db::begin_write(&app.db).await?;
     let current: ProcessingJob = sqlx::query_as("SELECT * FROM processing_jobs WHERE id=?")
@@ -1149,7 +1299,93 @@ mod filter_tests {
     }
 }
 
+async fn claim_queued(app: &App) -> anyhow::Result<Option<ProcessingJob>> {
+    let _lock = app.jobs.lock().await;
+    claim_queued_in_pool(&app.db).await
+}
+
+async fn claim_queued_in_pool(pool: &sqlx::SqlitePool) -> anyhow::Result<Option<ProcessingJob>> {
+    // No job has been selected or transitioned if BEGIN cannot acquire custody.
+    // Only this definitely pre-effect contention is an idle scheduling result.
+    let mut tx = match pool.begin_with("BEGIN IMMEDIATE").await {
+        Ok(tx) => tx,
+        Err(sqlx::Error::Database(error))
+            if error
+                .code()
+                .and_then(|v| v.parse::<i32>().ok())
+                .is_some_and(|v| matches!(v & 255, 5 | 6)) =>
+        {
+            return Ok(None);
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let row = sqlx::query_as::<_, ProcessingJob>(
+        "SELECT * FROM processing_jobs WHERE phase='queued' ORDER BY created_at,id LIMIT 1",
+    )
+    .fetch_optional(&mut *tx)
+    .await?;
+    let claimed = if let Some(row) = row {
+        let (next, effects) = transition(&row.state()?, Input::Start);
+        let runs = matches!(effects.as_slice(), [Effect::Run { .. }]);
+        let changed = sqlx::query("UPDATE processing_jobs SET phase=?,attempt=?,progress_seconds=0,error=?,updated_at=? WHERE id=? AND phase=? AND attempt=?")
+            .bind(db::phase_name(next.phase)).bind(next.attempt)
+            .bind((!runs).then_some("job attempt limit reached"))
+            .bind(now()).bind(&row.id).bind(&row.phase).bind(row.attempt).execute(&mut *tx).await?;
+        anyhow::ensure!(
+            changed.rows_affected() == 1,
+            "processing queued claim changed under custody"
+        );
+        if runs {
+            Some(
+                sqlx::query_as("SELECT * FROM processing_jobs WHERE id=?")
+                    .bind(&row.id)
+                    .fetch_one(&mut *tx)
+                    .await?,
+            )
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    // Any error after BEGIN, including uncertain commit, remains an error. No
+    // caller may infer a fresh queued attempt from failure or receipt absence.
+    tx.commit().await?;
+    Ok(claimed)
+}
+
 pub async fn worker(app: App, stop: CancellationToken) -> anyhow::Result<()> {
+    worker_inner(app, stop, None).await
+}
+pub(crate) async fn service_worker(
+    app: App,
+    stop: CancellationToken,
+    intent: crate::native_service::ServiceStopIntent,
+) -> anyhow::Result<()> {
+    worker_inner(app, stop, Some(intent)).await
+}
+async fn worker_inner(
+    app: App,
+    stop: CancellationToken,
+    intent: Option<crate::native_service::ServiceStopIntent>,
+) -> anyhow::Result<()> {
+    if app.native_catalog.is_some() {
+        // One bounded startup reconciliation pass. A reserved attempt is not
+        // re-rendered or polled into repeated retries by the ordinary queue.
+        crate::native_processing::recover_reserved_for_service(&app, stop.clone(), intent.as_ref())
+            .await?;
+        if intent
+            .as_ref()
+            .is_some_and(|proof| proof.requested_for_native(app.native_catalog.as_ref().unwrap()))
+        {
+            return Ok(());
+        }
+        #[cfg(test)]
+        crate::native_service::startup_observation::recovered(
+            &app,
+            crate::native_service::startup_observation::Role::Processing,
+        );
+    }
     loop {
         if stop.is_cancelled() {
             return Ok(());
@@ -1187,26 +1423,7 @@ pub async fn worker(app: App, stop: CancellationToken) -> anyhow::Result<()> {
             lease = app.processing.execution.reserve(format!("processing:{}", new_id()), playscale_core::work::Class::Preparation, 1) => lease.map_err(|e| anyhow::anyhow!("encoder reservation rejected: {e:?}"))?,
         };
         let permit = tokio::select! {_ = stop.cancelled()=>return Ok(()),p=app.processing.io.clone().acquire_owned()=>Arc::new(p?)};
-        let job = {
-            let _lock = app.jobs.lock().await;
-            let row = sqlx::query_as::<_, ProcessingJob>(
-                "SELECT * FROM processing_jobs WHERE phase='queued' ORDER BY created_at,id LIMIT 1",
-            )
-            .fetch_optional(&app.db)
-            .await?;
-            if let Some(row) = row {
-                let (next, effects) = transition(&row.state()?, Input::Start);
-                let runs = matches!(effects.as_slice(), [Effect::Run { .. }]);
-                sqlx::query("UPDATE processing_jobs SET phase=?,attempt=?,progress_seconds=0,error=?,updated_at=? WHERE id=?").bind(db::phase_name(next.phase)).bind(next.attempt).bind((!runs).then_some("job attempt limit reached")).bind(now()).bind(&row.id).execute(&app.db).await?;
-                if runs {
-                    Some(load(&app, &row.id).await?)
-                } else {
-                    None
-                }
-            } else {
-                None
-            }
-        };
+        let job = claim_queued(&app).await?;
         if let Some(job) = job.as_ref().filter(|j| j.backend == "videotoolbox")
             && hardware.is_none()
         {
@@ -1227,7 +1444,27 @@ pub async fn worker(app: App, stop: CancellationToken) -> anyhow::Result<()> {
             if let Err(error) = &result {
                 tracing::warn!(job_id=%job.id,%error,"processing failed");
             }
-            finish(&app, &job, result.ok()).await?;
+            if app.native_catalog.is_some() {
+                match result {
+                    Ok((found, _unused_legacy_library)) => {
+                        if let Err(error) = crate::native_processing::publish_render(
+                            &app,
+                            &job,
+                            found,
+                            stop.clone(),
+                            permit.clone(),
+                        )
+                        .await
+                        {
+                            tracing::warn!(job_id=%job.id,error=?error,"native generated publication failed or requires reconciliation");
+                            finish_native_failure(&app, &job).await?;
+                        }
+                    }
+                    Err(_) => finish_native_failure(&app, &job).await?,
+                }
+            } else {
+                finish(&app, &job, result.ok()).await?;
+            }
             // A stuck encoder keeps its hardware session too, until its witness frees.
             if lease.is_stuck()
                 && let Some(hardware) = &hardware
@@ -1239,7 +1476,10 @@ pub async fn worker(app: App, stop: CancellationToken) -> anyhow::Result<()> {
                 }
             }
             // A stuck attempt's directory holds its live witness: keep it for recovery.
-            if load(&app, &job.id).await?.phase != "completed" && !lease.is_stuck() {
+            if load(&app, &job.id).await?.phase != "completed"
+                && !lease.is_stuck()
+                && !native_attempt_retained(&app, &job.id, job.attempt).await?
+            {
                 let directory = app.processing.root.join(job.relative());
                 blocking(permit.clone(), move || {
                     if directory.exists() {
@@ -1470,7 +1710,166 @@ mod supervisor_tests {
 
     #[test]
     fn pause_and_resume_the_group_then_terminate_while_paused() {
-        use std::io::Write;
+        use std::io::{Read, Write};
+        use std::sync::mpsc;
+        use std::time::Instant;
+
+        // A receipt means the real control reader consumed this byte, not that
+        // the supervisor has sent a signal or that the child has progressed.
+        struct ObservedControl {
+            stream: UnixStream,
+            receipts: mpsc::Sender<(usize, u8)>,
+            sequence: usize,
+        }
+        impl Read for ObservedControl {
+            fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+                let count = self.stream.read(bytes)?;
+                for &byte in &bytes[..count] {
+                    self.sequence += 1;
+                    let _ = self.receipts.send((self.sequence, byte));
+                }
+                Ok(count)
+            }
+        }
+        struct OwnedSupervisor {
+            control: Option<UnixStream>,
+            task: Option<std::thread::JoinHandle<anyhow::Result<i32>>>,
+        }
+        impl OwnedSupervisor {
+            fn finish(&mut self) -> Result<i32, String> {
+                // Always request EOF and join before reporting a failed phase.
+                drop(self.control.take());
+                self.task
+                    .take()
+                    .unwrap()
+                    .join()
+                    .map_err(|_| "supervisor thread panicked".to_owned())?
+                    .map_err(|error| format!("supervisor failed: {error:#}"))
+            }
+        }
+        impl Drop for OwnedSupervisor {
+            fn drop(&mut self) {
+                if self.task.is_some() {
+                    let _ = self.finish();
+                }
+            }
+        }
+        fn wait_until(
+            deadline: Instant,
+            phase: &str,
+            mut ready: impl FnMut() -> Result<bool, String>,
+        ) -> Result<(), String> {
+            loop {
+                let now = Instant::now();
+                if now >= deadline {
+                    return Err(format!("{phase}: original phase deadline elapsed"));
+                }
+                if ready()? {
+                    return Ok(());
+                }
+                std::thread::sleep((deadline - now).min(Duration::from_millis(5)));
+            }
+        }
+        fn consume(
+            receipts: &mpsc::Receiver<(usize, u8)>,
+            expected: (usize, u8),
+            deadline: Instant,
+        ) -> Result<(), String> {
+            wait_until(
+                deadline,
+                &format!("control consumption {expected:?}"),
+                || match receipts.try_recv() {
+                    Ok(actual) if actual == expected => Ok(true),
+                    Ok(actual) => Err(format!(
+                        "unexpected control receipt {actual:?}, expected {expected:?}"
+                    )),
+                    Err(mpsc::TryRecvError::Empty) => Ok(false),
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        Err("control reader ended before receipt".into())
+                    }
+                },
+            )
+        }
+        fn observe_state(pid: i32, continued: bool, deadline: Instant) -> Result<(), String> {
+            let expected = if continued {
+                libc::CLD_CONTINUED
+            } else {
+                libc::CLD_STOPPED
+            };
+            wait_until(
+                deadline,
+                if continued {
+                    "OS group leader continued"
+                } else {
+                    "OS group leader stopped"
+                },
+                || {
+                    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+                    // Peek without consuming the production owner's exit witness.
+                    // A positive stop/continue report is consumed separately below
+                    // using only that non-exit event class.
+                    let flags = libc::WEXITED
+                        | libc::WNOHANG
+                        | libc::WNOWAIT
+                        | if continued {
+                            libc::WCONTINUED
+                        } else {
+                            libc::WSTOPPED
+                        };
+                    let result =
+                        unsafe { libc::waitid(libc::P_PID, pid as libc::id_t, &mut info, flags) };
+                    if result != 0 {
+                        return Err(format!(
+                            "waitid phase observation: {}",
+                            std::io::Error::last_os_error()
+                        ));
+                    }
+                    let observed_pid = unsafe { info.si_pid() };
+                    if observed_pid == 0 {
+                        return Ok(false);
+                    }
+                    if observed_pid != pid || info.si_code != expected {
+                        return Err(format!(
+                            "unexpected child phase pid={observed_pid} code={} status={}",
+                            info.si_code,
+                            unsafe { info.si_status() }
+                        ));
+                    }
+                    // Explicitly consume this non-exit transition so a retained
+                    // WNOWAIT report cannot satisfy a later phase. WEXITED is
+                    // deliberately absent: this wait cannot reap the leader.
+                    let mut consumed: libc::siginfo_t = unsafe { std::mem::zeroed() };
+                    let consume_flags = libc::WNOHANG
+                        | if continued {
+                            libc::WCONTINUED
+                        } else {
+                            libc::WSTOPPED
+                        };
+                    let result = unsafe {
+                        libc::waitid(libc::P_PID, pid as libc::id_t, &mut consumed, consume_flags)
+                    };
+                    if result != 0 {
+                        return Err(format!(
+                            "consume non-exit transition: {}",
+                            std::io::Error::last_os_error()
+                        ));
+                    }
+                    if unsafe { consumed.si_pid() } != pid || consumed.si_code != expected {
+                        return Err(format!(
+                            "non-exit transition changed before consumption: code={}",
+                            consumed.si_code
+                        ));
+                    }
+                    Ok(true)
+                },
+            )
+        }
+        fn remaining(deadline: Instant) {
+            if let Some(duration) = deadline.checked_duration_since(Instant::now()) {
+                std::thread::sleep(duration);
+            }
+        }
+
         let dir = tempfile::tempdir().unwrap();
         let ticks = dir.path().join("ticks");
         let script = format!(
@@ -1478,31 +1877,79 @@ mod supervisor_tests {
             dir.path().display(),
             ticks.display()
         );
-        let (mut server, supervisor) = UnixStream::pair().unwrap();
+        let (server, supervisor) = UnixStream::pair().unwrap();
+        let (sender, receipts) = mpsc::channel();
         let task = std::thread::spawn(move || {
             supervise(
                 "/bin/sh".into(),
                 vec!["-c".into(), script.into()],
-                supervisor,
+                ObservedControl {
+                    stream: supervisor,
+                    receipts: sender,
+                    sequence: 0,
+                },
                 Duration::from_millis(500),
             )
         });
+        let mut owned = OwnedSupervisor {
+            control: Some(server),
+            task: Some(task),
+        };
         let pid = grandchild(dir.path());
         let size = || std::fs::metadata(&ticks).map_or(0, |m| m.len());
-        std::thread::sleep(Duration::from_millis(300));
-        server.write_all(b"p").unwrap();
-        std::thread::sleep(Duration::from_millis(300));
-        let paused = size();
-        std::thread::sleep(Duration::from_millis(400));
-        assert_eq!(size(), paused, "group kept running while paused");
-        server.write_all(b"r").unwrap();
-        std::thread::sleep(Duration::from_millis(400));
-        assert!(size() > paused, "group did not resume");
-        server.write_all(b"p").unwrap();
-        std::thread::sleep(Duration::from_millis(200));
-        drop(server);
-        assert_eq!(task.join().unwrap().unwrap(), 1);
-        assert!(wait_gone(pid));
+        let result = (|| -> Result<(), String> {
+            let initial = Instant::now() + Duration::from_millis(300);
+            wait_until(initial, "initial child tick", || Ok(size() > 0))?;
+            remaining(initial);
+            let pause = Instant::now() + Duration::from_millis(300);
+            owned
+                .control
+                .as_mut()
+                .unwrap()
+                .write_all(b"p")
+                .map_err(|e| e.to_string())?;
+            consume(&receipts, (1, b'p'), pause)?;
+            observe_state(pid, false, pause)?;
+            remaining(pause);
+            let paused = size();
+            std::thread::sleep(Duration::from_millis(400));
+            if size() != paused {
+                return Err("group kept running while paused".into());
+            }
+            // Every resume observation shares the original 400ms budget from
+            // the control write. No ACK or poll resets or enlarges that budget.
+            let resume = Instant::now() + Duration::from_millis(400);
+            owned
+                .control
+                .as_mut()
+                .unwrap()
+                .write_all(b"r")
+                .map_err(|e| e.to_string())?;
+            consume(&receipts, (2, b'r'), resume)?;
+            observe_state(pid, true, resume)?;
+            wait_until(resume, "resumed child tick", || Ok(size() > paused))?;
+            remaining(resume);
+            let second_pause = Instant::now() + Duration::from_millis(200);
+            owned
+                .control
+                .as_mut()
+                .unwrap()
+                .write_all(b"p")
+                .map_err(|e| e.to_string())?;
+            consume(&receipts, (3, b'p'), second_pause)?;
+            observe_state(pid, false, second_pause)?;
+            remaining(second_pause);
+            Ok(())
+        })();
+        let joined = owned.finish();
+        let gone = wait_gone(pid);
+        assert!(
+            result.is_ok(),
+            "{}; cleanup={joined:?}; gone={gone}",
+            result.unwrap_err()
+        );
+        assert_eq!(joined.unwrap(), 1);
+        assert!(gone, "group remained after joined supervisor cleanup");
     }
 
     #[test]
@@ -1579,6 +2026,7 @@ mod publication_tests {
         sqlx::query("INSERT INTO processing_jobs(id,source_file_id,source_revision,recipe,backend,idempotency_key,phase,attempt,created_at,updated_at) VALUES ('job','source','source-revision','h264720p','software','key','running',1,0,0)").execute(&pool).await.unwrap();
         let app = App {
             health: Arc::new(crate::operations::Health::new(false)),
+            native_catalog: None,
             db: pool,
             admin_token: Arc::new("test".into()),
             origin: Arc::new("http://localhost".into()),
@@ -1700,6 +2148,7 @@ mod publication_tests {
         sqlx::query("INSERT INTO processing_jobs(id,source_file_id,source_revision,recipe,backend,idempotency_key,phase,attempt,created_at,updated_at) VALUES ('job','source','source-revision','h264720p','software','key','running',1,0,0)").execute(&pool).await.unwrap();
         let app = App {
             health: Arc::new(crate::operations::Health::new(false)),
+            native_catalog: None,
             db: pool,
             admin_token: Arc::new("test".into()),
             origin: Arc::new("http://localhost".into()),
@@ -1809,5 +2258,57 @@ mod settings_tests {
                 assert_eq!(settings.validate().is_ok(), valid, "{field}={value}");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod native_publication_tests;
+
+#[cfg(test)]
+mod queued_claim_tests {
+    use super::*;
+    #[tokio::test]
+    async fn held_writer_preserves_accepted_job_then_claims_exactly_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = db::connect(&dir.path().join("claims.sqlite3"))
+            .await
+            .unwrap();
+        let library = db::add_library(&pool, "fixture", dir.path()).await.unwrap();
+        sqlx::query("INSERT INTO items(id,title,kind) VALUES('item','Fixture','video')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO editions(id,item_id,label) VALUES('edition','item','Original')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO media_files(id,edition_id,library_id,relative_path,revision,fingerprint,bytes,tracks_json,available) VALUES('source','edition',?,'source.mp4','source-revision','stamp',1,'[]',1)").bind(&library.id).execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO processing_jobs(id,source_file_id,source_revision,recipe,backend,idempotency_key,phase,created_at,updated_at) VALUES('job','source','source-revision','h264720p','software','accepted-request','queued',1,1)").execute(&pool).await.unwrap();
+        let mut held = pool.begin_with("BEGIN IMMEDIATE").await.unwrap();
+        assert!(claim_queued_in_pool(&pool).await.unwrap().is_none());
+        let unchanged: (String, i64, String, Option<String>) = sqlx::query_as(
+            "SELECT phase,attempt,idempotency_key,error FROM processing_jobs WHERE id='job'",
+        )
+        .fetch_one(&mut *held)
+        .await
+        .unwrap();
+        assert_eq!(
+            unchanged,
+            ("queued".into(), 0, "accepted-request".into(), None)
+        );
+        held.commit().await.unwrap();
+        let claimed = claim_queued_in_pool(&pool).await.unwrap().unwrap();
+        assert_eq!(claimed.id, "job");
+        assert_eq!(claimed.phase, "running");
+        assert_eq!(claimed.attempt, 1);
+        assert!(claim_queued_in_pool(&pool).await.unwrap().is_none());
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT attempt FROM processing_jobs WHERE id='job'")
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            1
+        );
+        pool.close().await;
     }
 }

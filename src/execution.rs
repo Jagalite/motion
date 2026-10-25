@@ -91,6 +91,27 @@ impl Coordinator {
         Self::apply(&mut self.inner.lock().unwrap(), input)
     }
 
+    /// Stop admission now, retaining all real owners and pending cleanup.
+    pub fn begin_drain(&self) {
+        self.input(Input::BeginDrain);
+    }
+
+    /// Terminal state decision is made by the production core transition under
+    /// the same mutex as reserve. Adapter callback ownership must also be empty.
+    pub fn close_admission_if_idle(&self) -> anyhow::Result<()> {
+        let mut inner = self.inner.lock().unwrap();
+        anyhow::ensure!(
+            inner.starts.is_empty() && inner.terminate.is_empty(),
+            "execution callback owners remain during terminal closure"
+        );
+        Self::apply(&mut inner, Input::CloseAdmission);
+        anyhow::ensure!(
+            inner.ledger.admission_closed,
+            "execution owners remain during terminal closure"
+        );
+        Ok(())
+    }
+
     /// Wait for admission. Dropping the future before admission withdraws the request.
     /// `owner` must be unique among live requests (for example `job:attempt`).
     pub async fn reserve(
@@ -153,7 +174,10 @@ impl Coordinator {
     /// between overlapping and disruptive replacement before requesting capacity.
     pub fn fits_now(&self, class: Class, units: u32) -> bool {
         let inner = self.inner.lock().unwrap();
-        inner.ledger.waiting.is_empty() && inner.ledger.fits(class, units)
+        !inner.ledger.admission_closed
+            && !inner.ledger.admission_draining
+            && inner.ledger.waiting.is_empty()
+            && inner.ledger.fits(class, units)
     }
 
     pub fn snapshot(&self) -> Snapshot {
@@ -258,6 +282,23 @@ impl Lease {
         *self.running.lock().unwrap() = Some(Witness::open(path)?);
         Ok(())
     }
+    /// Register an already descriptor-anchored witness without reopening a
+    /// replaceable pathname after asynchronous preparation. The duplicate is
+    /// only a lock probe, never a source/media reader with a shared seek offset.
+    pub(crate) fn started_retained(&self, witness: &Witness) -> std::io::Result<()> {
+        #[cfg(unix)]
+        {
+            *self.running.lock().unwrap() = Some(Witness {
+                probe: witness.probe.try_clone()?,
+            });
+            Ok(())
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = witness;
+            Err(std::io::Error::other("retained witnesses require Unix"))
+        }
+    }
     /// The execution this lease covered has ended (confirmed by the caller).
     pub fn settled(&self) {
         self.running.lock().unwrap().take();
@@ -353,6 +394,43 @@ fn flock(file: &std::fs::File, operation: libc::c_int) -> bool {
 }
 
 impl Witness {
+    /// Linux private native execution: the probe is a new open-file description
+    /// of the descriptor we just created and locked, not another lookup of the
+    /// scratch path. Refuse existing/symlink leaves. `/proc/self/fd` is derived
+    /// only from this owned descriptor, never from a catalog/plan locator.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn create_anchored(path: &std::path::Path) -> std::io::Result<(Self, Held)> {
+        use std::os::{
+            fd::AsRawFd,
+            unix::fs::{MetadataExt, OpenOptionsExt},
+        };
+        let held = std::fs::OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+            .mode(0o600)
+            .open(path)?;
+        if !flock(&held, libc::LOCK_EX | libc::LOCK_NB) {
+            return Err(std::io::Error::other(
+                "new execution witness could not be locked",
+            ));
+        }
+        let probe = std::fs::File::open(format!("/proc/self/fd/{}", held.as_raw_fd()))?;
+        let (a, b) = (held.metadata()?, probe.metadata()?);
+        if a.dev() != b.dev() || a.ino() != b.ino() || !a.is_file() || !b.is_file() {
+            return Err(std::io::Error::other(
+                "execution witness descriptor changed",
+            ));
+        }
+        Ok((Self { probe }, Held(held)))
+    }
+    #[cfg(not(target_os = "linux"))]
+    pub(crate) fn create_anchored(_: &std::path::Path) -> std::io::Result<(Self, Held)> {
+        Err(std::io::Error::other(
+            "anchored native witness requires Linux",
+        ))
+    }
     /// Create the witness for a new execution. Fails if another owner holds it.
     pub fn create(path: &std::path::Path) -> std::io::Result<(Self, Held)> {
         let held = std::fs::OpenOptions::new()
@@ -607,6 +685,117 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn retained_native_witness_ignores_replaced_path_and_holds_actual_description() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("owner");
+        let coordinator = Coordinator::new(Budget {
+            units: 1,
+            interactive_reserve: 0,
+        });
+        let lease = coordinator
+            .reserve("anchored-witness".into(), Class::Preparation, 1)
+            .await
+            .unwrap();
+        let (witness, held) = Witness::create_anchored(&path).unwrap();
+        std::fs::rename(&path, dir.path().join("old-owner")).unwrap();
+        std::fs::write(&path, b"replacement").unwrap();
+        lease.started_retained(&witness).unwrap();
+        assert!(!witness.released());
+        assert!(Witness::open(&path).unwrap().released());
+        drop(lease);
+        assert_eq!(coordinator.snapshot().used, 1);
+        assert_eq!(coordinator.snapshot().stuck, ["anchored-witness"]);
+        assert!(!witness.released());
+        drop(held);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while coordinator.snapshot().used != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(witness.released());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn retained_native_witness_waits_for_actual_descendant_after_parent_exit() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("owner");
+        use std::{io::Write, os::fd::FromRawFd};
+        let mut pipe = [-1; 2];
+        // SAFETY: successful pipe2 returns two fresh owned descriptors. Only
+        // the read end is inherited; unwinding drops the writer and releases
+        // the descendant too, so a failed assertion cannot orphan it forever.
+        assert_eq!(
+            unsafe { libc::pipe2(pipe.as_mut_ptr(), libc::O_CLOEXEC) },
+            0
+        );
+        let read_pipe = unsafe { std::fs::File::from_raw_fd(pipe[0]) };
+        let mut release = unsafe { std::fs::File::from_raw_fd(pipe[1]) };
+        let coordinator = Coordinator::new(Budget {
+            units: 1,
+            interactive_reserve: 0,
+        });
+        let lease = coordinator
+            .reserve("native-descendant".into(), Class::Preparation, 1)
+            .await
+            .unwrap();
+        let (witness, held) = Witness::create_anchored(&path).unwrap();
+        lease.started_retained(&witness).unwrap();
+        let mut command = tokio::process::Command::new("sh");
+        command
+            .args(["-c", "(read ignored <&4) &"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        inherit(&mut command, &[&held.0, &read_pipe]);
+        let mut child = command.spawn().unwrap();
+        drop(held);
+        drop(read_pipe);
+        assert!(
+            tokio::time::timeout(Duration::from_secs(5), child.wait())
+                .await
+                .unwrap()
+                .unwrap()
+                .success()
+        );
+        // The observed parent has exited, but its actual descendant still owns
+        // the inherited locked description. A new pathname cannot bypass it.
+        std::fs::rename(&path, dir.path().join("old-owner")).unwrap();
+        std::fs::write(&path, b"replacement").unwrap();
+        assert!(!witness.released());
+        let exited = Arc::new(AtomicBool::new(false));
+        let seen = exited.clone();
+        assert!(
+            !confirm_exit(
+                &lease,
+                None,
+                Some(witness),
+                Duration::from_millis(20),
+                move || {
+                    seen.store(true, Ordering::SeqCst);
+                }
+            )
+            .await
+        );
+        drop(lease);
+        assert_eq!(coordinator.snapshot().used, 1);
+        assert!(!exited.load(Ordering::SeqCst));
+        assert!(!coordinator.fits_now(Class::Interactive, 1));
+        release.write_all(b"release actual descendant\n").unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while coordinator.snapshot().used != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(exited.load(Ordering::SeqCst));
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn registered_ownership_survives_path_loss_and_releases_after_failed_spawn() {
@@ -765,5 +954,134 @@ mod tests {
         assert!(!witness.released());
         drop(held);
         assert!(witness.released());
+    }
+}
+
+#[cfg(test)]
+mod terminal_admission_tests {
+    use super::*;
+    #[tokio::test]
+    async fn failed_drain_preserves_admission_and_terminal_close_never_reopens() {
+        let owner = Coordinator::new(BUDGET);
+        let lease = owner
+            .reserve("held".into(), Class::Preparation, 1)
+            .await
+            .unwrap();
+        assert!(owner.close_admission_if_idle().is_err());
+        drop(lease);
+        owner.close_admission_if_idle().unwrap();
+        owner.close_admission_if_idle().unwrap();
+        assert_eq!(
+            owner
+                .clone()
+                .reserve("late-clone".into(), Class::Preparation, 1)
+                .await
+                .err(),
+            Some(Rejection::AdmissionClosed)
+        );
+        assert!(!owner.fits_now(Class::Preparation, 1));
+    }
+    #[tokio::test]
+    async fn draining_retained_clones_refuse_new_work_and_preserve_pending_cleanup() {
+        let owner = Coordinator::new(Budget {
+            units: 1,
+            interactive_reserve: 0,
+        });
+        let lease = owner
+            .reserve("held".into(), Class::Preparation, 1)
+            .await
+            .unwrap();
+        let clone = owner.clone();
+        let mut queued = Box::pin(clone.reserve("queued".into(), Class::Preparation, 1));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(1), &mut queued)
+                .await
+                .is_err()
+        );
+        owner.begin_drain();
+        owner.begin_drain();
+        assert!(owner.close_admission_if_idle().is_err());
+        assert!(!owner.inner.lock().unwrap().ledger.admission_closed);
+        assert_eq!(owner.snapshot().used, 1);
+        assert_eq!(
+            owner
+                .clone()
+                .reserve("late".into(), Class::Preparation, 1)
+                .await
+                .err(),
+            Some(Rejection::AdmissionClosed)
+        );
+        assert!(!owner.fits_now(Class::Preparation, 1));
+        drop(lease);
+        assert_eq!(owner.snapshot().used, 0);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(1), &mut queued)
+                .await
+                .is_err()
+        );
+        assert!(owner.close_admission_if_idle().is_err());
+        drop(queued);
+        owner.close_admission_if_idle().unwrap();
+        assert_eq!(
+            owner
+                .reserve("after".into(), Class::Preparation, 1)
+                .await
+                .err(),
+            Some(Rejection::AdmissionClosed)
+        );
+    }
+    #[tokio::test]
+    async fn reserve_and_begin_drain_linearize_without_fabricating_exit() {
+        let owner = Coordinator::new(BUDGET);
+        let clone = owner.clone();
+        let reserve =
+            tokio::spawn(async move { clone.reserve("race".into(), Class::Preparation, 1).await });
+        owner.begin_drain();
+        match reserve.await.unwrap() {
+            Ok(lease) => {
+                assert!(owner.close_admission_if_idle().is_err());
+                drop(lease);
+            }
+            Err(reason) => assert_eq!(reason, Rejection::AdmissionClosed),
+        }
+        owner.close_admission_if_idle().unwrap();
+        assert_eq!(
+            owner
+                .reserve("late".into(), Class::Preparation, 1)
+                .await
+                .err(),
+            Some(Rejection::AdmissionClosed)
+        );
+    }
+    #[tokio::test]
+    async fn reserve_and_terminal_close_linearize_under_same_mutex() {
+        let owner = Coordinator::new(BUDGET);
+        let racing = owner.clone();
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        let other = barrier.clone();
+        let reserve = tokio::spawn(async move {
+            other.wait().await;
+            racing.reserve("race".into(), Class::Preparation, 1).await
+        });
+        barrier.wait().await;
+        let closed = owner.close_admission_if_idle();
+        match reserve.await.unwrap() {
+            Ok(lease) => {
+                assert!(closed.is_err());
+                drop(lease);
+                owner.close_admission_if_idle().unwrap();
+            }
+            Err(reason) => {
+                assert_eq!(reason, Rejection::AdmissionClosed);
+                assert!(closed.is_ok());
+            }
+        }
+        assert_eq!(
+            owner
+                .reserve("after".into(), Class::Preparation, 1)
+                .await
+                .err(),
+            Some(Rejection::AdmissionClosed)
+        );
     }
 }

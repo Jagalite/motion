@@ -365,7 +365,7 @@ pub async fn approve_pairing(
         &grant,
         &known,
     )?;
-    super::access_management::validate_grant(&mut tx, &grant, &approval.policy).await?;
+    super::access_management::validate_grant(&app, &mut tx, &grant, &approval.policy).await?;
     if let Some(user_id) = &approval.user_id {
         let user = super::access_management::load_user(&mut tx, user_id)
             .await?
@@ -1011,15 +1011,36 @@ pub async fn replace_policy(
     caller
         .reauthorize(&mut tx, Some(Permission::SystemAdmin))
         .await?;
-    let ids = serde_json::to_string(&policy.library_ids).map_err(Problem::internal)?;
-    let known: BTreeSet<String> = sqlx::query_scalar(
-        "SELECT id FROM catalog_libraries WHERE id IN (SELECT value FROM json_each(?))",
-    )
-    .bind(ids)
-    .fetch_all(&mut *tx)
-    .await?
-    .into_iter()
-    .collect();
+    let known: BTreeSet<String> = if let Some(native) = &app.native_catalog {
+        // Definition existence is a named native-owner fact, not a work
+        // projection or saved-query capability. Preserve core error order.
+        if native
+            .validate_library_definitions(&mut tx, &policy.library_ids)
+            .await
+            .map_err(Problem::internal)?
+        {
+            policy.library_ids.clone()
+        } else {
+            BTreeSet::new()
+        }
+    } else {
+        if super::playback::native_bound(&mut tx).await? {
+            return Err(Problem::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "native_owner_unavailable",
+                "Native catalog ownership is not admitted",
+            ));
+        }
+        let ids = serde_json::to_string(&policy.library_ids).map_err(Problem::internal)?;
+        sqlx::query_scalar(
+            "SELECT id FROM catalog_libraries WHERE id IN (SELECT value FROM json_each(?))",
+        )
+        .bind(ids)
+        .fetch_all(&mut *tx)
+        .await?
+        .into_iter()
+        .collect()
+    };
     let row = auth::load_device(&mut tx, &id)
         .await?
         .ok_or_else(Problem::not_found)?;

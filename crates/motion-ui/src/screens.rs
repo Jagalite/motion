@@ -7,6 +7,8 @@
 //! reloads the server-rendered page. No Topcoat procedure or route mutates
 //! anything (plan 11.7: no mutation-only procedures are authorized).
 
+use sha2::{Digest, Sha256};
+
 use topcoat::{
     Result,
     context::Cx,
@@ -622,9 +624,23 @@ pub(crate) async fn matches(cx: &Cx) -> Result<impl View> {
 pub(crate) async fn processing(cx: &Cx) -> Result<impl View> {
     let who = principal(cx)?;
     let jobs = facade(cx).0.jobs(who).await.map_err(ui_error)?;
+    // Keep uncertain native request identities within the same user, profile,
+    // server/restore epoch and browser session. Never persist the CSRF secret.
+    let mut recovery_context = Sha256::new();
+    for value in [
+        &who.principal_id,
+        &who.profile_id,
+        &who.server_epoch,
+        &who.viewing_epoch,
+        &who.csrf_token,
+    ] {
+        recovery_context.update((value.len() as u64).to_be_bytes());
+        recovery_context.update(value.as_bytes());
+    }
+    let recovery_scope = format!("{:x}", recovery_context.finalize());
     Ok(view! {
         <h1>"Processing"</h1>
-        <p class="muted">"Prepare a version of a title from its management page. Failed or cancelled work can be retried here."</p>
+        <p class="muted">"Prepare a version of a title from its management page. Background job status is shown below."</p>
         if jobs.is_empty() {
             empty(message: "No background work.")
         } else {
@@ -645,13 +661,19 @@ pub(crate) async fn processing(cx: &Cx) -> Result<impl View> {
                                 } else { "—" }
                             </td>
                             <td>
-                                if !matches!(job.phase.as_str(), "completed" | "failed" | "cancelled" | "interrupted" | "cancelling") {
+                                if !job.controls_available {
+                                    <span class="muted">"Read-only job history"</span>
+                                }
+                                if job.cancel_request_available {
                                     command_form(command: format!("POST /api/v2/jobs/{}/cancel", job.id), label: "Cancel", idempotent: true, class: Some("command inline"))
                                 }
-                                // The server retries failed and cancelled jobs only, and
-                                // only at the revision shown here.
-                                if matches!(job.phase.as_str(), "failed" | "cancelled") {
+                                // Native decisions arrive as per-row hints. A retry
+                                // always carries the exact revision reviewed here.
+                                if job.retry_request_available {
                                     command_form(command: format!("POST /api/v2/jobs/{}/retry", job.id), label: "Retry", idempotent: true, if_match: Some(job.etag.clone()), class: Some("command inline"))
+                                }
+                                if job.native_control_recovery {
+                                    <div data-job-control-recovery=(job.id.as_str()) data-job-control-scope=(recovery_scope.as_str())></div>
                                 }
                             </td>
                         </tr>

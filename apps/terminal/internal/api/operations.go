@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -35,16 +36,67 @@ type Scan struct {
 	Complete        bool               `json:"complete"`
 }
 type Job struct {
-	ID                string   `json:"id"`
-	Revision          string   `json:"revision"`
-	Kind              string   `json:"kind"`
-	Phase             string   `json:"phase"`
-	AttemptGeneration string   `json:"attempt_generation"`
-	Progress          *float64 `json:"progress"`
-	ErrorCode         *string  `json:"error_code"`
-	ResultIDs         []string `json:"result_ids"`
-	RequesterID       string   `json:"requester_id"`
+	ID                string       `json:"id"`
+	Revision          string       `json:"revision"`
+	Kind              string       `json:"kind"`
+	Phase             string       `json:"phase"`
+	AttemptGeneration string       `json:"attempt_generation"`
+	Progress          *float64     `json:"progress"`
+	ErrorCode         *string      `json:"error_code"`
+	ResultIDs         []string     `json:"result_ids"`
+	RequesterID       string       `json:"requester_id"`
+	Controls          *JobControls `json:"controls,omitempty"`
 }
+
+// JobControls describes bounded native preparation request offers. These
+// observations are not authorization, execution or publication authority.
+// Missing controls preserve older wire responses, not native eligibility.
+type JobControls struct {
+	Family                 string `json:"family"`
+	Version                int    `json:"version"`
+	Cohort                 bool   `json:"cohort"`
+	CancelRequestAvailable bool   `json:"cancel_request_available"`
+	RetryRequestAvailable  bool   `json:"retry_request_available"`
+	// Wire hints must both be explicit booleans. Typed local values already
+	// supply both bool fields, so their zero values remain valid observations.
+	incompleteRequestHints bool
+}
+
+// RequestHintsComplete distinguishes explicit false from omitted/null wire
+// hints. An incomplete descriptor must never offer either native action.
+func (c JobControls) RequestHintsComplete() bool { return !c.incompleteRequestHints }
+
+func (c *JobControls) UnmarshalJSON(data []byte) error {
+	*c = JobControls{incompleteRequestHints: true}
+	var wire struct {
+		Family                 string `json:"family"`
+		Version                int    `json:"version"`
+		Cohort                 bool   `json:"cohort"`
+		CancelRequestAvailable *bool  `json:"cancel_request_available"`
+		RetryRequestAvailable  *bool  `json:"retry_request_available"`
+	}
+	if err := json.Unmarshal(data, &wire); err != nil {
+		return err
+	}
+	c.Family, c.Version, c.Cohort = wire.Family, wire.Version, wire.Cohort
+	if wire.CancelRequestAvailable != nil {
+		c.CancelRequestAvailable = *wire.CancelRequestAvailable
+	}
+	if wire.RetryRequestAvailable != nil {
+		c.RetryRequestAvailable = *wire.RetryRequestAvailable
+	}
+	c.incompleteRequestHints = wire.CancelRequestAvailable == nil || wire.RetryRequestAvailable == nil
+	return nil
+}
+
+func (c JobControls) MarshalJSON() ([]byte, error) {
+	if !c.RequestHintsComplete() {
+		return []byte("null"), nil // serialization cannot repair an invalid hint
+	}
+	type wire JobControls
+	return json.Marshal(wire(c))
+}
+
 type Diagnostics struct {
 	ServerEpoch      string   `json:"server_epoch"`
 	UptimeSeconds    string   `json:"uptime_seconds"`

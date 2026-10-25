@@ -1,5 +1,5 @@
 use playscale_core::work::{
-    Budget, Class, Effect, Hold, Input, Ledger, Reservation, Waiter, transition,
+    Budget, Class, Effect, Hold, Input, Ledger, Rejection, Reservation, Waiter, transition,
 };
 use stateless::{
     Check, Enumerate, Model, ModelCodec, ModelError, ModelMetadata, Transition, TransitionRef,
@@ -31,7 +31,7 @@ impl stateless::Generate for Work {
 }
 impl Enumerate for Work {
     fn inputs(&self, state: &Ledger) -> Result<Vec<Input>, ModelError> {
-        let mut inputs = Vec::new();
+        let mut inputs = vec![Input::BeginDrain, Input::CloseAdmission];
         if state.last_ticket < self.max_tickets {
             for owner in self.owners {
                 for class in self.classes {
@@ -105,9 +105,9 @@ impl Model for Work {
     fn metadata(&self) -> ModelMetadata {
         ModelMetadata {
             name: "playscale.work".into(),
-            model_version: 2,
-            properties_version: 2,
-            codec_version: 2,
+            model_version: 4,
+            properties_version: 4,
+            codec_version: 4,
             build: format!(
                 "{}:{}",
                 env!("CARGO_PKG_VERSION"),
@@ -133,6 +133,10 @@ impl Model for Work {
         tickets.sort();
         tickets.dedup();
         Ok(vec![
+            check(
+                "closed_requires_empty_custody",
+                !s.admission_closed || (s.held.is_empty() && s.waiting.is_empty()),
+            ),
             // Only adopted survivors may exceed the budget; admitted work never does
             // (checked per start by starts_follow_precedence).
             check(
@@ -163,12 +167,13 @@ impl Model for Work {
             // lower-priority work, or behind stuck capacity only.
             check(
                 "admission_progress",
-                s.waiting.iter().all(|w| {
-                    !s.fits(w.class, w.units)
-                        || s.waiting
-                            .iter()
-                            .any(|b| rank(s, b) < rank(s, w) && legitimately_blocked(s, b))
-                }),
+                s.admission_draining
+                    || s.waiting.iter().all(|w| {
+                        !s.fits(w.class, w.units)
+                            || s.waiting
+                                .iter()
+                                .any(|b| rank(s, b) < rank(s, w) && legitimately_blocked(s, b))
+                    }),
             ),
         ])
     }
@@ -197,7 +202,10 @@ impl Model for Work {
             Input::Cancel { ticket } | Input::Exited { ticket } | Input::Stuck { ticket } => {
                 Some(*ticket)
             }
-            Input::Request { .. } | Input::Adopt { .. } => None,
+            Input::BeginDrain
+            | Input::CloseAdmission
+            | Input::Request { .. }
+            | Input::Adopt { .. } => None,
         };
         let known = ticket.is_some_and(|t| before.holds(t).is_some() || before.is_waiting(t));
         let expected_release: Vec<(u64, u32)> = match input {
@@ -219,6 +227,19 @@ impl Model for Work {
             _ => vec![],
         };
         let disposition = match input {
+            Input::Request { .. } | Input::Adopt { .. }
+                if before.admission_closed || before.admission_draining =>
+            {
+                after == before
+                    && accepted.is_empty()
+                    && matches!(
+                        next.outputs,
+                        [Effect::Rejected {
+                            reason: Rejection::AdmissionClosed,
+                            ..
+                        }]
+                    )
+            }
             Input::Request {
                 owner,
                 class,
@@ -383,6 +404,32 @@ impl Model for Work {
             _ => true,
         };
         Ok(vec![
+            check(
+                "terminal_admission_is_absorbing",
+                !before.admission_closed || after == before,
+            ),
+            check(
+                "draining_never_reopens_or_starts_queued_work",
+                (!before.admission_draining || after.admission_draining)
+                    && (!(before.admission_draining || matches!(input, Input::BeginDrain))
+                        || started.is_empty()),
+            ),
+            check(
+                "begin_drain_preserves_actual_custody",
+                !matches!(input, Input::BeginDrain)
+                    || (after.held == before.held
+                        && after.waiting == before.waiting
+                        && after.last_ticket == before.last_ticket
+                        && next.outputs.is_empty()),
+            ),
+            check(
+                "terminal_close_requires_empty_actual_owners",
+                before.admission_closed
+                    || !after.admission_closed
+                    || (matches!(input, Input::CloseAdmission)
+                        && before.held.is_empty()
+                        && before.waiting.is_empty()),
+            ),
             check("request_disposition", disposition && accepted_recorded),
             check("starts_follow_precedence", ordered_starts),
             check(
@@ -495,7 +542,7 @@ fn bounded_work_graph_checks_production_reducer() {
         stateless::explore::SearchTermination::GraphExhausted
     );
     println!(
-        "Stateless work: {} states, {} edges; 3 owners, 4 classes, 1..2 units, <=5 tickets, budget 3 reserve 1",
+        "Stateless work: {} states, {} edges; 3 owners, 4 classes, 1..2 units, <=5 tickets, budget 3 reserve 1, explicit terminal close",
         report.states, report.transitions
     );
 }
@@ -560,4 +607,69 @@ fn stuck_then_exit_replays_exactly() {
     let replay = stateless::execution::replay(&SMALL, &trace, Default::default()).unwrap();
     assert_eq!(replay.outcome, stateless::execution::ReplayOutcome::Exact);
     assert_eq!(replay.steps_verified, 6);
+}
+
+#[test]
+fn terminal_close_trace_replays_without_reopening_or_releasing_live_owner() {
+    let inputs = vec![
+        Input::Request {
+            owner: "a".into(),
+            class: Class::Preparation,
+            units: 1,
+        },
+        Input::CloseAdmission,
+        Input::Cancel { ticket: 1 },
+        Input::CloseAdmission,
+        Input::Exited { ticket: 1 },
+        Input::CloseAdmission,
+        Input::Request {
+            owner: "b".into(),
+            class: Class::Interactive,
+            units: 1,
+        },
+        Input::Adopt {
+            owner: "c".into(),
+            class: Class::Preparation,
+            units: 2,
+        },
+        Input::CloseAdmission,
+    ];
+    let trace = stateless::execution::record(&SMALL, inputs, Default::default(), 100).unwrap();
+    let replay = stateless::execution::replay(&SMALL, &trace, Default::default()).unwrap();
+    assert_eq!(replay.outcome, stateless::execution::ReplayOutcome::Exact);
+    assert_eq!(replay.steps_verified, 9);
+}
+
+#[test]
+fn draining_trace_preserves_queued_custody_until_cancel_and_real_exit() {
+    let inputs = vec![
+        Input::Request {
+            owner: "a".into(),
+            class: Class::Preparation,
+            units: 2,
+        },
+        Input::Request {
+            owner: "b".into(),
+            class: Class::Preparation,
+            units: 1,
+        },
+        Input::BeginDrain,
+        Input::CloseAdmission,
+        Input::Request {
+            owner: "c".into(),
+            class: Class::Interactive,
+            units: 1,
+        },
+        Input::Cancel { ticket: 1 },
+        Input::Stuck { ticket: 1 },
+        Input::Exited { ticket: 1 },
+        Input::CloseAdmission,
+        Input::Cancel { ticket: 2 },
+        Input::CloseAdmission,
+        Input::BeginDrain,
+    ];
+    let trace = stateless::execution::record(&SMALL, inputs, Default::default(), 100).unwrap();
+    let replay = stateless::execution::replay(&SMALL, &trace, Default::default()).unwrap();
+    assert_eq!(replay.outcome, stateless::execution::ReplayOutcome::Exact);
+    assert_eq!(replay.steps_verified, 12);
 }

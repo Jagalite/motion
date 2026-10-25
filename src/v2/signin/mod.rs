@@ -70,9 +70,61 @@ impl From<core::Error> for Problem {
         problem(e)
     }
 }
+/// Retained database facts for a caller that already owns the Motion writer.
+pub(super) async fn retained_device_lineage(
+    c: &mut sqlx::SqliteConnection,
+    id: &str,
+) -> Result<Option<store::RetainedFamily>, Problem> {
+    motion_catalog_backend::source_lifecycle::require_retained_writer_in(c)
+        .await
+        .map_err(Problem::internal)?;
+    store::family_snapshot(c, id).await
+}
+// These fixed readers retain their independently validated owner. Neither
+// exposes an unguarded raw-connection family snapshot or relaxes WRITE callers.
+pub(super) async fn source_authorization_lineage(
+    reader: &mut motion_catalog_backend::motion_snapshot::RetainedAuthorizationReader<'_>,
+    id: &str,
+) -> Result<Option<store::RetainedFamily>, Problem> {
+    let db = reader
+        .authorize_connection()
+        .await
+        .map_err(Problem::internal)?;
+    let family = store::family_snapshot(db, id).await?;
+    reader.verify().await.map_err(Problem::internal)?;
+    Ok(family)
+}
+// Explicit old consuming-reader compatibility. Authentication policy remains
+// identical, but this input must never be presented as retained resource custody.
+pub(super) async fn legacy_source_authorization_lineage(
+    reader: &mut motion_catalog_backend::motion_snapshot::LegacyAuthorizationReader<'_>,
+    id: &str,
+) -> Result<Option<store::RetainedFamily>, Problem> {
+    let db = reader
+        .authorize_connection()
+        .await
+        .map_err(Problem::internal)?;
+    let family = store::family_snapshot(db, id).await?;
+    reader.verify().await.map_err(Problem::internal)?;
+    Ok(family)
+}
+pub(super) async fn target_authorization_lineage(
+    reader: &mut motion_catalog_backend::TargetAuthorizationReader<'_>,
+    id: &str,
+) -> Result<Option<store::RetainedFamily>, Problem> {
+    let db = reader
+        .authorize_connection()
+        .await
+        .map_err(Problem::internal)?;
+    let family = store::family_snapshot(db, id).await?;
+    reader.verify().await.map_err(Problem::internal)?;
+    Ok(family)
+}
 pub(super) async fn device_lineage_valid(
     c: &mut sqlx::SqliteConnection,
     id: &str,
 ) -> Result<bool, Problem> {
     store::family_valid(c, id).await
 }
+
+pub(crate) use store::RetainedFamily;

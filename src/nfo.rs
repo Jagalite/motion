@@ -1,6 +1,9 @@
-//! Sidecar NFO adapter. Reading happens during traversal (never inside the
-//! writer transaction); parsing is `playscale_core::nfo`; publication stores a
-//! bounded `nfo` contribution for the file's work.
+//! Sidecar NFO adapters. Legacy traversal reads before its writer transaction.
+//! The private native adapter instead retains explicit writer/filesystem custody
+//! across preparation and publication. Parsing is `playscale_core::nfo`.
+pub(crate) mod native_custody;
+pub(crate) mod native_observation;
+
 use playscale_core::nfo;
 use sqlx::SqliteConnection;
 use std::{io::Read, path::Path};
@@ -81,6 +84,14 @@ pub fn read(root: &Path, relative: &str, budget: &mut usize) -> Sidecar {
 
 const SOURCE: &str = "nfo";
 
+async fn require_legacy_catalog(conn: &mut SqliteConnection) -> anyhow::Result<()> {
+    let bound: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM catabolic_binding)")
+        .fetch_one(conn)
+        .await?;
+    anyhow::ensure!(!bound, crate::metadata_jobs::NativeRefreshUnavailable);
+    Ok(())
+}
+
 /// Publish (or withdraw) a work's `nfo` contribution from one observed file,
 /// inside the scan's writer transaction.
 pub(crate) async fn publish(
@@ -88,6 +99,7 @@ pub(crate) async fn publish(
     file: &str,
     sidecar: &Sidecar,
 ) -> anyhow::Result<()> {
+    require_legacy_catalog(conn).await?;
     let item: String = sqlx::query_scalar(
         "SELECT e.item_id FROM media_files f JOIN editions e ON e.id=f.edition_id WHERE f.id=?",
     )
@@ -186,6 +198,15 @@ async fn withdraw(
 /// each observation is published only if its source binding and file facts
 /// are unchanged at commit. Returns how many observations were published.
 pub async fn refresh_item(app: &crate::App, item: &str) -> anyhow::Result<usize> {
+    let mut fence = crate::db::begin_write(&app.db).await?;
+    let native_bound: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM catabolic_binding)")
+        .fetch_one(&mut *fence)
+        .await?;
+    if app.native_catalog.is_some() || native_bound {
+        return Err(crate::metadata_jobs::NativeRefreshUnavailable.into());
+    }
+    fence.commit().await?;
+
     let observed = observe_item(app, item).await?;
     let _guard = app.jobs.lock().await;
     let mut tx = crate::db::begin_write(&app.db).await?;
@@ -241,6 +262,7 @@ pub(crate) async fn publish_refresh_in(
     item: &str,
     observed: &[(RefreshRow, Sidecar)],
 ) -> anyhow::Result<usize> {
+    require_legacy_catalog(tx).await?;
     let mut published = 0;
     for ((file, relative, root, identity, binding, revision), sidecar) in observed {
         if matches!(sidecar, Sidecar::Unusable) {

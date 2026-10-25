@@ -370,42 +370,83 @@ pub(super) async fn provider(
         },
     ))
 }
-pub(super) async fn family_valid(
+pub(super) async fn family_snapshot(
     c: &mut sqlx::SqliteConnection,
     device: &str,
-) -> Result<bool, Problem> {
+) -> Result<Option<RetainedFamily>, Problem> {
     let row=sqlx::query("SELECT f.*,i.enabled AS identity_enabled,i.revision AS current_identity_revision,i.kind,u.disabled,p.enabled AS provider_enabled,p.revision AS provider_revision,s.email_json,s.email_revision,s.reviewed_epoch,x.restore_epoch FROM signin_families f JOIN signin_identities i ON i.id=f.identity_id JOIN access_users u ON u.id=f.user_id LEFT JOIN signin_providers p ON p.id=i.provider_id CROSS JOIN signin_settings s CROSS JOIN server_identity x WHERE f.device_id=?").bind(device).fetch_optional(c).await?;
-    let Some(r) = row else { return Ok(true) };
+    let Some(r) = row else { return Ok(None) };
     let is_email = r.get::<String, _>("kind") == "email";
     let email: EmailConfig =
         serde_json::from_str(r.get("email_json")).map_err(Problem::internal)?;
     let old: String = r.get("epoch");
     let current: String = r.get("restore_epoch");
-    Ok(core::family_valid(
-        &core::Family {
-            revoked: r.get("revoked"),
-            epoch: &old,
-            current_epoch: &current,
-            expires_at: r.get("expires_at"),
-            user_enabled: !r.get::<bool, _>("disabled"),
-            identity_enabled: r.get("identity_enabled"),
-            identity_revision: r.get::<i64, _>("identity_revision") as u64,
-            current_identity_revision: r.get::<i64, _>("current_identity_revision") as u64,
-            method_enabled: if is_email {
-                email.enabled
-            } else {
-                r.get::<Option<bool>, _>("provider_enabled")
-                    .unwrap_or(false)
-            } && r.get::<String, _>("reviewed_epoch") == current,
-            method_revision: r.get::<i64, _>("method_revision") as u64,
-            current_method_revision: if is_email {
-                r.get::<i64, _>("email_revision")
-            } else {
-                r.get::<Option<i64>, _>("provider_revision").unwrap_or(0)
-            } as u64,
-        },
-        now(),
-    ))
+    Ok(Some(RetainedFamily {
+        revoked: r.get("revoked"),
+        epoch: old,
+        current_epoch: current.clone(),
+        expires_at: r.get("expires_at"),
+        user_enabled: !r.get::<bool, _>("disabled"),
+        identity_enabled: r.get("identity_enabled"),
+        identity_revision: r.get::<i64, _>("identity_revision") as u64,
+        current_identity_revision: r.get::<i64, _>("current_identity_revision") as u64,
+        method_enabled: if is_email {
+            email.enabled
+        } else {
+            r.get::<Option<bool>, _>("provider_enabled")
+                .unwrap_or(false)
+        } && r.get::<String, _>("reviewed_epoch") == current,
+        method_revision: r.get::<i64, _>("method_revision") as u64,
+        current_method_revision: if is_email {
+            r.get::<i64, _>("email_revision")
+        } else {
+            r.get::<Option<i64>, _>("provider_revision").unwrap_or(0)
+        } as u64,
+    }))
+}
+
+/// Database facts only, not a grant. The retaining caller must fence their
+/// mutation with the same Motion writer while checking time again at use.
+pub(crate) struct RetainedFamily {
+    revoked: bool,
+    epoch: String,
+    current_epoch: String,
+    expires_at: i64,
+    user_enabled: bool,
+    identity_enabled: bool,
+    identity_revision: u64,
+    current_identity_revision: u64,
+    method_enabled: bool,
+    method_revision: u64,
+    current_method_revision: u64,
+}
+impl RetainedFamily {
+    pub(crate) fn valid_at(&self, now: i64) -> bool {
+        core::family_valid(
+            &core::Family {
+                revoked: self.revoked,
+                epoch: &self.epoch,
+                current_epoch: &self.current_epoch,
+                expires_at: self.expires_at,
+                user_enabled: self.user_enabled,
+                identity_enabled: self.identity_enabled,
+                identity_revision: self.identity_revision,
+                current_identity_revision: self.current_identity_revision,
+                method_enabled: self.method_enabled,
+                method_revision: self.method_revision,
+                current_method_revision: self.current_method_revision,
+            },
+            now,
+        )
+    }
+}
+pub(super) async fn family_valid(
+    c: &mut sqlx::SqliteConnection,
+    device: &str,
+) -> Result<bool, Problem> {
+    Ok(family_snapshot(c, device)
+        .await?
+        .is_none_or(|family| family.valid_at(now())))
 }
 pub(super) async fn revoke_families(
     c: &mut sqlx::SqliteConnection,

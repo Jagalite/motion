@@ -8,6 +8,26 @@ use playscale_core::matching::{
 use serde::Serialize;
 use sqlx::{Sqlite, SqliteConnection, SqlitePool, Transaction};
 
+/// Legacy matching persistence cannot publish into a native-bound catalog.
+#[derive(Debug)]
+pub struct NativeMatchingUnavailable;
+impl std::fmt::Display for NativeMatchingUnavailable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("native_matching_unavailable: native matching publication is not yet admitted")
+    }
+}
+impl std::error::Error for NativeMatchingUnavailable {}
+
+async fn require_legacy_catalog(conn: &mut SqliteConnection) -> anyhow::Result<()> {
+    let bound: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM catabolic_binding)")
+        .fetch_one(conn)
+        .await?;
+    if bound {
+        return Err(NativeMatchingUnavailable.into());
+    }
+    Ok(())
+}
+
 #[derive(Debug)]
 pub enum MatchingError {
     Rejected(MatchError),
@@ -102,24 +122,33 @@ async fn store(conn: &mut SqliteConnection, p: &Proposal, insert: bool) -> anyho
 }
 
 pub async fn get(db: &SqlitePool, id: &str) -> Result<Proposal, MatchingError> {
+    let mut tx = db.begin().await?;
+    require_legacy_catalog(&mut tx).await?;
     let row: Row = sqlx::query_as(&format!("SELECT {COLUMNS} WHERE id=?"))
         .bind(id)
-        .fetch_one(db)
+        .fetch_one(&mut *tx)
         .await?;
-    Ok(decode(row)?)
+    let result = decode(row)?;
+    tx.commit().await?;
+    Ok(result)
 }
 
 /// Undecided proposals, oldest change first, with an ID tie-breaker.
 pub async fn inbox(db: &SqlitePool, limit: i64) -> Result<Vec<Proposal>, MatchingError> {
+    let mut tx = db.begin().await?;
+    require_legacy_catalog(&mut tx).await?;
     let rows: Vec<Row> = sqlx::query_as(&format!(
         "SELECT {COLUMNS} WHERE status IN ('pending','review','deferred') ORDER BY updated_at,id LIMIT ?"
     ))
     .bind(limit.clamp(1, 200))
-    .fetch_all(db)
+    .fetch_all(&mut *tx)
     .await?;
-    rows.into_iter()
+    let result = rows
+        .into_iter()
         .map(|r| decode(r).map_err(MatchingError::from))
-        .collect()
+        .collect();
+    tx.commit().await?;
+    result
 }
 
 /// Local candidates: other live works whose normalized title equals the
@@ -182,6 +211,10 @@ async fn local_candidates(
 pub async fn propose(app: &App, file_id: &str) -> Result<Proposal, MatchingError> {
     let _guard = app.jobs.lock().await;
     let mut tx = crate::db::begin_write(&app.db).await?;
+    if app.native_catalog.is_some() {
+        return Err(MatchingError::Storage(NativeMatchingUnavailable.into()));
+    }
+    require_legacy_catalog(&mut tx).await?;
     let proposal = propose_in_transaction(&mut tx, file_id).await?;
     tx.commit().await?;
     Ok(proposal)
@@ -193,6 +226,7 @@ pub(crate) async fn propose_in_transaction(
     tx: &mut Transaction<'_, Sqlite>,
     file_id: &str,
 ) -> Result<Proposal, MatchingError> {
+    require_legacy_catalog(&mut **tx).await?;
     let (revision, path, item): (String, String, String) = sqlx::query_as(
         "SELECT revision,relative_path,item_id FROM catalog_files WHERE id=? AND generated=0",
     )
@@ -261,6 +295,10 @@ pub async fn decide(
 ) -> Result<Decided, MatchingError> {
     let _guard = app.jobs.lock().await;
     let mut tx = crate::db::begin_write(&app.db).await?;
+    if app.native_catalog.is_some() {
+        return Err(MatchingError::Storage(NativeMatchingUnavailable.into()));
+    }
+    require_legacy_catalog(&mut tx).await?;
     let decided = decide_in_transaction(&mut tx, id, expected_revision, decision).await?;
     tx.commit().await?;
     Ok(decided)
@@ -274,6 +312,7 @@ pub(crate) async fn decide_in_transaction(
     expected_revision: u64,
     decision: Decision,
 ) -> Result<Decided, MatchingError> {
+    require_legacy_catalog(&mut **tx).await?;
     let row: Row = sqlx::query_as(&format!("SELECT {COLUMNS} WHERE id=?"))
         .bind(id)
         .fetch_one(&mut **tx)
@@ -358,6 +397,7 @@ async fn identify(
 /// Inside scan publication: open proposals whose file revision changed become
 /// stale through the same core refresh decision.
 pub(crate) async fn invalidate_changed(conn: &mut SqliteConnection) -> anyhow::Result<()> {
+    require_legacy_catalog(conn).await?;
     let rows: Vec<(Row, String)> = sqlx::query_as::<_, (String, i64, String, String, String, String, Option<String>, String)>(
         "SELECT p.id,p.revision,p.file_id,p.file_revision,p.status,p.candidates_json,p.decision_json,f.revision FROM match_proposals p JOIN media_files f ON f.id=p.file_id WHERE p.status IN ('pending','review','deferred') AND f.revision<>p.file_revision",
     )
@@ -383,6 +423,7 @@ pub(crate) async fn provider_identity_allowed(
     source: &str,
     incoming: Option<&str>,
 ) -> anyhow::Result<bool> {
+    require_legacy_catalog(conn).await?;
     let state: String = sqlx::query_scalar("SELECT match_state FROM items WHERE id=?")
         .bind(item)
         .fetch_one(&mut *conn)
@@ -413,6 +454,10 @@ pub async fn reopen(
 ) -> Result<Proposal, MatchingError> {
     let _guard = app.jobs.lock().await;
     let mut tx = crate::db::begin_write(&app.db).await?;
+    if app.native_catalog.is_some() {
+        return Err(MatchingError::Storage(NativeMatchingUnavailable.into()));
+    }
+    require_legacy_catalog(&mut tx).await?;
     let row: Row = sqlx::query_as(&format!("SELECT {COLUMNS} WHERE id=?"))
         .bind(id)
         .fetch_one(&mut *tx)
@@ -450,6 +495,10 @@ pub async fn reopen(
 pub async fn unmatch(app: &App, item: &str) -> Result<(), MatchingError> {
     let _guard = app.jobs.lock().await;
     let mut tx = crate::db::begin_write(&app.db).await?;
+    if app.native_catalog.is_some() {
+        return Err(MatchingError::Storage(NativeMatchingUnavailable.into()));
+    }
+    require_legacy_catalog(&mut tx).await?;
     let state: String = sqlx::query_scalar("SELECT match_state FROM items WHERE id=? AND id NOT IN (SELECT alias_id FROM item_aliases)")
         .bind(item)
         .fetch_one(&mut *tx)
@@ -482,6 +531,10 @@ pub async fn identify_manually(
     }
     let _guard = app.jobs.lock().await;
     let mut tx = crate::db::begin_write(&app.db).await?;
+    if app.native_catalog.is_some() {
+        return Err(MatchingError::Storage(NativeMatchingUnavailable.into()));
+    }
+    require_legacy_catalog(&mut tx).await?;
     let live: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM items WHERE id=? AND id NOT IN (SELECT alias_id FROM item_aliases)",
     )

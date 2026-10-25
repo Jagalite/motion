@@ -574,6 +574,17 @@ pub struct JobRow {
     pub error_code: Option<String>,
     /// Validator a retry is checked against.
     pub etag: String,
+    /// A recognized control contract for this row, not an authorization grant.
+    /// Historical rows without that contract remain read-only in native mode.
+    pub controls_available: bool,
+    /// Advisory hints for NEW actions, computed by the authorized read adapter.
+    /// The renderer must not reconstruct native policy from kind or phase.
+    pub cancel_request_available: bool,
+    pub retry_request_available: bool,
+    /// The native capability is currently supported for this principal. This
+    /// permits offering exact recovery of an already-uncertain request, even
+    /// when this row no longer offers a new action. It grants no new command.
+    pub native_control_recovery: bool,
 }
 
 /// A server download demand of this device. Transfer progress is device-owned

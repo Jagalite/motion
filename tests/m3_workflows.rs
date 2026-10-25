@@ -124,6 +124,7 @@ impl Fixture {
             .unwrap();
         let app = App {
             health: Arc::new(playscale::operations::Health::new(false)),
+            native_catalog: None,
             db,
             admin_token: Arc::new(OPERATOR.into()),
             origin: Arc::new("http://127.0.0.1:8787".into()),

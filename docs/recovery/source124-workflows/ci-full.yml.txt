@@ -1,0 +1,134 @@
+name: CI full
+
+# Long-running suites, kept out of the fast pull-request gate (ci.yml):
+# debug-build Stateless models and live FFmpeg delivery (scripts/ci/test_tier.py
+# full), real-process integration, upgrade from the released baseline with
+# rollback/restore, and packaging. Runs on main, nightly and on demand
+# (gh workflow run ci-full.yml --ref <branch>), and on pull requests that touch
+# what these checks protect.
+on:
+  push:
+    branches: [main]
+  schedule:
+    - cron: '17 7 * * *'
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - 'src/**'
+      - 'crates/**'
+      - 'tests/**'
+      - 'migrations/**'
+      - 'contracts/**'
+      - 'scripts/**'
+      - 'apps/**'
+      - 'packages/**'
+      - 'ui-assets/**'
+      - 'web/**'
+      - '.cargo/**'
+      - 'vendor/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+      - 'packaging.lock.json'
+      - 'config.example.json'
+      - '.github/workflows/**'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-full-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: never
+  CARGO_INCREMENTAL: '0'
+
+jobs:
+  heavy-tests:
+    name: Heavy tests (Stateless models, live FFmpeg delivery)
+    runs-on: macos-14
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Install project Rust toolchain
+        run: rustup toolchain install 1.99.0 --profile minimal
+      - name: Install FFmpeg
+        # tests/server.rs requires ffprobe, and the delivery tests skip their
+        # media checks without these tools; the runner image has neither.
+        run: |
+          brew install ffmpeg
+          ffmpeg -version | head -1
+          ffprobe -version | head -1
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            target
+          key: rust-${{ runner.os }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}
+          restore-keys: rust-${{ runner.os }}-
+      - name: Full-tier tests (scripts/ci/test_tier.py)
+        run: python3 scripts/ci/test_tier.py full
+
+  integration:
+    name: Real-process integration, upgrade and restore
+    runs-on: macos-14
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          # The upgrade check builds the released baseline commit from history.
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Install FFmpeg
+        run: |
+          brew install ffmpeg
+          ffmpeg -version | head -1
+          ffprobe -version | head -1
+      - name: Install toolchains
+        run: |
+          rustup toolchain install 1.99.0 --profile minimal
+          # The released baseline builds with its own rust-toolchain.toml.
+          rustup toolchain install 1.95.0 --profile minimal
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            target
+          key: integration-${{ runner.os }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}
+          restore-keys: integration-${{ runner.os }}-
+      - name: Cache released baseline server
+        uses: actions/cache@v4
+        with:
+          path: artifacts/baseline-server
+          key: baseline-server-${{ runner.os }}-${{ hashFiles('scripts/upgrade_restore_check.py') }}
+      - name: Build candidate server
+        run: cargo build --locked -p playscale --bin playscale
+      - name: Integration checks
+        run: python3 scripts/integration_checks.py --work artifacts/integration
+      - name: Upgrade from the released baseline, rollback and restore
+        run: python3 scripts/upgrade_restore_check.py --work artifacts/upgrade-restore
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: integration-evidence
+          path: |
+            artifacts/integration
+            artifacts/upgrade-restore/receipt.json
+            artifacts/upgrade-restore/servers.log
+            artifacts/baseline-server/build.log
+          if-no-files-found: ignore
+
+  package:
+    name: Package
+    uses: ./.github/workflows/package.yml

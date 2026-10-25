@@ -15,6 +15,8 @@ use playscale_core::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+mod native;
+pub(crate) use native::complete_source_inventory_in;
 
 pub fn routes() -> Router<App> {
     Router::new()
@@ -101,6 +103,9 @@ pub async fn list_libraries(
     caller: Caller,
     Query(q): Query<PageQuery>,
 ) -> Result<Response, Problem> {
+    if app.native_catalog.is_some() {
+        return native::list_libraries(app, caller, q).await;
+    }
     caller.require(Permission::CatalogRead)?;
     let scope = access::catalog_scope(&caller.principal);
     let all = matches!(scope, access::CatalogScope::All);
@@ -131,6 +136,9 @@ pub async fn get_library(
     caller: Caller,
     Path(id): Path<String>,
 ) -> Result<Response, Problem> {
+    if app.native_catalog.is_some() {
+        return native::get_library(app, caller, id).await;
+    }
     caller.require(Permission::CatalogRead)?;
     if !access::catalog_scope(&caller.principal).library(&id) {
         return Err(Problem::not_found());
@@ -147,6 +155,9 @@ pub async fn create_library(
     headers: HeaderMap,
     body: Body<LibraryInput>,
 ) -> Result<Response, Problem> {
+    if app.native_catalog.is_some() {
+        return native::create_library(app, caller, headers, body).await;
+    }
     caller.require(Permission::SourcesManage)?;
     let key = idempotency_key(&headers)?;
     let _guard = app.jobs.lock().await;
@@ -203,6 +214,9 @@ pub async fn replace_library(
     headers: HeaderMap,
     body: Body<LibraryInput>,
 ) -> Result<Response, Problem> {
+    if app.native_catalog.is_some() {
+        return native::replace_library(app, caller, id, headers, body).await;
+    }
     caller.require(Permission::SourcesManage)?;
     let expected = if_match(&headers)?;
     let _guard = app.jobs.lock().await;
@@ -262,6 +276,9 @@ pub async fn list_sources(
     caller: Caller,
     Query(q): Query<PageQuery>,
 ) -> Result<Response, Problem> {
+    if app.native_catalog.is_some() {
+        return native::list(app, caller, q).await;
+    }
     caller.require(Permission::SourcesManage)?;
     let mut tx = app.db.begin().await?;
     let limit = q.limit()?;
@@ -288,6 +305,9 @@ pub async fn get_source(
     caller: Caller,
     Path(id): Path<String>,
 ) -> Result<Response, Problem> {
+    if app.native_catalog.is_some() {
+        return native::get(app, caller, id).await;
+    }
     caller.require(Permission::SourcesManage)?;
     Ok(tagged(
         StatusCode::OK,
@@ -301,6 +321,9 @@ pub async fn create_source(
     headers: HeaderMap,
     body: Body<SourceInput>,
 ) -> Result<Response, Problem> {
+    if app.native_catalog.is_some() {
+        return native::create(app, caller, headers, body).await;
+    }
     caller.require(Permission::SourcesManage)?;
     let key = idempotency_key(&headers)?;
     // Replay before filesystem observation; an acknowledged source can be offline.
@@ -387,6 +410,9 @@ pub async fn delete_source(
     Path(id): Path<String>,
     headers: HeaderMap,
 ) -> Result<Response, Problem> {
+    if app.native_catalog.is_some() {
+        return native::delete(app, caller, id, headers).await;
+    }
     caller.require(Permission::SourcesManage)?;
     let expected = if_match(&headers)?;
     let _guard = app.jobs.lock().await;

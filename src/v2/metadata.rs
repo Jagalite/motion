@@ -6,6 +6,10 @@
 //! in `playscale_core::{metadata, matching, artwork}` and the services in
 //! `crate::{metadata, matching}`. This module supplies the caller, the
 //! catalog scope and the stored facts, and executes inside one transaction.
+mod native;
+mod native_artwork;
+mod native_artwork_upload;
+
 use super::{
     Body, Page, PageQuery, Problem, Scope, Stored, auth::Caller, etag, idempotency_key, if_match,
     page, scope_clause,
@@ -190,6 +194,9 @@ async fn get_metadata(
     Path(item_id): Path<String>,
 ) -> Result<Response, Problem> {
     caller.require(Permission::CatalogRead)?;
+    if app.native_catalog.is_some() {
+        return native::get(&app, &caller, &item_id).await;
+    }
     let scope = core::catalog_scope(&caller.principal);
     let mut tx = app.db.begin().await?;
     if !visible_item(&mut tx, &scope, &item_id).await? {
@@ -220,6 +227,7 @@ async fn replace_contribution(
 ) -> Result<Response, Problem> {
     caller.require(Permission::CatalogWrite)?;
     let expected = if_match(&headers)?;
+    let request_digest = body.digest;
     let input = body.value;
     if !metadata_service::valid_source(&source) {
         return Err(Problem::invalid(
@@ -249,6 +257,18 @@ async fn replace_contribution(
         input.excluded_tags.into_iter().collect(),
     )
     .map_err(|reason| Problem::invalid("invalid_metadata", reason))?;
+    if app.native_catalog.is_some() {
+        return native::replace(
+            &app,
+            &caller,
+            &item_id,
+            &source,
+            expected,
+            contribution,
+            &request_digest,
+        )
+        .await;
+    }
     // Metadata projection and scan publication share the writer boundary.
     let _guard = app.jobs.lock().await;
     let mut tx = begin_write(&app.db).await?;
@@ -814,6 +834,9 @@ async fn list_artwork(
     Query(q): Query<PageQuery>,
 ) -> Result<Json<Page<AssetBody>>, Problem> {
     caller.require(Permission::CatalogRead)?;
+    if app.native_catalog.is_some() {
+        return native_artwork::list(&app, &caller, &item_id, &q).await;
+    }
     let limit = q.limit()?;
     let scope = core::catalog_scope(&caller.principal);
     let mut tx = app.db.begin().await?;
@@ -867,10 +890,13 @@ async fn asset_content(
 ) -> Result<Response, Problem> {
     let Query(query) =
         query.map_err(|_| Problem::bad("invalid_query", "The query parameters are invalid"))?;
-    let scope = core::catalog_scope(&caller.principal);
-    let (clause, all, ids) = scope_clause(&scope, "f.library_id");
-    let mut conn = app.db.acquire().await?;
-    let asset: Option<(String, Vec<u8>)> = sqlx::query_as(&format!(
+    let (mime, bytes) = if app.native_catalog.is_some() {
+        native_artwork::content(&app, &caller, &asset_id).await?
+    } else {
+        let scope = core::catalog_scope(&caller.principal);
+        let (clause, all, ids) = scope_clause(&scope, "f.library_id");
+        let mut conn = app.db.acquire().await?;
+        let asset: Option<(String, Vec<u8>)> = sqlx::query_as(&format!(
         "SELECT a.mime,a.bytes FROM artwork_assets a WHERE a.id=? AND (? OR EXISTS(SELECT 1 FROM (SELECT item_id,asset_id FROM artwork_contributions UNION SELECT item_id,asset_id FROM item_artwork_assets) c JOIN editions e ON e.item_id=c.item_id JOIN media_files f ON f.edition_id=e.id WHERE c.asset_id=a.id AND c.item_id NOT IN (SELECT alias_id FROM item_aliases) AND {clause}))"
     ))
     .bind(&asset_id)
@@ -879,8 +905,9 @@ async fn asset_content(
     .bind(ids)
     .fetch_optional(&mut *conn)
     .await?;
-    drop(conn);
-    let (mime, bytes) = asset.ok_or_else(Problem::not_found)?;
+        drop(conn);
+        asset.ok_or_else(Problem::not_found)?
+    };
     let revision = query
         .revision
         .ok_or_else(|| Problem::bad("revision_required", "Send the asset revision"))?;
@@ -995,6 +1022,9 @@ async fn upload_artwork(
             "body_too_large",
             "Artwork exceeds 8 MiB",
         ));
+    }
+    if app.native_catalog.is_some() {
+        return native_artwork_upload::upload(&app, &caller, &id, &key, bytes).await;
     }
     let digest = super::sha256(&bytes);
     let mut tx = begin_write(&app.db).await?;
@@ -1118,6 +1148,9 @@ async fn get_artwork_selection(
     Path(id): Path<String>,
 ) -> Result<Response, Problem> {
     caller.require(Permission::CatalogRead)?;
+    if app.native_catalog.is_some() {
+        return native_artwork::selection(&app, &caller, &id).await;
+    }
     let mut tx = app.db.begin().await?;
     let (item, _) =
         super::catalog::load_item(&mut tx, &core::catalog_scope(&caller.principal), &id, true)
@@ -1153,6 +1186,9 @@ async fn select_artwork(
         "poster" | "backdrop" | "banner" | "thumbnail"
     ) {
         return Err(Problem::invalid("invalid_role", "Unknown artwork role"));
+    }
+    if app.native_catalog.is_some() {
+        return native_artwork::select(&app, &caller, &id, expected, input).await;
     }
     let mut tx = begin_write(&app.db).await?;
     let principal = caller

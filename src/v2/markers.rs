@@ -3,7 +3,7 @@
 //! a manual marker is a correction that outranks embedded, imported and
 //! detected ones (`Provenance::precedence`) without erasing them.
 use super::{Body, PageQuery, Problem, Scope, auth::Caller, etag, idempotency_key, page};
-use crate::{App, db::begin_write, new_id, now};
+use crate::{App, new_id, now};
 use axum::{
     Json, Router,
     extract::{Path, Query, State},
@@ -77,15 +77,11 @@ async fn list(
     };
     let limit = q.limit()?;
     let after = q.after()?.to_owned();
-    let mut tx = app.db.begin().await?;
-    super::playback::readable_timeline(&mut tx, &caller.principal, &timeline).await?;
-    let current: i64 = sqlx::query_scalar("SELECT revision FROM timelines WHERE id=?")
-        .bind(&timeline)
-        .fetch_one(&mut *tx)
-        .await?;
+    let (mut tx, principal, current, _) =
+        authorized_timeline(&app, &caller, &timeline, Permission::CatalogRead, false).await?;
     let mut markers = load(&mut tx, &timeline).await?;
     markers.extend(
-        embedded(&mut tx, &caller.principal, &timeline, current as u64)
+        embedded(&mut tx, &principal, &timeline, current as u64)
             .await?
             .into_iter()
             .map(|m| (m, 1)),
@@ -159,7 +155,7 @@ async fn list(
             )
         })
         .collect();
-    let page = page(&mut tx, &caller.principal, rows, limit).await?;
+    let page = page(&mut tx, &principal, rows, limit).await?;
     tx.commit().await?;
     Ok(Json(page))
 }
@@ -185,6 +181,7 @@ async fn embedded(
     );
     // Candidates are paged by (version, file) until a readable one is
     // found, so unreadable copies ordered first never hide a readable one.
+    let native = super::playback::native_bound(conn).await?;
     let mut after = (String::new(), String::new());
     loop {
         let rows: Vec<Row> = sqlx::query_as(
@@ -206,15 +203,51 @@ async fn embedded(
             return Ok(vec![]);
         };
         after = (version.clone(), file.clone());
-        for (_, file, file_revision, chapters, timeline_ms, file_seconds) in rows {
+        for (version, file, file_revision, mut chapters, timeline_ms, mut file_seconds) in rows {
+            if native && !super::playback::native_version_ready(conn, &version).await? {
+                continue;
+            }
             if !playscale_core::playback_session::readable(
                 principal,
                 super::content::file_facts(conn, &file).await?.as_ref(),
             ) {
                 continue;
             }
-            let chapters: Vec<core::FileChapter> =
-                serde_json::from_str(chapters.as_deref().unwrap_or("[]")).unwrap_or_default();
+            if native {
+                // The sealed current occurrence mapping, not the SQL scalar
+                // chapters cache, owns this exact original's imported/probed
+                // facts. Readiness above independently proves live lineage.
+                let encoded: String = sqlx::query_scalar("SELECT p.mapping_json FROM catabolic_projection_files p JOIN catabolic_projection_state s ON s.singleton=1 AND s.generation=p.generation WHERE p.file_id=? AND p.available=1")
+                    .bind(&file).fetch_one(&mut *conn).await?;
+                let mapping: motion_catalog_backend::occurrence_bridge::OccurrenceMapping =
+                    serde_json::from_str(&encoded).map_err(Problem::internal)?;
+                if mapping.motion_file["id"] != file
+                    || mapping.motion_file["revision"] != file_revision
+                    || mapping.motion_file["generated"] != 0
+                {
+                    return Err(super::catalog::native_unavailable());
+                }
+                chapters = match &mapping.motion_file["chapters_json"] {
+                    Value::Null => None,
+                    Value::String(raw) if raw.len() <= 1024 * 1024 => Some(raw.clone()),
+                    _ => return Err(super::catalog::native_unavailable()),
+                };
+                file_seconds = match &mapping.motion_file["duration_seconds"] {
+                    Value::Null => None,
+                    value => Some(
+                        value
+                            .as_f64()
+                            .filter(|v| v.is_finite() && *v >= 0.0)
+                            .ok_or_else(super::catalog::native_unavailable)?,
+                    ),
+                };
+            }
+            let chapters: Vec<core::FileChapter> = if native {
+                serde_json::from_str(chapters.as_deref().unwrap_or("[]"))
+                    .map_err(Problem::internal)?
+            } else {
+                serde_json::from_str(chapters.as_deref().unwrap_or("[]")).unwrap_or_default()
+            };
             // The timeline's duration, else the whole file's (scan-created
             // timelines record none), so chapters past the media's end drop.
             let duration = timeline_ms.and_then(|d| u64::try_from(d).ok()).or_else(|| {
@@ -346,6 +379,147 @@ fn rejected(e: MarkerError) -> Problem {
     }
 }
 
+/// One current caller/writer boundary for manual state and descriptive identity.
+/// Byte readiness is only consulted separately for embedded chapter additions.
+async fn authorized_timeline(
+    app: &App,
+    caller: &Caller,
+    timeline: &str,
+    permission: Permission,
+    curate: bool,
+) -> Result<
+    (
+        sqlx::Transaction<'static, sqlx::Sqlite>,
+        access::Principal,
+        i64,
+        Option<i64>,
+    ),
+    Problem,
+> {
+    // Prepare saved native scope before acquiring the application writer. The
+    // writer below reauthorizes and validates the exact prepared scope again.
+    let native_scope = if let Some(runtime) = &app.native_catalog {
+        let mut initial = app.db.begin().await?;
+        let principal = caller.reauthorize(&mut initial, Some(permission)).await?;
+        let scope = access::catalog_scope(&principal);
+        initial.commit().await?;
+        let library = match &scope {
+            access::CatalogScope::Libraries(ids) => Some(
+                runtime
+                    .prepare_library_read_scope(ids.clone())
+                    .await
+                    .map_err(super::catalog::native_read_error)?,
+            ),
+            _ => None,
+        };
+        let selection = match (&scope, &library) {
+            (access::CatalogScope::Nothing, _) => None,
+            (_, Some(library)) => Some(library.selection.clone()),
+            _ => Some(
+                runtime
+                    .prepare_all_scope()
+                    .await
+                    .map_err(super::catalog::native_read_error)?,
+            ),
+        };
+        Some((runtime.clone(), scope, library, selection))
+    } else {
+        None
+    };
+    let mut tx = super::playback::begin_catalog_application(app, curate).await?;
+    let principal = caller.reauthorize(&mut tx, Some(permission)).await?;
+    let (revision, duration) = if let Some((runtime, scope, library, selection)) = native_scope {
+        if access::catalog_scope(&principal) != scope {
+            return Err(Problem::new(
+                StatusCode::CONFLICT,
+                "marker_scope_changed",
+                "Catalog authorization changed; retry the request",
+            ));
+        }
+        if let Some(library) = library {
+            runtime
+                .validate_library_read_scope(&mut tx, &library)
+                .await
+                .map_err(super::catalog::native_read_error)?;
+        }
+        let mut reader = crate::native_catalog::timeline_visibility::Reader::new(
+            runtime.clone(),
+            &mut tx,
+            selection.into_iter().collect(),
+        )
+        .await
+        .map_err(super::catalog::native_read_error)?;
+        let facts = reader
+            .timeline_body(&mut tx, &timeline)
+            .await
+            .map_err(super::catalog::native_read_error)?
+            .ok_or_else(Problem::not_found)?;
+        let work = facts["item_id"]
+            .as_str()
+            .ok_or_else(super::catalog::native_unavailable)?
+            .to_owned();
+        let revision = facts["revision"]
+            .as_str()
+            .and_then(|v| v.parse::<i64>().ok())
+            .filter(|v| *v >= 0)
+            .ok_or_else(super::catalog::native_unavailable)?;
+        let duration = if facts["duration_ms"].is_null() {
+            None
+        } else {
+            Some(
+                facts["duration_ms"]
+                    .as_i64()
+                    .filter(|v| *v >= 0)
+                    .ok_or_else(super::catalog::native_unavailable)?,
+            )
+        };
+        // Visibility in any granted library is insufficient for curation:
+        // require the complete current native work membership under this same
+        // writer, without using frozen catalog-library joins as authority.
+        if curate {
+            let handle = tokio::runtime::Handle::current();
+            let (returned, writable) = runtime
+                .with_host(move |host| {
+                    let writable = handle.block_on(
+                        motion_catalog_backend::aggregate_revision::may_curate_work_in(
+                            &mut tx, host, &work, &scope,
+                        ),
+                    )?;
+                    Ok((tx, writable))
+                })
+                .await
+                .map_err(super::catalog::native_read_error)?;
+            tx = returned;
+            if !writable {
+                return Err(Problem::new(
+                    StatusCode::FORBIDDEN,
+                    "outside_scope",
+                    "The complete work is outside the device's catalog scope",
+                ));
+            }
+        }
+        (revision, duration)
+    } else {
+        let row = super::playback::readable_timeline(&mut tx, &principal, &timeline).await?;
+        if curate {
+            super::catalog::curatable_item(
+                &mut tx,
+                &access::catalog_scope(&principal),
+                &row.item_id,
+                false,
+            )
+            .await?;
+        }
+        sqlx::query_as::<_, (i64, Option<i64>)>(
+            "SELECT revision,duration_ms FROM timelines WHERE id=?",
+        )
+        .bind(&timeline)
+        .fetch_one(&mut *tx)
+        .await?
+    };
+    Ok((tx, principal, revision, duration))
+}
+
 /// Add a manual marker against the timeline revision the caller reviewed.
 async fn create(
     State(app): State<App>,
@@ -364,19 +538,8 @@ async fn create(
         )
     })?;
     let _guard = app.jobs.lock().await;
-    let mut tx = begin_write(&app.db).await?;
-    let principal = caller
-        .reauthorize(&mut tx, Some(Permission::CatalogWrite))
-        .await?;
-    let row = super::playback::readable_timeline(&mut tx, &principal, &timeline).await?;
-    // Changing a title's markers is curation: the whole work must be in scope.
-    super::catalog::curatable_item(
-        &mut tx,
-        &access::catalog_scope(&principal),
-        &row.item_id,
-        false,
-    )
-    .await?;
+    let (mut tx, principal, revision, duration) =
+        authorized_timeline(&app, &caller, &timeline, Permission::CatalogWrite, true).await?;
     let scope = Scope {
         principal: &principal.id,
         operation: "createMarker",
@@ -393,11 +556,6 @@ async fn create(
         response.headers_mut().insert(header::ETAG, etag(1));
         return Ok(response);
     }
-    let (revision, duration): (i64, Option<i64>) =
-        sqlx::query_as("SELECT revision,duration_ms FROM timelines WHERE id=?")
-            .bind(&timeline)
-            .fetch_one(&mut *tx)
-            .await?;
     let label = input.label.as_deref().map(str::trim);
     crate::markers::admission(&mut tx, &timeline)
         .await?

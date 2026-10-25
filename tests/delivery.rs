@@ -1,7 +1,10 @@
 //! Live HLS delivery against real FFmpeg/FFprobe from PATH. Skips (with a message)
 //! when either tool is missing.
+#[path = "support/media_fixtures.rs"]
+mod media_fixtures;
 #[path = "support/service_router.rs"]
 mod service_router;
+use media_fixtures::align_fixture_audio_to_video;
 
 use axum::{
     body::Body,
@@ -96,6 +99,7 @@ impl Fixture {
         }
         let app = App {
             health: Arc::new(playscale::operations::Health::new(false)),
+            native_catalog: None,
             db,
             admin_token: Arc::new("test-secret-token".into()),
             origin: Arc::new("http://127.0.0.1:8787".into()),
@@ -229,7 +233,14 @@ async fn json_on(app: &App, method: &str, path: &str, body: Option<Value>) -> (S
 
 fn probe(path: &std::path::Path) -> Value {
     let output = Command::new("ffprobe")
-        .args(["-v", "error", "-show_streams", "-of", "json"])
+        .args([
+            "-v",
+            "error",
+            "-show_streams",
+            "-show_format",
+            "-of",
+            "json",
+        ])
         .arg(path)
         .output()
         .unwrap();
@@ -1087,6 +1098,7 @@ async fn copy_routes_start_at_keyframes_and_keep_source_video() {
             .status()
             .unwrap();
         assert!(status.success());
+        align_fixture_audio_to_video(&f.dir.path().join("media").join(name));
     }
     // The copy routes require every stream (hence the container) to start at
     // zero: check the fixture really does, so a shifted encode fails loudly here.
@@ -1400,6 +1412,7 @@ async fn text_subtitles_are_served_as_webvtt_sidecars() {
         .status()
         .unwrap();
     assert!(status.success());
+    align_fixture_audio_to_video(&f.dir.path().join("media/clip.mkv"));
     f.scan().await;
     let (file_id, revision): (String, String) =
         sqlx::query_as("SELECT id,revision FROM media_files LIMIT 1")
@@ -1723,6 +1736,7 @@ async fn copy_route_refuses_open_gop_segments() {
             .status()
             .unwrap();
         assert!(status.success());
+        align_fixture_audio_to_video(&f.dir.path().join("media").join(name));
     }
     f.scan().await;
     let mut ids = Vec::new();

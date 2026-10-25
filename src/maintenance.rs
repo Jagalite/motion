@@ -410,6 +410,7 @@ mod tests {
         sqlx::query("INSERT INTO processing_jobs(id,source_file_id,source_revision,recipe,backend,idempotency_key,phase,created_at,updated_at,output_file_id) VALUES ('job','file','hash','h264720p','software','key','completed',0,0,'output')").execute(&db).await.unwrap();
         App {
             health: Arc::new(crate::operations::Health::new(false)),
+            native_catalog: None,
             db,
             admin_token: Arc::new("test".into()),
             origin: Arc::new("http://localhost".into()),

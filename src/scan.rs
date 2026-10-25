@@ -56,6 +56,75 @@ fn chapters_of(value: &serde_json::Value) -> Vec<playscale_core::markers::FileCh
         .collect()
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProbeInput {
+    LegacyPipe,
+    RestrictedPipe,
+    Descriptor,
+}
+impl ProbeInput {
+    fn args(self) -> &'static [&'static str] {
+        match self {
+            Self::LegacyPipe => &["-i", "pipe:0"],
+            Self::RestrictedPipe => &["-protocol_whitelist", "pipe", "-i", "pipe:0"],
+            Self::Descriptor => &["-protocol_whitelist", "fd", "-fd", "0", "-i", "fd:"],
+        }
+    }
+}
+/// Capability discovery is bounded and owns its child until exit. It never
+/// probes the user pathname or grants the broad file/network protocols.
+async fn native_probe_input(
+    ffprobe: &Path,
+    stop: &CancellationToken,
+) -> anyhow::Result<ProbeInput> {
+    if !cfg!(unix) {
+        return Ok(ProbeInput::RestrictedPipe);
+    }
+    let mut child = Command::new(ffprobe)
+        .args(["-v", "error", "-protocols"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .spawn()?;
+    let mut stdout = child
+        .stdout
+        .take()
+        .context("probe capability stdout missing")?;
+    let mut bytes = Vec::new();
+    let result: anyhow::Result<()> = tokio::select! {
+        result = tokio::time::timeout(Duration::from_secs(5), async {
+            (&mut stdout).take(64*1024+1).read_to_end(&mut bytes).await?;
+            anyhow::ensure!(bytes.len() <= 64*1024, "probe capability output exceeds limit");
+            anyhow::ensure!(child.wait().await?.success(), "probe capability query failed");
+            Ok::<_,anyhow::Error>(())
+        }) => result.map_err(anyhow::Error::from).and_then(|r|r),
+        _ = stop.cancelled() => Err(anyhow::anyhow!("probe capability cancelled")),
+    };
+    if result.is_err() {
+        let _ = child.kill().await;
+        let _ = child.wait().await;
+    }
+    result?;
+    let text = std::str::from_utf8(&bytes)?;
+    let input = text
+        .split_once("Input:")
+        .context("probe input protocols missing")?
+        .1
+        .split("Output:")
+        .next()
+        .unwrap_or("");
+    if input.lines().any(|line| line.trim() == "fd") {
+        Ok(ProbeInput::Descriptor)
+    } else {
+        anyhow::ensure!(
+            input.lines().any(|line| line.trim() == "pipe"),
+            "probe has no safe descriptor protocol"
+        );
+        Ok(ProbeInput::RestrictedPipe)
+    }
+}
+
 /// Probe only the chapters of an unchanged file (one probed before chapters
 /// were recorded), bound to the same opened file and fingerprint. None when
 /// it cannot be read now; the next scan tries again.
@@ -65,14 +134,31 @@ async fn probe_chapters(
     ffprobe: &Path,
     expected: &str,
 ) -> Option<Vec<playscale_core::markers::FileChapter>> {
-    let (file, check) = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
-        let file = open_file(&root, &relative)?;
-        let check = file.try_clone()?;
-        Ok((file, check))
-    })
+    let file = tokio::task::spawn_blocking(move || open_file(&root, &relative))
+        .await
+        .ok()?
+        .ok()?;
+    probe_chapters_file(
+        file,
+        ffprobe,
+        expected,
+        ProbeInput::LegacyPipe,
+        &CancellationToken::new(),
+    )
     .await
-    .ok()?
-    .ok()?;
+}
+async fn probe_chapters_file(
+    mut file: std::fs::File,
+    ffprobe: &Path,
+    expected: &str,
+    protocol: ProbeInput,
+    stop: &CancellationToken,
+) -> Option<Vec<playscale_core::markers::FileChapter>> {
+    if fingerprint(&file.metadata().ok()?) != expected {
+        return None;
+    }
+    file.seek(SeekFrom::Start(0)).ok()?;
+    let check = file.try_clone().ok()?;
     let mut child = Command::new(ffprobe)
         .args([
             "-v",
@@ -81,9 +167,8 @@ async fn probe_chapters(
             "chapter=start_time,end_time:chapter_tags=title",
             "-of",
             "json",
-            "-i",
-            "pipe:0",
         ])
+        .args(protocol.args())
         .stdin(file)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
@@ -92,18 +177,18 @@ async fn probe_chapters(
         .ok()?;
     let mut stdout = child.stdout.take()?;
     let mut output = Vec::new();
-    let finished = tokio::time::timeout(Duration::from_secs(30), async {
-        (&mut stdout)
-            .take(1024 * 1024 + 1)
-            .read_to_end(&mut output)
-            .await
-            .ok()?;
-        child.wait().await.ok().filter(|s| s.success())
-    })
-    .await
-    .ok()
-    .flatten();
-    finished.filter(|_| output.len() <= 1024 * 1024)?;
+    let finished = tokio::select! {
+        result = tokio::time::timeout(Duration::from_secs(30), async {
+            (&mut stdout).take(1024*1024+1).read_to_end(&mut output).await.ok()?;
+            child.wait().await.ok().filter(|s|s.success())
+        }) => result.ok().flatten().filter(|_|output.len() <= 1024*1024),
+        _ = stop.cancelled(), if protocol != ProbeInput::LegacyPipe => None,
+    };
+    if finished.is_none() && protocol != ProbeInput::LegacyPipe {
+        let _ = child.kill().await;
+        let _ = child.wait().await;
+    }
+    finished?;
     let unchanged =
         tokio::task::spawn_blocking(move || check.metadata().map(|m| fingerprint(&m)).ok())
             .await
@@ -150,7 +235,17 @@ pub fn open_file(root: &Path, relative: &Path) -> anyhow::Result<std::fs::File> 
         "invalid media path"
     );
     let dir = cap_std::fs::Dir::open_ambient_dir(root, cap_std::ambient_authority())?;
-    let file = dir.open(relative)?.into_std();
+    let mut options = cap_std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use cap_std::fs::OpenOptionsExt;
+        // A formerly regular observed path can become a FIFO before opening.
+        // Keep capability-relative resolution, but never wait for its writer
+        // while holding the native owner or playback authorization custody.
+        options.custom_flags(libc::O_NONBLOCK);
+    }
+    let file = dir.open_with(relative, &options)?.into_std();
     anyhow::ensure!(file.metadata()?.is_file(), "not a regular file");
     Ok(file)
 }
@@ -423,6 +518,34 @@ pub(crate) async fn inspect(
     stop: CancellationToken,
     permit: std::sync::Arc<tokio::sync::OwnedSemaphorePermit>,
 ) -> anyhow::Result<Found> {
+    inspect_with_input(
+        root,
+        relative,
+        ffprobe,
+        stop,
+        permit,
+        ProbeInput::LegacyPipe,
+    )
+    .await
+}
+pub(crate) async fn inspect_native(
+    root: PathBuf,
+    relative: PathBuf,
+    ffprobe: &Path,
+    stop: CancellationToken,
+    permit: std::sync::Arc<tokio::sync::OwnedSemaphorePermit>,
+) -> anyhow::Result<Found> {
+    let input = native_probe_input(ffprobe, &stop).await?;
+    inspect_with_input(root, relative, ffprobe, stop, permit, input).await
+}
+async fn inspect_with_input(
+    root: PathBuf,
+    relative: PathBuf,
+    ffprobe: &Path,
+    stop: CancellationToken,
+    permit: std::sync::Arc<tokio::sync::OwnedSemaphorePermit>,
+    protocol: ProbeInput,
+) -> anyhow::Result<Found> {
     let rel = relative
         .to_str()
         .context("media path must be UTF-8")?
@@ -435,6 +558,7 @@ pub(crate) async fn inspect(
     let chapter_root = root.clone();
     let chapter_relative = relative.clone();
     let hashing_permit = permit.clone();
+    let hashing_stop = stop.clone();
     let (file, revision, stamp, bytes) =
         tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
             let _hold = hashing_permit;
@@ -444,7 +568,7 @@ pub(crate) async fn inspect(
             let mut hash = Sha256::new();
             let mut buf = [0_u8; 128 * 1024];
             loop {
-                anyhow::ensure!(!stop.is_cancelled(), "scan cancelled");
+                anyhow::ensure!(!hashing_stop.is_cancelled(), "scan cancelled");
                 let n = file.read(&mut buf)?;
                 if n == 0 {
                     break;
@@ -461,6 +585,12 @@ pub(crate) async fn inspect(
         .await??;
     // A regular-file stdin keeps probing bound to the opened file, never a shell/path URL.
     let check_file = file.try_clone()?;
+    let chapter_file = (protocol != ProbeInput::LegacyPipe)
+        .then(|| file.try_clone())
+        .transpose()?;
+    let final_check = (protocol != ProbeInput::LegacyPipe)
+        .then(|| file.try_clone())
+        .transpose()?;
     let mut child = Command::new(ffprobe)
         .args([
             "-v",
@@ -469,9 +599,8 @@ pub(crate) async fn inspect(
             "format=duration:stream=index,codec_type,codec_name,width,height,avg_frame_rate,bit_rate,pix_fmt,color_transfer,color_primaries,color_space,color_range,start_time,extradata_size:stream_tags=language,title,mimetype,rotate:stream_disposition=default,forced,hearing_impaired,comment:stream_side_data=side_data_type,rotation,max_luminance,max_content,dv_profile,dv_bl_signal_compatibility_id",
             "-of",
             "json",
-            "-i",
-            "pipe:0",
         ])
+        .args(protocol.args())
         .stdin(file)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
@@ -479,7 +608,8 @@ pub(crate) async fn inspect(
         .spawn()?;
     let mut stdout = child.stdout.take().context("missing probe output")?;
     let mut output = Vec::new();
-    let result = tokio::time::timeout(Duration::from_secs(30), async {
+    let result: anyhow::Result<()> = tokio::select! {
+    result = tokio::time::timeout(Duration::from_secs(30), async {
         (&mut stdout)
             .take(1024 * 1024 + 1)
             .read_to_end(&mut output)
@@ -488,16 +618,23 @@ pub(crate) async fn inspect(
         let status = child.wait().await?;
         anyhow::ensure!(status.success(), "ffprobe could not inspect media");
         Ok::<_, anyhow::Error>(())
-    })
-    .await;
+    }) => result.map_err(anyhow::Error::from).and_then(|r|r),
+    _ = stop.cancelled(), if protocol != ProbeInput::LegacyPipe => Err(anyhow::anyhow!("native probe cancelled")),
+    };
+    if result.is_err() && protocol != ProbeInput::LegacyPipe {
+        let _ = child.kill().await;
+        let _ = child.wait().await;
+    }
+    anyhow::ensure!(!stop.is_cancelled(), "probe cancelled");
     // Unsupported/corrupt media remains cataloged with unknown technical metadata.
-    let value: serde_json::Value = if matches!(result, Ok(Ok(()))) {
+    let value: serde_json::Value = if result.is_ok() {
         serde_json::from_slice(&output)?
     } else {
         serde_json::json!({})
     };
+    let fingerprint_permit = permit.clone();
     let current_stamp = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
-        let _hold = permit;
+        let _hold = fingerprint_permit;
         Ok(fingerprint(&check_file.metadata()?))
     })
     .await??;
@@ -582,7 +719,17 @@ pub(crate) async fn inspect(
         })
         .collect();
     // Optional chapter overflow/failure must not erase successful stream facts.
-    let chapters = probe_chapters(chapter_root, chapter_relative, ffprobe, &stamp).await;
+    let chapters = if let Some(file) = chapter_file {
+        probe_chapters_file(file, ffprobe, &stamp, protocol, &stop).await
+    } else {
+        probe_chapters(chapter_root, chapter_relative, ffprobe, &stamp).await
+    };
+    if let Some(check) = final_check {
+        anyhow::ensure!(
+            !stop.is_cancelled() && fingerprint(&check.metadata()?) == stamp,
+            "native source changed or probe cancelled during chapter inspection"
+        );
+    }
     Ok(Found {
         relative: rel,
         title,
@@ -1292,5 +1439,187 @@ esac
         assert_eq!(found.tracks.len(), 2);
         assert_eq!(found.tracks[0].rotation_degrees, 90);
         assert_eq!(found.tracks[1].rotation_degrees, 270);
+    }
+}
+
+#[cfg(all(test, unix))]
+mod safe_open_tests {
+    #[test]
+    fn replaced_fifo_is_rejected_without_waiting_for_writer() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("movie.mp4");
+        assert!(
+            std::process::Command::new("mkfifo")
+                .arg(&path)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let root = dir.path().to_owned();
+        let (send, receive) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let result = super::open_file(&root, std::path::Path::new("movie.mp4"));
+            let _ = send.send(result.map(|_| ()));
+        });
+        let result = receive
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("opening a replaced FIFO waited for a writer");
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("not a regular file")
+        );
+        worker.join().unwrap();
+    }
+}
+
+#[cfg(all(test, unix))]
+mod native_probe_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    fn wav(path: &Path) {
+        let bytes = 16000u32;
+        let mut data = Vec::new();
+        data.extend(b"RIFF");
+        data.extend((bytes + 36).to_le_bytes());
+        data.extend(b"WAVEfmt ");
+        data.extend(16u32.to_le_bytes());
+        data.extend(1u16.to_le_bytes());
+        data.extend(1u16.to_le_bytes());
+        data.extend(8000u32.to_le_bytes());
+        data.extend(16000u32.to_le_bytes());
+        data.extend(2u16.to_le_bytes());
+        data.extend(16u16.to_le_bytes());
+        data.extend(b"data");
+        data.extend(bytes.to_le_bytes());
+        data.resize(44 + bytes as usize, 0);
+        std::fs::write(path, data).unwrap();
+    }
+    async fn permit() -> std::sync::Arc<tokio::sync::OwnedSemaphorePermit> {
+        std::sync::Arc::new(
+            std::sync::Arc::new(tokio::sync::Semaphore::new(1))
+                .acquire_owned()
+                .await
+                .unwrap(),
+        )
+    }
+
+    #[tokio::test]
+    async fn native_seekable_descriptor_measures_real_pcm_without_path_protocol() {
+        let dir = tempfile::tempdir().unwrap();
+        wav(&dir.path().join("original.wav"));
+        let probe = Path::new("ffprobe");
+        assert_eq!(
+            native_probe_input(probe, &CancellationToken::new())
+                .await
+                .unwrap(),
+            ProbeInput::Descriptor,
+            "this qualification test requires a packaged ffprobe with fd input support"
+        );
+        let expected = fingerprint(&std::fs::metadata(dir.path().join("original.wav")).unwrap());
+        let found = inspect_native(
+            dir.path().to_owned(),
+            "original.wav".into(),
+            probe,
+            CancellationToken::new(),
+            permit().await,
+        )
+        .await
+        .unwrap();
+        assert_eq!(found.duration, Some(1.0));
+        assert_eq!(found.fingerprint, expected);
+        assert_eq!(found.tracks.len(), 1);
+        assert_eq!(found.tracks[0].kind, "audio");
+        assert_eq!(found.chapters, Some(Vec::new()));
+    }
+
+    #[tokio::test]
+    async fn native_descriptor_rejects_secondary_file_protocol() {
+        let dir = tempfile::tempdir().unwrap();
+        wav(&dir.path().join("secret.wav"));
+        let playlist = dir.path().join("playlist.ffconcat");
+        std::fs::write(
+            &playlist,
+            format!(
+                "ffconcat version 1.0\nfile 'file:{}'\n",
+                dir.path().join("secret.wav").display()
+            ),
+        )
+        .unwrap();
+        // Explicit concat demuxing removes format-detection ambiguity; safe=0
+        // means the protocol whitelist, not concat's filename policy, must deny.
+        let output = Command::new("ffprobe")
+            .args(["-v", "error", "-f", "concat", "-safe", "0"])
+            .args(ProbeInput::Descriptor.args())
+            .args(["-show_entries", "format=duration", "-of", "json"])
+            .stdin(open_file(dir.path(), Path::new("playlist.ffconcat")).unwrap())
+            .output()
+            .await
+            .unwrap();
+        assert!(!output.status.success());
+        let error = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            error.contains("not on whitelist") && error.contains("file"),
+            "{error}"
+        );
+        let found = inspect_native(
+            dir.path().to_owned(),
+            "playlist.ffconcat".into(),
+            Path::new("ffprobe"),
+            CancellationToken::new(),
+            permit().await,
+        )
+        .await
+        .unwrap();
+        assert_eq!(found.duration, None);
+        assert!(found.tracks.is_empty());
+    }
+
+    #[tokio::test]
+    async fn native_missing_fd_capability_uses_only_restricted_pipe() {
+        let dir = tempfile::tempdir().unwrap();
+        let probe = dir.path().join("probe");
+        std::fs::write(&probe, "#!/bin/sh\nprintf 'Supported file protocols:\nInput:\n  file\n  pipe\nOutput:\n  fd\n'\n").unwrap();
+        std::fs::set_permissions(&probe, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let input = native_probe_input(&probe, &CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(input, ProbeInput::RestrictedPipe);
+        assert_eq!(
+            input.args(),
+            &["-protocol_whitelist", "pipe", "-i", "pipe:0"]
+        );
+    }
+
+    #[tokio::test]
+    async fn native_chapter_probe_refuses_changed_full_fingerprint() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("original.wav");
+        wav(&path);
+        let file = open_file(dir.path(), Path::new("original.wav")).unwrap();
+        let old = fingerprint(&file.metadata().unwrap());
+        let before = file.metadata().unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let after = file.metadata().unwrap();
+        assert_eq!(before.len(), after.len());
+        assert_eq!(before.modified().unwrap(), after.modified().unwrap());
+        assert_ne!(
+            old,
+            fingerprint(&after),
+            "ctime-only drift must invalidate the saved probe"
+        );
+        assert!(
+            probe_chapters_file(
+                file,
+                Path::new("ffprobe"),
+                &old,
+                ProbeInput::Descriptor,
+                &CancellationToken::new()
+            )
+            .await
+            .is_none()
+        );
     }
 }

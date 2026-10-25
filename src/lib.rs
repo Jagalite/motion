@@ -3,6 +3,7 @@ pub mod api;
 pub mod artifact_leases;
 pub mod artwork;
 pub mod catalog;
+pub use motion_catalog_backend as catalog_backend;
 pub mod components;
 pub mod config;
 pub mod curation;
@@ -45,6 +46,8 @@ use tokio::sync::{Mutex, Semaphore};
 pub struct App {
     pub health: Arc<operations::Health>,
     pub db: sqlx::SqlitePool,
+    /// Present only after durable native activation has reconciled successfully.
+    pub native_catalog: Option<Arc<native_catalog::Runtime>>,
     pub admin_token: Arc<String>,
     pub origin: Arc<String>,
     pub authority: Arc<String>,
@@ -74,3 +77,23 @@ pub mod desktop;
 pub mod presentation;
 
 pub mod metadata_jobs;
+pub mod native_catalog;
+pub mod native_discovery;
+#[allow(dead_code)]
+pub(crate) mod native_generated;
+pub mod native_service;
+// Unregistered candidate verifier; no production admission constructor.
+#[allow(dead_code)] // Native generated publication wiring is not enabled yet.
+pub(crate) mod native_processing;
+#[allow(dead_code)]
+mod native_source_candidates;
+
+pub mod native_scans;
+
+// Isolated companion owner candidate; no schedule routes or tick are enabled.
+#[allow(dead_code)]
+pub(crate) mod native_schedules;
+
+// Internal watch authority candidate; no routes or startup consumer.
+#[allow(dead_code)]
+pub(crate) mod native_watch;

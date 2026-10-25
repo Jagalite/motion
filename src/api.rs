@@ -287,7 +287,7 @@ pub fn router_with(
     presentation: Option<Router>,
 ) -> Router {
     let mut router = Router::<App>::new()
-        .nest("/api/v2", crate::v2::router())
+        .nest("/api/v2", crate::v2::router(app.clone()))
         .route("/ready", get(crate::operations::ready))
         .route(
             "/health",

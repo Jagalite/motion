@@ -40,6 +40,9 @@ use serde::{Deserialize, Deserializer, Serialize};
 use sqlx::SqliteConnection;
 use std::collections::BTreeSet;
 
+mod native_collections;
+mod native_playlists;
+
 pub fn routes() -> Router<App> {
     Router::new()
         .route(
@@ -506,14 +509,14 @@ async fn list_filters(
 ) -> Result<Json<Page<FilterBody>>, Problem> {
     caller.require(Permission::CollectionsWrite)?;
     let limit = q.limit()?;
-    let mut tx = app.db.begin().await?;
+    let (_guard, mut tx, principal) = begin(&app, &caller, Permission::CollectionsWrite).await?;
     let mut rows = Vec::new();
-    for id in list_ids(&mut tx, "saved_filters", &caller.principal, &q, limit).await? {
+    for id in list_ids(&mut tx, "saved_filters", &principal, &q, limit).await? {
         if let Some(f) = service::load_filter(&mut tx, &id).await? {
             rows.push((id, filter_body(f).0));
         }
     }
-    let page = page(&mut tx, &caller.principal, rows, limit).await?;
+    let page = page(&mut tx, &principal, rows, limit).await?;
     tx.commit().await?;
     Ok(Json(page))
 }
@@ -524,12 +527,13 @@ async fn get_filter(
     Path(id): Path<String>,
 ) -> Result<Response, Problem> {
     caller.require(Permission::CollectionsWrite)?;
-    let mut conn = app.db.acquire().await?;
-    let f = service::load_filter(&mut conn, &id)
+    let (_guard, mut tx, principal) = begin(&app, &caller, Permission::CollectionsWrite).await?;
+    let f = service::load_filter(&mut tx, &id)
         .await?
         .ok_or_else(Problem::not_found)?;
-    owned(&caller.principal, &f.profile_id)?;
+    owned(&principal, &f.profile_id)?;
     let (body, revision) = filter_body(f);
+    tx.commit().await?;
     Ok(tagged(StatusCode::OK, &body, revision))
 }
 
@@ -714,6 +718,9 @@ async fn list_collections(
     caller: Caller,
     Query(q): Query<PageQuery>,
 ) -> Result<Json<Page<CollectionBody>>, Problem> {
+    if app.native_catalog.is_some() {
+        return native_collections::list(app, caller, q).await;
+    }
     caller.require(Permission::CollectionsWrite)?;
     let limit = q.limit()?;
     let scope = access::catalog_scope(&caller.principal);
@@ -734,6 +741,9 @@ async fn get_collection(
     caller: Caller,
     Path(id): Path<String>,
 ) -> Result<Response, Problem> {
+    if app.native_catalog.is_some() {
+        return native_collections::get(app, caller, id).await;
+    }
     caller.require(Permission::CollectionsWrite)?;
     let scope = access::catalog_scope(&caller.principal);
     let mut tx = app.db.begin().await?;
@@ -752,6 +762,9 @@ async fn create_collection(
     headers: HeaderMap,
     body: Body<CollectionInput>,
 ) -> Result<Response, Problem> {
+    if app.native_catalog.is_some() {
+        return native_collections::create(app, caller, headers, body).await;
+    }
     caller.require(Permission::CollectionsWrite)?;
     let key = idempotency_key(&headers)?;
     body.value.check()?;
@@ -791,6 +804,9 @@ async fn replace_collection(
     headers: HeaderMap,
     body: Body<CollectionInput>,
 ) -> Result<Response, Problem> {
+    if app.native_catalog.is_some() {
+        return native_collections::replace(app, caller, id, headers, body).await;
+    }
     caller.require(Permission::CollectionsWrite)?;
     let expected = if_match(&headers)?;
     body.value.check()?;
@@ -859,6 +875,9 @@ async fn delete_collection(
     Path(id): Path<String>,
     headers: HeaderMap,
 ) -> Result<Response, Problem> {
+    if app.native_catalog.is_some() {
+        return native_collections::delete(app, caller, id, headers).await;
+    }
     delete_owned(
         &app,
         &caller,
@@ -948,6 +967,9 @@ async fn list_playlists(
     caller: Caller,
     Query(q): Query<PageQuery>,
 ) -> Result<Json<Page<PlaylistBody>>, Problem> {
+    if app.native_catalog.is_some() {
+        return native_playlists::list(app, caller, q).await;
+    }
     caller.require(Permission::CollectionsWrite)?;
     let limit = q.limit()?;
     let scope = access::catalog_scope(&caller.principal);
@@ -968,6 +990,9 @@ async fn get_playlist(
     caller: Caller,
     Path(id): Path<String>,
 ) -> Result<Response, Problem> {
+    if app.native_catalog.is_some() {
+        return native_playlists::get(app, caller, id).await;
+    }
     caller.require(Permission::CollectionsWrite)?;
     let scope = access::catalog_scope(&caller.principal);
     let mut tx = app.db.begin().await?;
@@ -986,6 +1011,9 @@ async fn create_playlist(
     headers: HeaderMap,
     body: Body<PlaylistInput>,
 ) -> Result<Response, Problem> {
+    if app.native_catalog.is_some() {
+        return native_playlists::create(app, caller, headers, body).await;
+    }
     caller.require(Permission::CollectionsWrite)?;
     let key = idempotency_key(&headers)?;
     ids("profile_id", [&body.value.profile_id])?;
@@ -1017,6 +1045,9 @@ async fn replace_playlist(
     headers: HeaderMap,
     body: Body<PlaylistInput>,
 ) -> Result<Response, Problem> {
+    if app.native_catalog.is_some() {
+        return native_playlists::replace(app, caller, id, headers, body).await;
+    }
     caller.require(Permission::CollectionsWrite)?;
     let expected = if_match(&headers)?;
     ids("profile_id", [&body.value.profile_id])?;
@@ -1053,6 +1084,9 @@ async fn delete_playlist(
     Path(id): Path<String>,
     headers: HeaderMap,
 ) -> Result<Response, Problem> {
+    if app.native_catalog.is_some() {
+        return native_playlists::delete(app, caller, id, headers).await;
+    }
     delete_owned(
         &app,
         &caller,

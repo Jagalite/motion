@@ -12,6 +12,7 @@ use tokio::sync::{Mutex, Semaphore};
 fn app(dir: &Path, db: SqlitePool) -> App {
     App {
         health: Arc::new(playscale::operations::Health::new(false)),
+        native_catalog: None,
         db,
         admin_token: Arc::new("test-secret-token".into()),
         origin: Arc::new("http://127.0.0.1:8787".into()),
@@ -714,7 +715,16 @@ async fn timeline_repair_handles_empty_cuts_existing_v2_and_reopen() {
         if already_upgraded {
             // Authentic previous-main order: SQL first, attribution afterward;
             // no candidate repair is allowed to run during fixture preparation.
-            let old = SqlitePool::connect(&format!("sqlite://{}", path.display()))
+            // Even fixture-only raw migration connections use the normal
+            // default-deny projection function. This does not run attribution
+            // repair or grant the private projection capability.
+            let old = sqlx::sqlite::SqlitePoolOptions::new()
+                .after_connect(|connection, _| {
+                    Box::pin(motion_catalog_backend::projection::configure_connection(
+                        connection,
+                    ))
+                })
+                .connect(&format!("sqlite://{}", path.display()))
                 .await
                 .unwrap();
             sqlx::migrate!("./migrations").run(&old).await.unwrap();

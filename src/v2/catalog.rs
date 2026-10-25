@@ -9,6 +9,11 @@
 //! membership comes from original files through logical library/source bindings.
 //! Source/scan services are adapted separately; relationships, timeline/version
 //! creation and full file-track evidence still need their service ports.
+mod native_details;
+mod native_editions;
+mod native_relationship_writes;
+mod native_relationships;
+
 use super::{
     Body, Page, PageQuery, Problem, Scope, Stored, auth::Caller, etag, idempotency_key, if_match,
     page, scope_clause, timestamp,
@@ -27,7 +32,7 @@ use playscale_core::{
     identity::{IdentityError, MergePlan, MergeRequest, SplitMove, SplitPlan, SplitRequest},
 };
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -474,6 +479,11 @@ pub struct CatalogItemBody {
     match_state: String,
     parent_ids: Vec<String>,
 }
+impl CatalogItemBody {
+    pub(super) fn library_ids(&self) -> &[String] {
+        &self.library_ids
+    }
+}
 
 /// Availability of the files the principal may read: no files is unknown.
 fn availability(files: &[&(String, bool)]) -> &'static str {
@@ -684,6 +694,9 @@ async fn browse(
             None => (false, None, None),
         },
     };
+    if app.native_catalog.is_some() {
+        return browse_native(app, caller, filter, q).await;
+    }
     let scope = access::catalog_scope(&caller.principal);
     let (clause, all, ids) = scope_clause(&scope, "f.library_id");
     // The batched ID filter is emitted only when given, as a direct predicate
@@ -792,6 +805,9 @@ pub async fn get_item(
     Path(id): Path<String>,
 ) -> Result<Response, Problem> {
     caller.require(Permission::CatalogRead)?;
+    if app.native_catalog.is_some() {
+        return get_native_item(&app, &caller, &id).await;
+    }
     let scope = access::catalog_scope(&caller.principal);
     let mut tx = app.db.begin().await?;
     let (row, _) = load_item(&mut tx, &scope, &id, true).await?;
@@ -799,6 +815,776 @@ pub async fn get_item(
     let body = item_body(&mut tx, &scope, row).await?;
     tx.commit().await?;
     Ok(tagged(StatusCode::OK, &body, revision))
+}
+
+#[track_caller]
+pub(super) fn native_unavailable() -> Problem {
+    tracing::warn!(location = %std::panic::Location::caller(), "native wire projection refused unsupported or inconsistent facts");
+    Problem::new(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "native_projection_unavailable",
+        "This catalog scope needs a richer native projection; no legacy catalog data was used",
+    )
+}
+pub(super) fn native_read_error(error: anyhow::Error) -> Problem {
+    if error
+        .downcast_ref::<crate::native_catalog::ReadFailure>()
+        .is_some_and(|e| {
+            e.0 == catabolic_store::catalog_scope::ScopeErrorCode::NotFoundOrNotVisible
+        })
+    {
+        Problem::not_found()
+    } else {
+        tracing::warn!(%error,"native scoped read unavailable");
+        native_unavailable()
+    }
+}
+/// Disposable wire projection of a native no-file work with explicit wire
+/// identity evidence. Richer records require their separately qualified adapter.
+fn plain_native_work(row: &Value) -> Result<CatalogItemBody, Problem> {
+    let id = row[0].as_str().ok_or_else(native_unavailable)?;
+    let metadata: Value = match row[2].as_str() {
+        Some(text) => serde_json::from_str(text).map_err(|_| native_unavailable())?,
+        None => row[2].clone(),
+    };
+    let projection = &metadata["motion_catalog"];
+    if projection["contract_version"] != 1
+        || projection["item_id"] != id
+        || (projection["creation_request_digest"].as_str().is_none()
+            && !projection["external_ids"].is_array())
+        || !projection["parent_id"].is_null()
+    {
+        return Err(native_unavailable());
+    }
+    let mut external_ids = Vec::new();
+    if let Some(ids) = projection["external_ids"].as_array() {
+        for identity in ids {
+            external_ids.push(ExternalIdentity {
+                provider: identity["provider"]
+                    .as_str()
+                    .ok_or_else(native_unavailable)?
+                    .into(),
+                value: identity["value"]
+                    .as_str()
+                    .ok_or_else(native_unavailable)?
+                    .into(),
+                namespace_version: identity["namespace_version"]
+                    .as_str()
+                    .ok_or_else(native_unavailable)?
+                    .into(),
+            });
+        }
+    }
+    let kind =
+        playscale_core::catalog_kind::from_native(row[1].as_str().ok_or_else(native_unavailable)?)
+            .ok_or_else(native_unavailable)?;
+    if projection["kind"] != kind {
+        return Err(native_unavailable());
+    }
+    let media_type = projection["media_type"]
+        .as_str()
+        .ok_or_else(native_unavailable)?;
+    let revision = projection["catalog_revision"]
+        .as_u64()
+        .ok_or_else(native_unavailable)?;
+    Ok(CatalogItemBody {
+        id: id.into(),
+        revision: revision.to_string(),
+        kind: media_kind(media_type, kind),
+        title: metadata["title"]
+            .as_str()
+            .ok_or_else(native_unavailable)?
+            .into(),
+        library_ids: vec![],
+        availability: "unknown",
+        external_ids,
+        artwork_id: None,
+        default_timeline_id: None,
+        match_state: projection["match_state"]
+            .as_str()
+            .ok_or_else(native_unavailable)?
+            .into(),
+        parent_ids: vec![],
+    })
+}
+/// Fields are assembled from native scoped work/library records and current
+/// generation-tagged exact physical maps. Legacy metadata, library membership,
+/// and aliases are never consulted as authority here.
+pub(super) async fn projected_native_work(
+    runtime: &crate::native_catalog::Runtime,
+    conn: &mut sqlx::SqliteConnection,
+    row: &Value,
+    native_libraries: &[Value],
+) -> Result<CatalogItemBody, Problem> {
+    let mut body = plain_native_work(row)?;
+    // read_scoped_records independently admitted the exact current native source
+    // before permitting this protected field through the projection shape gate.
+    let metadata: Value = match row[2].as_str() {
+        Some(text) => serde_json::from_str(text).map_err(|_| native_unavailable())?,
+        None => row[2].clone(),
+    };
+    if let Some(value) = metadata.get("motion_artwork") {
+        let state = playscale_core::artwork::native::ReferenceState::parse_json(
+            &value.to_string(),
+            &body.id,
+        )
+        .map_err(|_| native_unavailable())?;
+        body.artwork_id = playscale_core::artwork::native::resolve_role(&state, "poster")
+            .map_err(|_| native_unavailable())?
+            .asset_id;
+    }
+    let shape = &row[3];
+    if shape["requires_rich_projection"] == false || shape["logical_work_projection"] == true {
+        return Ok(body);
+    }
+    if shape["physical_work_projection"] != true {
+        return Err(native_unavailable());
+    }
+    let native_editions: Vec<String> =
+        serde_json::from_value(shape["edition_ids"].clone()).map_err(|_| native_unavailable())?;
+    let editions: Vec<String> = native_editions
+        .iter()
+        .map(|id| {
+            id.strip_prefix("motion.edition:")
+                .filter(|id| valid_id(id))
+                .map(str::to_owned)
+                .ok_or_else(native_unavailable)
+        })
+        .collect::<Result<_, _>>()?;
+    if editions.is_empty() {
+        return Err(native_unavailable());
+    }
+    let encoded = serde_json::to_string(&editions).map_err(Problem::internal)?;
+    let matching: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM editions WHERE item_id=? AND id IN(SELECT value FROM json_each(?))",
+    )
+    .bind(&body.id)
+    .bind(&encoded)
+    .fetch_one(&mut *conn)
+    .await?;
+    if matching != editions.len() as i64 {
+        return Err(native_unavailable());
+    }
+    let (catalog,incarnation,generation):(String,String,i64)=sqlx::query_as("SELECT catalog_id,incarnation,generation FROM catabolic_projection_state WHERE singleton=1").fetch_one(&mut *conn).await?;
+    let native_versions: Vec<String> =
+        serde_json::from_value(shape["version_ids"].clone()).map_err(|_| native_unavailable())?;
+    let version_ids: Vec<String> = native_versions
+        .iter()
+        .map(|id| {
+            id.strip_prefix("motion.version:")
+                .filter(|id| valid_id(id))
+                .map(str::to_owned)
+                .ok_or_else(native_unavailable)
+        })
+        .collect::<Result<_, _>>()?;
+    if version_ids.is_empty() {
+        return native_details::empty_work(
+            runtime,
+            conn,
+            body,
+            shape,
+            generation,
+            &catalog,
+            &incarnation,
+        )
+        .await;
+    }
+    let encoded_versions = serde_json::to_string(&version_ids).map_err(Problem::internal)?;
+    let manifests:Vec<(String,String,String)>=sqlx::query_as("SELECT version_id,timeline_id,manifest_json FROM catabolic_projection_versions WHERE generation=? AND native_timeline_revision=native_current_timeline_revision AND version_id IN(SELECT value FROM json_each(?)) ORDER BY version_id")
+        .bind(generation).bind(&encoded_versions).fetch_all(&mut *conn).await?;
+    let current_ids: BTreeSet<_> = manifests.iter().map(|row| row.0.clone()).collect();
+    if current_ids.len() != manifests.len() {
+        return Err(native_unavailable());
+    }
+    let missing_ids: Vec<_> = version_ids
+        .iter()
+        .filter(|id| !current_ids.contains(*id))
+        .cloned()
+        .collect();
+    let unavailable_facts = if !missing_ids.is_empty() {
+        let ids = missing_ids.clone();
+        Some(
+            runtime
+                .with_host(move |host| {
+                    host.projection_unavailable_versions(generation, &ids)
+                        .map_err(|e| anyhow::anyhow!("unavailable native facts: {e:?}"))
+                })
+                .await
+                .map_err(native_read_error)?,
+        )
+    } else {
+        None
+    };
+    let unavailable_dependencies = if unavailable_facts.is_some() {
+        let work = body.id.clone();
+        Some(
+            runtime
+                .with_host(move |host| {
+                    let capture = host.capture_work_dependencies(generation, &work)?;
+                    Ok(capture.dependencies().clone())
+                })
+                .await
+                .map_err(native_read_error)?,
+        )
+    } else {
+        None
+    };
+    let mut exact_files = BTreeSet::new();
+    let mut generated_files = BTreeSet::new();
+    let mut timelines = BTreeSet::new();
+    if let Some(facts) = &unavailable_facts {
+        if facts["contract_version"] != 1
+            || facts["catalog_id"] != catalog
+            || facts["incarnation"] != incarnation
+            || facts["generation"] != generation
+        {
+            return Err(native_unavailable());
+        }
+        let versions = facts["versions"]
+            .as_array()
+            .ok_or_else(native_unavailable)?;
+        if versions.len() != missing_ids.len() {
+            return Err(native_unavailable());
+        }
+        for version in versions {
+            let id = version["version_id"]
+                .as_str()
+                .ok_or_else(native_unavailable)?;
+            if !missing_ids.iter().any(|v| v == id)
+                || version["association_item_id"] != format!("motion.version:{id}")
+                || !native_editions
+                    .iter()
+                    .any(|v| version["edition_item_id"] == *v)
+                || !version["version_revision"].as_i64().is_some_and(|n| n > 0)
+                || !version["timeline_revision"].as_i64().is_some_and(|n| n > 0)
+                || version["timeline_revision"] != version["current_timeline_revision"]
+            {
+                return Err(native_unavailable());
+            }
+            let deps = unavailable_dependencies
+                .as_ref()
+                .ok_or_else(native_unavailable)?;
+            let owner = deps["versions"]
+                .as_array()
+                .ok_or_else(native_unavailable)?
+                .iter()
+                .find(|v| v["id"] == id)
+                .ok_or_else(native_unavailable)?;
+            let head = deps["version_heads"]
+                .as_array()
+                .ok_or_else(native_unavailable)?
+                .iter()
+                .find(|v| v["version_id"] == id && v["revision"] == owner["current_revision"])
+                .ok_or_else(native_unavailable)?;
+            if owner["current_revision"] != version["version_revision"]
+                || owner["association_item_id"] != version["association_item_id"]
+                || head["timeline_id"] != version["timeline_id"]
+                || head["timeline_revision"] != version["timeline_revision"]
+            {
+                return Err(native_unavailable());
+            }
+            timelines.insert(
+                version["timeline_id"]
+                    .as_str()
+                    .ok_or_else(native_unavailable)?
+                    .to_owned(),
+            );
+            for binding in version["bindings"]
+                .as_array()
+                .ok_or_else(native_unavailable)?
+            {
+                exact_files.insert((
+                    binding["file"]["file_id"]
+                        .as_str()
+                        .ok_or_else(native_unavailable)?
+                        .to_owned(),
+                    binding["file"]["revision"]
+                        .as_str()
+                        .ok_or_else(native_unavailable)?
+                        .to_owned(),
+                ));
+            }
+        }
+    }
+    for (version_id, timeline_id, raw) in manifests {
+        let envelope: Value = serde_json::from_str(&raw).map_err(|_| native_unavailable())?;
+        if envelope["catalog_id"] != catalog
+            || envelope["incarnation"] != incarnation
+            || envelope["generation"] != generation
+        {
+            return Err(native_unavailable());
+        }
+        let candidates = if envelope.get("selection").is_some() {
+            &envelope["selection"]["selected_versions"]
+        } else {
+            &envelope["manifest"]["versions"]
+        };
+        let candidate = candidates
+            .as_array()
+            .ok_or_else(native_unavailable)?
+            .iter()
+            .find(|v| v["version"]["version_id"] == version_id)
+            .ok_or_else(native_unavailable)?;
+        let edition = candidate["version"]["edition_item_id"]
+            .as_str()
+            .ok_or_else(native_unavailable)?;
+        if !native_editions.iter().any(|v| v == edition) {
+            return Err(native_unavailable());
+        }
+        let origin = motion_catalog_backend::version_proof::origin_in(
+            conn,
+            &version_id,
+            &catalog,
+            &incarnation,
+            generation,
+        )
+        .await
+        .map_err(native_read_error)?;
+        let projected_origin: String =
+            sqlx::query_scalar("SELECT origin FROM media_versions WHERE id=?")
+                .bind(&version_id)
+                .fetch_one(&mut *conn)
+                .await?;
+        if !matches!(
+            (origin, projected_origin.as_str()),
+            (
+                motion_catalog_backend::version_proof::ProofOrigin::Original,
+                "original"
+            ) | (
+                motion_catalog_backend::version_proof::ProofOrigin::ReceiptVerifiedGenerated,
+                "generated"
+            )
+        ) {
+            return Err(native_unavailable());
+        }
+        let proof = motion_catalog_backend::version_proof::read(
+            &envelope,
+            &catalog,
+            &incarnation,
+            generation,
+            &catabolic_store::catalog_projection::VersionLineageRequest {
+                work_item_id: body.id.clone(),
+                edition_item_id: edition.into(),
+                version_item_id: format!("motion.version:{version_id}"),
+                version_id: version_id.clone(),
+            },
+            origin,
+        )
+        .map_err(native_read_error)?;
+        let contract = &proof.version["version"];
+        if contract["association_item_id"] != format!("motion.version:{version_id}")
+            || contract["timeline_id"] != timeline_id
+            || !native_editions
+                .iter()
+                .any(|id| contract["edition_item_id"] == *id)
+        {
+            return Err(native_unavailable());
+        }
+        timelines.insert(timeline_id);
+        for binding in contract["bindings"]
+            .as_array()
+            .ok_or_else(native_unavailable)?
+        {
+            if origin
+                == motion_catalog_backend::version_proof::ProofOrigin::ReceiptVerifiedGenerated
+            {
+                generated_files.insert((
+                    binding["file"]["file_id"]
+                        .as_str()
+                        .ok_or_else(native_unavailable)?
+                        .to_owned(),
+                    binding["file"]["revision"]
+                        .as_str()
+                        .ok_or_else(native_unavailable)?
+                        .to_owned(),
+                ));
+            }
+            exact_files.insert((
+                binding["file"]["file_id"]
+                    .as_str()
+                    .ok_or_else(native_unavailable)?
+                    .to_owned(),
+                binding["file"]["revision"]
+                    .as_str()
+                    .ok_or_else(native_unavailable)?
+                    .to_owned(),
+            ));
+        }
+    }
+    if exact_files.is_empty() {
+        return Err(native_unavailable());
+    }
+    let files:Vec<(String,String,String,bool,String)>=sqlx::query_as("SELECT f.id,f.library_id,f.edition_id,p.available,p.mapping_json FROM catabolic_projection_files p JOIN media_files f ON f.id=p.file_id WHERE p.generation=? AND f.edition_id IN(SELECT value FROM json_each(?)) ORDER BY f.id")
+        .bind(generation).bind(&encoded).fetch_all(&mut *conn).await?;
+    if files.is_empty() {
+        return Err(native_unavailable());
+    }
+    let mut source_ids = BTreeSet::new();
+    let mut available = 0;
+    let mut seen = BTreeSet::new();
+    for (id, source, edition, present, raw) in &files {
+        let mapping: motion_catalog_backend::occurrence_bridge::OccurrenceMapping =
+            serde_json::from_str(raw).map_err(|_| native_unavailable())?;
+        if mapping.motion_file["id"] != *id
+            || mapping.motion_file["edition_id"] != *edition
+            || mapping.source.library_id != *source
+        {
+            return Err(native_unavailable());
+        }
+        let exact = (
+            mapping.physical.exact.file_id.clone(),
+            mapping.physical.exact.revision.clone(),
+        );
+        if !exact_files.contains(&exact) {
+            continue;
+        }
+        if let Some(facts) = &unavailable_facts {
+            for version in facts["versions"]
+                .as_array()
+                .ok_or_else(native_unavailable)?
+            {
+                for binding in version["bindings"]
+                    .as_array()
+                    .ok_or_else(native_unavailable)?
+                {
+                    if binding["file"]["file_id"] != exact.0
+                        || binding["file"]["revision"] != exact.1
+                    {
+                        continue;
+                    }
+                    let observed = &binding["observation"]["snapshot"];
+                    let status = binding["observation"]["state"]
+                        .as_str()
+                        .ok_or_else(native_unavailable)?;
+                    if binding["profile"] != mapping.source.profile
+                        || observed["location"] != mapping.physical.location
+                        || observed["path"] != mapping.physical.path
+                        || (status == "present") != *present
+                        || !matches!(status, "present" | "missing" | "replacement")
+                        || !mapping.version_files.iter().any(|v| {
+                            v["version_id"] == version["version_id"]
+                                && v["part"] == binding["part"]
+                                && v["file_id"] == *id
+                                && v["file_revision"] == mapping.motion_file["revision"]
+                        })
+                    {
+                        return Err(native_unavailable());
+                    }
+                }
+            }
+        }
+        // A present native observation is not current local deployment
+        // admission. Withdrawal does not advance native generation. Generated
+        // output uses its independently receipt-verified private source instead.
+        let admitted = if generated_files.contains(&exact) {
+            true
+        } else if mapping.source.library_id == motion_catalog_backend::generated_source::SOURCE_ID {
+            if *present {
+                return Err(native_unavailable());
+            }
+            false
+        } else {
+            motion_catalog_backend::source_lifecycle::current_in(conn, source)
+                .await
+                .map_err(native_read_error)?
+                .state
+                == motion_catalog_backend::source_lifecycle::State::Active
+        };
+        if !seen.insert(exact) {
+            return Err(native_unavailable());
+        }
+        if admitted {
+            source_ids.insert(source.clone());
+        }
+        available += usize::from(*present && admitted);
+    }
+    if seen != exact_files {
+        return Err(native_unavailable());
+    }
+    body.availability = if available == seen.len() {
+        "available"
+    } else if available == 0 {
+        "unavailable"
+    } else {
+        "degraded"
+    };
+    for library in native_libraries {
+        let metadata: Value =
+            serde_json::from_str(library[2].as_str().ok_or_else(native_unavailable)?)
+                .map_err(|_| native_unavailable())?;
+        let definition = &metadata["motion_library"];
+        let id = definition["id"].as_str().ok_or_else(native_unavailable)?;
+        if definition["contract_version"] != 1 || library[0] != format!("motion.library:{id}") {
+            return Err(native_unavailable());
+        }
+        let ids: Vec<String> = serde_json::from_value(definition["source_ids"].clone())
+            .map_err(|_| native_unavailable())?;
+        if ids.iter().any(|id| source_ids.contains(id)) {
+            body.library_ids.push(id.to_owned());
+        }
+    }
+    body.library_ids.sort();
+    body.library_ids.dedup();
+    let all_timelines: Vec<String> =
+        serde_json::from_value(shape["timeline_ids"].clone()).map_err(|_| native_unavailable())?;
+    if all_timelines.iter().any(|id| !valid_id(id))
+        || timelines.iter().any(|id| !all_timelines.contains(id))
+    {
+        return Err(native_unavailable());
+    }
+    body.default_timeline_id = match all_timelines.as_slice() {
+        [only] => Some(only.clone()),
+        _ => None,
+    };
+    Ok(body)
+}
+
+pub(super) async fn get_native_item(
+    app: &App,
+    caller: &Caller,
+    id: &str,
+) -> Result<Response, Problem> {
+    if !valid_id(id) {
+        return Err(Problem::not_found());
+    }
+    let runtime = app.native_catalog.as_ref().ok_or_else(native_unavailable)?;
+    let mut authorization = app.db.begin().await?;
+    let initial = caller
+        .reauthorize(&mut authorization, Some(Permission::CatalogRead))
+        .await?;
+    let prepared_scope = access::catalog_scope(&initial);
+    if prepared_scope == CatalogScope::Nothing {
+        return Err(Problem::not_found());
+    }
+    authorization.commit().await?;
+    let scoped = match &prepared_scope {
+        CatalogScope::Libraries(ids) => Some(
+            runtime
+                .prepare_library_read_scope(ids.clone())
+                .await
+                .map_err(native_read_error)?,
+        ),
+        _ => None,
+    };
+    let selection = match &scoped {
+        Some(scope) => scope.selection.clone(),
+        None => runtime
+            .prepare_all_scope()
+            .await
+            .map_err(native_read_error)?,
+    };
+    let library_selection = match &scoped {
+        Some(scope) => scope.definitions.clone(),
+        None => runtime
+            .prepare_library_definitions(None)
+            .await
+            .map_err(native_read_error)?,
+    };
+    runtime
+        .rebuild_projection()
+        .await
+        .map_err(native_read_error)?;
+    let mut tx: sqlx::Transaction<'static, sqlx::Sqlite> =
+        app.db.begin_with("BEGIN IMMEDIATE").await?;
+    let principal = caller
+        .reauthorize(&mut tx, Some(Permission::CatalogRead))
+        .await?;
+    let current_scope = access::catalog_scope(&principal);
+    if current_scope == CatalogScope::Nothing {
+        return Err(Problem::not_found());
+    }
+    if current_scope != prepared_scope {
+        return Err(native_unavailable());
+    }
+    runtime
+        .validate_projection(&mut tx)
+        .await
+        .map_err(native_read_error)?;
+    if access::catalog_scope(&principal) != prepared_scope {
+        return Err(native_unavailable());
+    }
+    let native_libraries = match &scoped {
+        Some(scope) => runtime
+            .validate_library_read_scope(&mut tx, scope)
+            .await
+            .map_err(native_read_error)?,
+        None if prepared_scope == CatalogScope::Nothing => Vec::new(),
+        None => runtime
+            .read_libraries(&mut tx, vec![library_selection], None)
+            .await
+            .map_err(native_read_error)?,
+    };
+    let rows = runtime
+        .read_projectable_items(&mut tx, vec![selection], Some(id.into()))
+        .await
+        .map_err(native_read_error)?;
+    let mut body = projected_native_work(
+        runtime,
+        &mut tx,
+        rows.first().ok_or_else(Problem::not_found)?,
+        &native_libraries,
+    )
+    .await?;
+    let issued = runtime
+        .issue_work_revisions_and_commit(tx, vec![id.into()])
+        .await
+        .map_err(native_read_error)?;
+    let revision = issued.get(id).ok_or_else(native_unavailable)?.revision;
+    body.revision = revision.to_string();
+    Ok(tagged(StatusCode::OK, &body, revision))
+}
+async fn browse_native(
+    app: &App,
+    caller: &Caller,
+    filter: Filter,
+    q: PageQuery,
+) -> Result<Json<Page<CatalogItemBody>>, Problem> {
+    let limit = q.limit()?;
+    let after = match q.after()? {
+        "" => None,
+        cursor => Some(decode_cursor(cursor)?),
+    };
+    let runtime = app.native_catalog.as_ref().ok_or_else(native_unavailable)?;
+    let mut authorization = app.db.begin().await?;
+    let initial = caller
+        .reauthorize(&mut authorization, Some(Permission::CatalogRead))
+        .await?;
+    let prepared_scope = access::catalog_scope(&initial);
+    if prepared_scope == CatalogScope::Nothing {
+        let empty = page(
+            &mut authorization,
+            &initial,
+            Vec::<(String, CatalogItemBody)>::new(),
+            limit,
+        )
+        .await?;
+        authorization.commit().await?;
+        return Ok(Json(empty));
+    }
+    authorization.commit().await?;
+    let scoped = match &prepared_scope {
+        CatalogScope::Libraries(ids) => Some(
+            runtime
+                .prepare_library_read_scope(ids.clone())
+                .await
+                .map_err(native_read_error)?,
+        ),
+        _ => None,
+    };
+    let selection = match &scoped {
+        Some(scope) => scope.selection.clone(),
+        None => runtime
+            .prepare_all_scope()
+            .await
+            .map_err(native_read_error)?,
+    };
+    let library_selection = match &scoped {
+        Some(scope) => scope.definitions.clone(),
+        None => runtime
+            .prepare_library_definitions(None)
+            .await
+            .map_err(native_read_error)?,
+    };
+    runtime
+        .rebuild_projection()
+        .await
+        .map_err(native_read_error)?;
+    let mut tx: sqlx::Transaction<'static, sqlx::Sqlite> =
+        app.db.begin_with("BEGIN IMMEDIATE").await?;
+    let principal = caller
+        .reauthorize(&mut tx, Some(Permission::CatalogRead))
+        .await?;
+    runtime
+        .validate_projection(&mut tx)
+        .await
+        .map_err(native_read_error)?;
+    if access::catalog_scope(&principal) != prepared_scope {
+        return Err(native_unavailable());
+    }
+    let native_libraries = match &scoped {
+        Some(scope) => runtime
+            .validate_library_read_scope(&mut tx, scope)
+            .await
+            .map_err(native_read_error)?,
+        None if prepared_scope == CatalogScope::Nothing => Vec::new(),
+        None => runtime
+            .read_libraries(&mut tx, vec![library_selection], None)
+            .await
+            .map_err(native_read_error)?,
+    };
+    let rows = match access::catalog_scope(&principal) {
+        CatalogScope::Nothing => vec![],
+        CatalogScope::Libraries(_) | CatalogScope::All => runtime
+            .read_projectable_items(&mut tx, vec![selection], None)
+            .await
+            .map_err(native_read_error)?,
+    };
+    let ids: Option<Vec<String>> = filter
+        .ids
+        .as_ref()
+        .map(|ids| serde_json::from_str(ids))
+        .transpose()
+        .map_err(Problem::internal)?;
+    let mut items = Vec::new();
+    for row in rows {
+        let body = projected_native_work(runtime, &mut tx, &row, &native_libraries).await?;
+        if filter
+            .library_id
+            .as_ref()
+            .is_some_and(|id| !body.library_ids.contains(id))
+            || filter.parent_id.is_some()
+        {
+            continue;
+        }
+        if filter.kind.is_some_and(|kind| {
+            storage_kind(kind).is_none_or(|(media, family)| {
+                media_kind(media, family.unwrap_or("video")) != body.kind
+            })
+        }) {
+            continue;
+        }
+        if filter
+            .q
+            .as_ref()
+            .is_some_and(|q| !body.title.to_lowercase().contains(&q.to_lowercase()))
+        {
+            continue;
+        }
+        if ids.as_ref().is_some_and(|ids| !ids.contains(&body.id)) {
+            continue;
+        }
+        if after
+            .as_ref()
+            .is_some_and(|(title, id)| (&body.title, &body.id) <= (title, id))
+        {
+            continue;
+        }
+        items.push(body);
+    }
+    items.sort_by(|a, b| (&a.title, &a.id).cmp(&(&b.title, &b.id)));
+    let rows = items
+        .into_iter()
+        .take(limit as usize + 1)
+        .map(|body| (encode_cursor(&body.title, &body.id), body))
+        .collect();
+    let mut page = page(&mut tx, &principal, rows, limit).await?;
+    let ids = page
+        .items
+        .iter()
+        .map(|body: &CatalogItemBody| body.id.clone())
+        .collect();
+    let issued = runtime
+        .issue_work_revisions_and_commit(tx, ids)
+        .await
+        .map_err(native_read_error)?;
+    for body in &mut page.items {
+        body.revision = issued
+            .get(&body.id)
+            .ok_or_else(native_unavailable)?
+            .revision
+            .to_string();
+    }
+    Ok(Json(page))
 }
 
 // ---------------------------------------------------------------------------
@@ -869,6 +1655,9 @@ pub async fn create_item(
     if family.is_some_and(|f| f != "video") {
         return Err(unsupported_kind());
     }
+    if app.native_catalog.is_some() {
+        return create_native_work(&app, &caller, &key, &digest, title, media_type).await;
+    }
     let _guard = app.jobs.lock().await;
     let mut tx = begin_write(&app.db).await?;
     let principal = caller
@@ -918,6 +1707,400 @@ pub async fn create_item(
     Ok(tagged(StatusCode::CREATED, &json, revision))
 }
 
+/// First native mutation slice. No catalog SQL writes or fallback are allowed.
+/// The native intent commits before dispatch; current Motion authorization is
+/// reserved again across the native effect and Motion acknowledgment.
+async fn create_native_work(
+    app: &App,
+    caller: &Caller,
+    key: &str,
+    digest: &str,
+    title: String,
+    media_type: &str,
+) -> Result<Response, Problem> {
+    playscale_core::catalog::validate_structure(media_type, None, None, false, &[], 0)
+        .map_err(|detail| Problem::invalid("invalid_structure", detail))?;
+    let runtime = app
+        .native_catalog
+        .as_ref()
+        .ok_or_else(|| Problem::internal("native runtime missing"))?;
+    let _guard = app.jobs.lock().await;
+    let mut tx = begin_write(&app.db).await?;
+    let principal = caller
+        .reauthorize(&mut tx, Some(Permission::CatalogWrite))
+        .await?;
+    if !matches!(access::catalog_scope(&principal), CatalogScope::All) {
+        return Err(outside_scope());
+    }
+    let record = Scope {
+        principal: &principal.id,
+        operation: "createCatalogItem",
+        target: "-",
+        key,
+    };
+    let stored = record.load(&mut tx).await?;
+    if access::idempotency(stored.as_ref().map(|s| &s.record), digest, now())? == Idempotent::Replay
+    {
+        // This receipt is a new, unmapped work with no library/parent/artwork
+        // disclosure; current unrestricted authority remains mandatory.
+        let response = replayed(stored.unwrap());
+        tx.commit().await?;
+        runtime
+            .rebuild_projection()
+            .await
+            .map_err(native_read_error)?;
+        return Ok(response);
+    }
+    let operation = format!(
+        "server-create-work:{:x}",
+        Sha256::digest(
+            serde_json::to_vec(&(principal.id.as_str(), key)).map_err(Problem::internal)?
+        )
+    );
+    let id = format!("{:x}", Sha256::digest(operation.as_bytes()));
+    tx.commit().await?;
+    let command = runtime
+        .prepare_work(
+            operation,
+            id.clone(),
+            title.clone(),
+            media_type.to_owned(),
+            digest.to_owned(),
+        )
+        .await
+        .map_err(Problem::internal)?;
+    let (outcome, mut tx, principal, revision_intent) = loop {
+        let mut tx: sqlx::Transaction<'static, sqlx::Sqlite> =
+            app.db.begin_with("BEGIN IMMEDIATE").await?;
+        let principal = caller
+            .reauthorize(&mut tx, Some(Permission::CatalogWrite))
+            .await?;
+        if !matches!(access::catalog_scope(&principal), CatalogScope::All) {
+            return Err(outside_scope());
+        }
+        let record = Scope {
+            principal: &principal.id,
+            operation: "createCatalogItem",
+            target: "-",
+            key,
+        };
+        let stored = record.load(&mut tx).await?;
+        if access::idempotency(stored.as_ref().map(|s| &s.record), digest, now())?
+            == Idempotent::Replay
+        {
+            let response = replayed(stored.unwrap());
+            tx.commit().await?;
+            runtime
+                .rebuild_projection()
+                .await
+                .map_err(native_read_error)?;
+            return Ok(response);
+        }
+        use catabolic_store::catalog_commands::CommandOutcome;
+        // Transfer the authorization reservation into the blocking native worker.
+        // Cancellation cannot release revocation custody while dispatch is queued.
+        let (_, revision_intent) =
+            motion_catalog_backend::command_attempts::latest_in(&mut tx, &command)
+                .await
+                .map_err(Problem::internal)?;
+        let (outcome, witness, mut tx) = runtime
+            .execute_work_observed(revision_intent.clone(), tx)
+            .await
+            .map_err(Problem::internal)?;
+        if let Some(witness) = witness {
+            motion_catalog_backend::command_attempts::record_next_in(
+                &mut tx,
+                &command,
+                &revision_intent,
+                witness,
+            )
+            .await
+            .map_err(Problem::internal)?;
+            tx.commit().await?;
+            continue;
+        }
+        match &outcome {
+            CommandOutcome::Committed { .. } | CommandOutcome::Replay { .. } => {}
+            outcome => {
+                return Err(Problem::new(
+                    StatusCode::CONFLICT,
+                    "native_command_conflict",
+                    format!("Native command requires reconciliation: {}", outcome.code()),
+                ));
+            }
+        }
+        break (outcome, tx, principal, revision_intent);
+    };
+    let record = Scope {
+        principal: &principal.id,
+        operation: "createCatalogItem",
+        target: "-",
+        key,
+    };
+    motion_catalog_backend::revision_bridge::acknowledge_fresh_in(
+        &mut tx,
+        &id,
+        &revision_intent,
+        &outcome,
+    )
+    .await
+    .map_err(Problem::internal)?;
+    let body = CatalogItemBody {
+        id,
+        revision: "1".into(),
+        kind: media_kind(media_type, "video"),
+        title,
+        library_ids: vec![],
+        availability: "unknown",
+        external_ids: vec![],
+        artwork_id: None,
+        default_timeline_id: None,
+        match_state: "unmatched".into(),
+        parent_ids: vec![],
+    };
+    let json = serde_json::to_value(&body).map_err(Problem::internal)?;
+    sqlx::query("INSERT INTO change_events(topic,resource_id) VALUES('catalog',?)")
+        .bind(&body.id)
+        .execute(&mut *tx)
+        .await?;
+    record
+        .save(&mut tx, digest, StatusCode::CREATED, Some(&json), None)
+        .await?;
+    tx.commit().await?;
+    runtime
+        .rebuild_projection()
+        .await
+        .map_err(native_read_error)?;
+    Ok(tagged(StatusCode::CREATED, &body, 1))
+}
+
+async fn replace_native_work(
+    app: &App,
+    caller: &Caller,
+    id: &str,
+    expected: u64,
+    title: String,
+    media_type: &str,
+    digest: &str,
+) -> Result<Response, Problem> {
+    if !valid_id(id) {
+        return Err(Problem::not_found());
+    }
+    playscale_core::catalog::validate_structure(media_type, None, None, false, &[], 0)
+        .map_err(|detail| Problem::invalid("invalid_structure", detail))?;
+    let runtime = app.native_catalog.as_ref().ok_or_else(native_unavailable)?;
+    let _guard = app.jobs.lock().await;
+    let selection = runtime
+        .prepare_all_scope()
+        .await
+        .map_err(native_read_error)?;
+    let mut tx: sqlx::Transaction<'static, sqlx::Sqlite> =
+        app.db.begin_with("BEGIN IMMEDIATE").await?;
+    let principal = caller
+        .reauthorize(&mut tx, Some(Permission::CatalogWrite))
+        .await?;
+    if !matches!(access::catalog_scope(&principal), CatalogScope::All) {
+        return Err(outside_scope());
+    }
+    let operation = format!(
+        "server-replace-work:{:x}",
+        Sha256::digest(
+            serde_json::to_vec(&(principal.id.as_str(), id, expected, digest))
+                .map_err(Problem::internal)?
+        )
+    );
+    // Resolve an immutable intent before looking at a potentially newer native
+    // head. Receipt absence never authorizes replacing the saved payload/CAS.
+    let saved: Option<String> =
+        sqlx::query_scalar("SELECT envelope_json FROM catabolic_commands WHERE operation_id=?")
+            .bind(&operation)
+            .fetch_optional(&mut *tx)
+            .await?;
+    let recorded = saved
+        .as_deref()
+        .map(motion_catalog_backend::command_attempts::decode)
+        .transpose()
+        .map_err(Problem::internal)?;
+    if let Some(original) = &recorded {
+        let payload = original.payload();
+        let mutation = if payload["operation"] == "metadata_initialize_and_patch" {
+            payload
+        } else if payload["operation"] == "metadata" {
+            &payload["mutation"]["change"]
+        } else {
+            return Err(native_unavailable());
+        };
+        let evidence: Value = serde_json::from_str(
+            mutation["evidence_json"]
+                .as_str()
+                .ok_or_else(native_unavailable)?,
+        )
+        .map_err(Problem::internal)?;
+        if original.key().operation_id() != operation
+            || mutation["subject"] != id
+            || evidence["request_digest"] != digest
+        {
+            return Err(native_unavailable());
+        }
+        let (_, sent) = motion_catalog_backend::command_attempts::latest_in(&mut tx, original)
+            .await
+            .map_err(Problem::internal)?;
+        let (outcome, returned) = runtime
+            .with_host(move |host| Ok((host.reconcile_command_receipt(&sent)?, tx)))
+            .await
+            .map_err(native_read_error)?;
+        tx = returned;
+        if let Some(outcome) = outcome {
+            if !matches!(
+                outcome,
+                catabolic_store::catalog_commands::CommandOutcome::Replay { .. }
+            ) {
+                return Err(Problem::new(
+                    StatusCode::CONFLICT,
+                    "native_command_conflict",
+                    format!("Native command requires reconciliation: {}", outcome.code()),
+                ));
+            }
+            tx.commit().await?;
+            runtime
+                .rebuild_projection()
+                .await
+                .map_err(native_read_error)?;
+            return get_native_item(app, caller, id).await;
+        }
+    }
+    let rows = runtime
+        .read_items(&mut tx, vec![selection.clone()], Some(id.into()))
+        .await
+        .map_err(native_read_error)?;
+    let row = rows.first().ok_or_else(Problem::not_found)?;
+    let current = plain_native_work(row)?;
+    let revision: u64 = current.revision.parse().map_err(Problem::internal)?;
+    let mut metadata: Value = serde_json::from_str(row[2].as_str().ok_or_else(native_unavailable)?)
+        .map_err(Problem::internal)?;
+    let changed = current.title != title || metadata["motion_catalog"]["media_type"] != media_type;
+    let checked = runtime
+        .guard_work_and_commit(tx, id.into(), expected, |_, _, _| Ok(()))
+        .await
+        .map_err(native_read_error)?;
+    let aggregate = match checked {
+        crate::native_catalog::Guarded::Mismatch(_) => {
+            return Err(Problem::new(
+                StatusCode::PRECONDITION_FAILED,
+                "precondition_failed",
+                "The resource revision has changed",
+            ));
+        }
+        crate::native_catalog::Guarded::Applied { revision, .. } => revision.revision,
+    };
+    if !changed {
+        let mut current = current;
+        current.revision = aggregate.to_string();
+        return Ok(tagged(StatusCode::OK, &current, aggregate));
+    }
+    let next = revision.checked_add(1).ok_or_else(native_unavailable)?;
+    metadata["motion_catalog"]["catalog_revision"] = json!(next);
+    if metadata["motion_catalog"]["media_type"] != media_type {
+        let previous = metadata["motion_catalog"]["structure_revision"]
+            .as_u64()
+            .ok_or_else(native_unavailable)?;
+        metadata["motion_catalog"]["structure_revision"] =
+            json!(previous.checked_add(1).ok_or_else(native_unavailable)?);
+    }
+    metadata["motion_catalog"]["media_type"] = json!(media_type);
+    let command = if let Some(recorded) = recorded {
+        recorded
+    } else {
+        runtime
+            .prepare_work_update(
+                operation,
+                id.into(),
+                title,
+                metadata["motion_catalog"].clone(),
+                digest.into(),
+            )
+            .await
+            .map_err(native_read_error)?
+    };
+    loop {
+        let mut tx: sqlx::Transaction<'static, sqlx::Sqlite> =
+            app.db.begin_with("BEGIN IMMEDIATE").await?;
+        let principal = caller
+            .reauthorize(&mut tx, Some(Permission::CatalogWrite))
+            .await?;
+        if !matches!(access::catalog_scope(&principal), CatalogScope::All) {
+            return Err(outside_scope());
+        }
+        let rows = runtime
+            .read_items(&mut tx, vec![selection.clone()], Some(id.into()))
+            .await
+            .map_err(native_read_error)?;
+        if rows.is_empty() {
+            return Err(Problem::not_found());
+        }
+        let original = command.clone();
+        let subject = id.to_owned();
+        let handle = tokio::runtime::Handle::current();
+        let dispatch_caller = caller.clone();
+        let guarded = runtime
+            .guard_work_and_commit(tx, id.into(), expected, move |host, tx, _| {
+                handle
+                    .block_on(
+                        dispatch_caller.reauthorize(&mut **tx, Some(Permission::CatalogWrite)),
+                    )
+                    .map_err(|e| anyhow::anyhow!(e.detail))?;
+                let (_, attempt) = handle.block_on(
+                    motion_catalog_backend::command_attempts::latest_in(tx, &original),
+                )?;
+                let (outcome, witness) =
+                    crate::native_catalog::Runtime::execute_metadata_with_host(
+                        host,
+                        &attempt,
+                        subject.clone(),
+                    )?;
+                if let Some(witness) = witness {
+                    handle.block_on(motion_catalog_backend::command_attempts::record_next_in(
+                        tx, &original, &attempt, witness,
+                    ))?;
+                    return Ok(true);
+                }
+                anyhow::ensure!(
+                    matches!(
+                        outcome,
+                        catabolic_store::catalog_commands::CommandOutcome::Committed { .. }
+                            | catabolic_store::catalog_commands::CommandOutcome::Replay { .. }
+                    ),
+                    "native metadata command requires reconciliation: {}",
+                    outcome.code()
+                );
+                handle.block_on(
+                    sqlx::query("INSERT INTO change_events(topic,resource_id) VALUES('catalog',?)")
+                        .bind(&subject)
+                        .execute(&mut **tx),
+                )?;
+                Ok(false)
+            })
+            .await
+            .map_err(native_read_error)?;
+        match guarded {
+            crate::native_catalog::Guarded::Mismatch(_) => {
+                return Err(Problem::new(
+                    StatusCode::PRECONDITION_FAILED,
+                    "precondition_failed",
+                    "The resource revision has changed",
+                ));
+            }
+            crate::native_catalog::Guarded::Applied { value: true, .. } => continue,
+            crate::native_catalog::Guarded::Applied { value: false, .. } => break,
+        }
+    }
+    runtime
+        .rebuild_projection()
+        .await
+        .map_err(native_read_error)?;
+    get_native_item(app, caller, id).await
+}
+
 /// Replaces the curated title (the origin the metadata projection falls back
 /// to) and the logical kind. Hierarchy placement is kept; library membership
 /// is derived from files and must be sent unchanged.
@@ -930,10 +2113,29 @@ pub async fn replace_item(
 ) -> Result<Response, Problem> {
     caller.require(Permission::CatalogWrite)?;
     let expected = if_match(&headers)?;
+    let request_digest = body.digest;
     let input = body.value;
     let title = text("title", &input.title, 500)?;
     valid_ids("library_ids", &input.library_ids, 100)?;
     let (media_type, family) = storage_kind(input.kind).ok_or_else(unsupported_kind)?;
+    if app.native_catalog.is_some() {
+        if !input.library_ids.is_empty() {
+            return Err(derived_membership());
+        }
+        if family.is_some_and(|kind| kind != "video") {
+            return Err(unsupported_kind());
+        }
+        return replace_native_work(
+            &app,
+            &caller,
+            &id,
+            expected,
+            title,
+            media_type,
+            &request_digest,
+        )
+        .await;
+    }
     let _guard = app.jobs.lock().await;
     let mut tx = begin_write(&app.db).await?;
     let principal = caller
@@ -1050,6 +2252,9 @@ pub async fn list_editions(
     Query(q): Query<PageQuery>,
 ) -> Result<Json<Page<EditionBody>>, Problem> {
     caller.require(Permission::CatalogRead)?;
+    if app.native_catalog.is_some() {
+        return native_details::editions(&app, &caller, &id, q).await;
+    }
     let limit = q.limit()?;
     let scope = access::catalog_scope(&caller.principal);
     let (clause, all, ids) = scope_clause(&scope, "f.library_id");
@@ -1095,6 +2300,9 @@ pub async fn create_edition(
     body: Body<EditionInput>,
 ) -> Result<Response, Problem> {
     caller.require(Permission::CatalogWrite)?;
+    if app.native_catalog.is_some() {
+        return native_editions::create(State(app), caller, Path(id), headers, body).await;
+    }
     let expected = if_match(&headers)?;
     let key = idempotency_key(&headers)?;
     let (input, digest) = (body.value, body.digest);
@@ -1688,6 +2896,9 @@ pub async fn list_timelines(
     Query(q): Query<PageQuery>,
 ) -> Result<Response, Problem> {
     caller.require(Permission::CatalogRead)?;
+    if app.native_catalog.is_some() {
+        return native_details::timelines(&app, &caller, &id, q).await;
+    }
     let scope = access::catalog_scope(&caller.principal);
     let mut tx = app.db.begin().await?;
     let (item, _) = load_item(&mut tx, &scope, &id, true).await?;
@@ -1710,6 +2921,9 @@ pub async fn get_timeline(
     Path(id): Path<String>,
 ) -> Result<Response, Problem> {
     caller.require(Permission::CatalogRead)?;
+    if app.native_catalog.is_some() {
+        return native_details::timeline(&app, &caller, &id).await;
+    }
     let scope = access::catalog_scope(&caller.principal);
     let mut tx = app.db.begin().await?;
     let row: TimelineRow = sqlx::query_as(
@@ -1734,6 +2948,9 @@ pub async fn list_versions(
     Query(q): Query<PageQuery>,
 ) -> Result<Response, Problem> {
     caller.require(Permission::CatalogRead)?;
+    if app.native_catalog.is_some() {
+        return native_details::versions(&app, &caller, &id, q).await;
+    }
     let scope = access::catalog_scope(&caller.principal);
     let mut tx = app.db.begin().await?;
     let item: String = sqlx::query_scalar(
@@ -2239,6 +3456,10 @@ pub async fn create_relationship(
     headers: HeaderMap,
     body: Body<RelationshipInput>,
 ) -> Result<Response, Problem> {
+    if app.native_catalog.is_some() {
+        return native_relationship_writes::create(State(app), caller, Path(id), headers, body)
+            .await;
+    }
     caller.require(Permission::CatalogWrite)?;
     let expected = if_match(&headers)?;
     let key = idempotency_key(&headers)?;
@@ -2297,6 +3518,9 @@ pub async fn get_relationship(
     caller: Caller,
     Path(id): Path<String>,
 ) -> Result<Response, Problem> {
+    if app.native_catalog.is_some() {
+        return native_relationships::get(State(app), caller, Path(id)).await;
+    }
     caller.require(Permission::CatalogRead)?;
     let mut tx = app.db.begin().await?;
     let value = relationship(&mut tx, &access::catalog_scope(&caller.principal), &id).await?;
@@ -2313,6 +3537,9 @@ pub async fn delete_relationship(
     Path(id): Path<String>,
     headers: HeaderMap,
 ) -> Result<Response, Problem> {
+    if app.native_catalog.is_some() {
+        return native_relationship_writes::delete(State(app), caller, Path(id), headers).await;
+    }
     caller.require(Permission::CatalogWrite)?;
     let expected = if_match(&headers)?;
     let _guard = app.jobs.lock().await;
@@ -2342,6 +3569,9 @@ pub async fn list_relationships(
     Path(id): Path<String>,
     Query(q): Query<PageQuery>,
 ) -> Result<Response, Problem> {
+    if app.native_catalog.is_some() {
+        return native_relationships::list(State(app), caller, Path(id), Query(q)).await;
+    }
     caller.require(Permission::CatalogRead)?;
     let mut tx = app.db.begin().await?;
     let scope = access::catalog_scope(&caller.principal);
@@ -2451,4 +3681,30 @@ async fn files_page(
     let value = page(&mut tx, &caller.principal, values, limit).await?;
     tx.commit().await?;
     Ok(Json(value).into_response())
+}
+
+#[cfg(test)]
+mod native_projection_tests {
+    use super::*;
+    #[test]
+    fn imported_or_richer_records_never_become_empty_plain_dtos() {
+        let metadata = serde_json::json!({"title":"Native", "motion_catalog":{
+            "contract_version":1,"item_id":"work","kind":"video","catalog_revision":1,"media_type":"movie",
+            "parent_id":null,"match_state":"unmatched"
+        }});
+        let row = serde_json::json!(["work", "video", metadata.to_string()]);
+        assert!(plain_native_work(&row).is_err());
+        let mut metadata = metadata;
+        metadata["motion_catalog"]["creation_request_digest"] = Value::String("digest".into());
+        let row = serde_json::json!(["work", "video", metadata.to_string()]);
+        let body = plain_native_work(&row).unwrap();
+        assert_eq!(body.id, "work");
+        assert_eq!(body.title, "Native");
+        assert_eq!(body.availability, "unknown");
+        assert!(body.library_ids.is_empty());
+        metadata["motion_catalog"]["parent_id"] = Value::String("parent".into());
+        assert!(
+            plain_native_work(&serde_json::json!(["work", "video", metadata.to_string()])).is_err()
+        );
+    }
 }

@@ -101,6 +101,21 @@ func (f *Jobs) SetPhase(id, phase string) {
 	}
 }
 
+// SetControls replaces an observation without changing the job revision:
+// permission/publication hints can change independently of the job row.
+func (f *Jobs) SetControls(id string, controls *api.JobControls) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if i := f.index(id); i >= 0 {
+		if controls == nil {
+			f.jobs[i].Controls = nil
+		} else {
+			copy := *controls
+			f.jobs[i].Controls = &copy
+		}
+	}
+}
+
 func (f *Jobs) index(id string) int {
 	for i, j := range f.jobs {
 		if j.ID == id {

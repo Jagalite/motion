@@ -75,8 +75,18 @@ pub struct Waiter {
     pub units: u32,
 }
 
+fn admission_is_open(closed: &bool) -> bool {
+    !*closed
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Ledger {
+    /// Terminal process-owner admission. No transition reopens it.
+    #[serde(default, skip_serializing_if = "admission_is_open")]
+    pub admission_closed: bool,
+    /// Terminal shutdown has refused new admission, but actual owners may remain.
+    #[serde(default, skip_serializing_if = "admission_is_open")]
+    pub admission_draining: bool,
     pub budget: Budget,
     /// Keyed by ticket.
     pub held: BTreeMap<u64, Reservation>,
@@ -90,6 +100,10 @@ pub struct Ledger {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Input {
+    /// Close only when every reservation and waiter has genuinely exited.
+    CloseAdmission,
+    /// Refuse new requests immediately without claiming existing owners exited.
+    BeginDrain,
     Request {
         owner: String,
         class: Class,
@@ -137,6 +151,8 @@ pub enum Effect {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Rejection {
+    /// Terminal service shutdown has closed reservation admission.
+    AdmissionClosed,
     ExceedsBudget,
     OwnerConflict,
     TicketsExhausted,
@@ -146,6 +162,8 @@ impl Ledger {
     pub fn new(budget: Budget) -> Self {
         assert!(budget.valid(), "invalid execution budget");
         Self {
+            admission_closed: false,
+            admission_draining: false,
             budget,
             held: BTreeMap::new(),
             waiting: Vec::new(),
@@ -231,6 +249,9 @@ impl Ledger {
     /// it is blocked only by stuck capacity, which may never be returned; then later
     /// waiters may proceed. Once the stuck owner exits it regains its priority.
     fn admit(&mut self, effects: &mut Vec<Effect>) {
+        if self.admission_draining || self.admission_closed {
+            return;
+        }
         'admit: loop {
             for index in self.ordered() {
                 let w = &self.waiting[index];
@@ -265,7 +286,26 @@ impl Ledger {
 pub fn transition(before: &Ledger, input: &Input) -> (Ledger, Vec<Effect>) {
     let mut next = before.clone();
     let mut effects = Vec::new();
+    if next.admission_closed || next.admission_draining {
+        if let Input::Request { owner, .. } | Input::Adopt { owner, .. } = input {
+            effects.push(Effect::Rejected {
+                owner: owner.clone(),
+                reason: Rejection::AdmissionClosed,
+            });
+            return (next, effects);
+        }
+    }
     match input {
+        Input::BeginDrain => {
+            if !next.admission_closed {
+                next.admission_draining = true;
+            }
+        }
+        Input::CloseAdmission => {
+            if next.held.is_empty() && next.waiting.is_empty() {
+                next.admission_closed = true;
+            }
+        }
         Input::Request {
             owner,
             class,
@@ -388,14 +428,14 @@ pub fn transition(before: &Ledger, input: &Input) -> (Ledger, Vec<Effect>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    fn request(owner: &str, class: Class, units: u32) -> Input {
+    pub(super) fn request(owner: &str, class: Class, units: u32) -> Input {
         Input::Request {
             owner: owner.into(),
             class,
             units,
         }
     }
-    fn run(ledger: &mut Ledger, input: Input) -> Vec<Effect> {
+    pub(super) fn run(ledger: &mut Ledger, input: Input) -> Vec<Effect> {
         let (next, effects) = transition(ledger, &input);
         *ledger = next;
         effects
@@ -410,7 +450,7 @@ mod tests {
     fn start(ticket: u64) -> Effect {
         Effect::Start { ticket }
     }
-    fn released(ticket: u64, units: u32) -> Effect {
+    pub(super) fn released(ticket: u64, units: u32) -> Effect {
         Effect::Released { ticket, units }
     }
 
@@ -590,5 +630,126 @@ mod tests {
             act(&mut l, Input::Exited { ticket: 2 }),
             [released(2, 2), start(3)]
         );
+    }
+}
+
+#[cfg(test)]
+mod terminal_tests {
+    use super::tests::{released, request, run};
+    use super::*;
+    #[test]
+    fn terminal_close_requires_real_exit_and_is_absorbing_for_admission() {
+        let empty = Ledger::new(Budget {
+            units: 2,
+            interactive_reserve: 0,
+        });
+        let (held, _) = transition(
+            &empty,
+            &Input::Request {
+                owner: "held".into(),
+                class: Class::Preparation,
+                units: 1,
+            },
+        );
+        let (refused, _) = transition(&held, &Input::CloseAdmission);
+        assert_eq!(held, refused);
+        let (empty, _) = transition(&held, &Input::Exited { ticket: 1 });
+        let (closed, _) = transition(&empty, &Input::CloseAdmission);
+        assert!(closed.admission_closed);
+        assert_eq!(transition(&closed, &Input::CloseAdmission).0, closed);
+        for input in [
+            Input::Request {
+                owner: "late".into(),
+                class: Class::Preparation,
+                units: 1,
+            },
+            Input::Adopt {
+                owner: "late".into(),
+                class: Class::Preparation,
+                units: 1,
+            },
+        ] {
+            let (next, effects) = transition(&closed, &input);
+            assert_eq!(next, closed);
+            assert!(matches!(
+                effects.as_slice(),
+                [Effect::Rejected {
+                    reason: Rejection::AdmissionClosed,
+                    ..
+                }]
+            ));
+        }
+    }
+    #[test]
+    fn draining_blocks_admission_without_releasing_holders_or_starting_waiters() {
+        let mut ledger = Ledger::new(Budget {
+            units: 1,
+            interactive_reserve: 0,
+        });
+        run(&mut ledger, request("held", Class::Preparation, 1));
+        run(&mut ledger, request("queued", Class::Preparation, 1));
+        let before = ledger.clone();
+        assert!(run(&mut ledger, Input::BeginDrain).is_empty());
+        assert!(ledger.admission_draining);
+        assert!(!ledger.admission_closed);
+        assert_eq!(ledger.held, before.held);
+        assert_eq!(ledger.waiting, before.waiting);
+        assert!(run(&mut ledger, Input::BeginDrain).is_empty());
+        for input in [
+            request("new", Class::Preparation, 1),
+            Input::Adopt {
+                owner: "recovery".into(),
+                class: Class::Preparation,
+                units: 1,
+            },
+        ] {
+            let before = ledger.clone();
+            assert!(matches!(
+                run(&mut ledger, input).as_slice(),
+                [Effect::Rejected {
+                    reason: Rejection::AdmissionClosed,
+                    ..
+                }]
+            ));
+            assert_eq!(ledger, before);
+        }
+        assert!(run(&mut ledger, Input::CloseAdmission).is_empty());
+        assert!(!ledger.admission_closed);
+        assert_eq!(
+            run(&mut ledger, Input::Cancel { ticket: 1 }),
+            [Effect::Terminate { ticket: 1 }]
+        );
+        assert!(run(&mut ledger, Input::Stuck { ticket: 1 }).is_empty());
+        assert_eq!(
+            run(&mut ledger, Input::Exited { ticket: 1 }),
+            [released(1, 1)]
+        );
+        assert!(ledger.is_waiting(2));
+        run(&mut ledger, Input::CloseAdmission);
+        assert!(!ledger.admission_closed);
+        assert!(run(&mut ledger, Input::Cancel { ticket: 2 }).is_empty());
+        run(&mut ledger, Input::CloseAdmission);
+        assert!(ledger.admission_closed);
+        assert!(ledger.admission_draining);
+    }
+    #[test]
+    fn historical_open_codec_stays_unchanged_and_closed_roundtrips() {
+        let open = Ledger::new(Budget {
+            units: 2,
+            interactive_reserve: 0,
+        });
+        let value = serde_json::to_value(&open).unwrap();
+        assert!(value.get("admission_closed").is_none());
+        assert!(value.get("admission_draining").is_none());
+        assert_eq!(serde_json::from_value::<Ledger>(value).unwrap(), open);
+        let (draining, _) = transition(&open, &Input::BeginDrain);
+        let value = serde_json::to_value(&draining).unwrap();
+        assert_eq!(value["admission_draining"], true);
+        assert!(value.get("admission_closed").is_none());
+        assert_eq!(serde_json::from_value::<Ledger>(value).unwrap(), draining);
+        let (closed, _) = transition(&open, &Input::CloseAdmission);
+        let value = serde_json::to_value(&closed).unwrap();
+        assert_eq!(value["admission_closed"], true);
+        assert_eq!(serde_json::from_value::<Ledger>(value).unwrap(), closed);
     }
 }

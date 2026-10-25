@@ -34,13 +34,93 @@ func (b fixtureBackend) RetryJob(ctx context.Context, id, key, etag string) (api
 
 func processing(t *testing.T, jobs ...api.Job) (Model, *opstest.Jobs) {
 	t.Helper()
+	return processingWithFeatures(t, nil, jobs...)
+}
+
+func processingWithFeatures(t *testing.T, features []api.Feature, jobs ...api.Job) (Model, *opstest.Jobs) {
+	t.Helper()
 	f := opstest.NewJobs(jobs...)
-	m := New(context.Background(), fixtureBackend{&fake{permissions: []string{api.PermProcessingRequest}}, f}, "http://srv", nil)
+	m := New(context.Background(), fixtureBackend{&fake{permissions: []string{api.PermProcessingRequest}, features: features}, f}, "http://srv", nil)
 	m, _ = update(t, m, tea.WindowSizeMsg{Width: 100, Height: 30})
 	m = drain(t, m, m.reloadAll())
 	m.focus = focusContent
 	m = goTo(t, m, route{page: pageProcessing})
 	return m, f
+}
+
+func nativeJobReadFeatures() []api.Feature {
+	return []api.Feature{
+		{ID: "catalog.v2", Implemented: false, Enabled: false},
+		{ID: "processing.renditions", Implemented: false, Enabled: false},
+		{ID: "processing.native_job_reads", Implemented: true, Enabled: true},
+	}
+}
+
+func TestNativeJobReadCapabilityKeepsListAndInspectionWithoutControls(t *testing.T) {
+	m, f := processingWithFeatures(t, nativeJobReadFeatures(),
+		api.Job{ID: "j1", Kind: "rendition", Phase: "running"},
+		api.Job{ID: "j2", Kind: "rendition", Phase: "failed"})
+	jobs, ok := data[[]api.Job](m, keyJobs)
+	if !ok || len(jobs) != 2 || !m.readOnlyJobs() {
+		t.Fatalf("native read-only jobs not loaded: %+v", jobs)
+	}
+	m = selectJob(t, m, "j1")
+	m = press(t, m, "enter", "c", "y")
+	m = selectJob(t, m, "j2")
+	m = press(t, m, "R", "y")
+	if m.confirm.open() || len(m.acting) != 0 || ops(f.Calls()) != "get j1 " {
+		t.Fatalf("read-only controls dispatched: confirm=%+v calls=%s", m.confirm, ops(f.Calls()))
+	}
+	inspect := false
+	for _, binding := range m.shortHelp() {
+		for _, shortcut := range binding.Keys() {
+			if shortcut == "c" || shortcut == "R" {
+				t.Fatalf("read-only help advertised mutation: %+v", binding.Help())
+			}
+			inspect = inspect || shortcut == "enter"
+		}
+	}
+	if !inspect || !strings.Contains(screen(m), "Read-only rendition job history") {
+		t.Fatalf("read-only help omitted inspection or explanation: %s", screen(m))
+	}
+	for _, group := range m.fullHelp() {
+		for _, binding := range group {
+			if binding.Help().Desc == "cancel job" || binding.Help().Desc == "retry job" {
+				t.Fatalf("full help advertised native mutation: %+v", binding.Help())
+			}
+		}
+	}
+}
+
+func TestNativeJobReadCapabilityWithdrawsPendingMutation(t *testing.T) {
+	m, f := processing(t, api.Job{ID: "j1", Kind: "rendition", Phase: "failed"})
+	m = selectJob(t, m, "j1")
+	m = press(t, m, "R")
+	if !m.confirm.open() {
+		t.Fatal("older-server retry behavior should remain available")
+	}
+	b := m.backend.(fixtureBackend)
+	b.fake.features = nativeJobReadFeatures()
+	m = drain(t, m, m.load(keySession))
+	m = press(t, m, "y")
+	if m.confirm.open() || len(m.acting) != 0 || ops(f.Calls()) != "get j1 " {
+		t.Fatalf("stale confirmation dispatched after read-only capability: %s", ops(f.Calls()))
+	}
+}
+
+func TestNativeJobReadCapabilityRejectsDelayedRetryReview(t *testing.T) {
+	m, f := processing(t, api.Job{ID: "j1", Kind: "rendition", Phase: "failed"})
+	m = selectJob(t, m, "j1")
+	replies := messages(t, m.inspectJob("j1", true))
+	b := m.backend.(fixtureBackend)
+	b.fake.features = nativeJobReadFeatures()
+	m = drain(t, m, m.load(keySession))
+	for _, reply := range replies {
+		m, _ = update(t, m, reply)
+	}
+	if m.confirm.open() || ops(f.Calls()) != "get j1 " {
+		t.Fatalf("late review advertised a native mutation: %+v", m.confirm)
+	}
 }
 
 func selectJob(t *testing.T, m Model, id string) Model {
@@ -230,7 +310,7 @@ func TestLaunchConsultsCurrentCapabilitiesNotTheCache(t *testing.T) {
 	opened := 0
 	m.openBrowser = func(context.Context, string) error { opened++; return nil }
 	f.mu.Lock()
-	f.features = []api.Feature{{ID: "playback.v2", Implemented: true, Enabled: true}}
+	f.features = []api.Feature{{ID: "playback.v2", Implemented: true, Enabled: true, Limits: map[string]string{"routes": "original,prepared", "timeline_binding": "whole", "subtitles": "off"}}}
 	f.mu.Unlock()
 	m = drain(t, m, m.launch("t1"))
 	if opened != 1 || m.notice.err || !m.canPlay() {

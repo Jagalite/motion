@@ -10,11 +10,10 @@ use super::{
     Body, Page, PageQuery, Problem, Scope,
     auth::Caller,
     catalog::{self, TimelineRow},
-    content::file_facts,
     etag, idempotency_key, if_match, page,
-    playback::{readable_timeline, usable_profile},
+    playback::{begin_catalog_application, readable_timeline, usable_profile},
 };
-use crate::{App, db::begin_write, delivery, new_id, now};
+use crate::{App, delivery, new_id, now};
 use axum::{
     Json,
     extract::{Path, Query, State},
@@ -29,6 +28,8 @@ use playscale_core::{
 use serde::Deserialize;
 use serde_json::{Value, json};
 use sqlx::SqliteConnection;
+
+mod native_continue;
 
 impl From<Error> for Problem {
     fn from(e: Error) -> Self {
@@ -351,8 +352,11 @@ pub async fn get_viewing(
     Path((profile, timeline)): Path<(String, String)>,
 ) -> Result<Response, Problem> {
     caller.require(Permission::CatalogRead)?;
-    let mut tx = app.db.begin().await?;
-    admit_view(&mut tx, &caller.principal, &profile, &timeline).await?;
+    let mut tx = begin_catalog_application(&app, false).await?;
+    let principal = caller
+        .reauthorize(&mut tx, Some(Permission::CatalogRead))
+        .await?;
+    admit_view(&mut tx, &principal, &profile, &timeline).await?;
     let view = load_view(&mut tx, &profile, &timeline).await?;
     tx.commit().await?;
     Ok(tagged(
@@ -409,7 +413,7 @@ pub async fn put_viewing(
 ) -> Result<Response, Problem> {
     caller.require(Permission::ViewingWrite)?;
     let expected = if_match(&headers)?;
-    let mut tx = begin_write(&app.db).await?;
+    let mut tx = begin_catalog_application(&app, true).await?;
     let principal = caller
         .reauthorize(&mut tx, Some(Permission::ViewingWrite))
         .await?;
@@ -454,12 +458,18 @@ pub async fn continue_watching(
     Path(profile): Path<String>,
     Query(q): Query<PageQuery>,
 ) -> Result<Response, Problem> {
+    if app.native_catalog.is_some() {
+        return native_continue::read(&app, &caller, &profile, &q).await;
+    }
     caller.require(Permission::CatalogRead)?;
     let limit = q.limit()?;
     let after = keyset(&q)?;
-    let scope = access::catalog_scope(&caller.principal);
-    let mut tx = app.db.begin().await?;
-    usable_profile(&mut tx, &caller.principal, &profile).await?;
+    let mut tx = begin_catalog_application(&app, false).await?;
+    let principal = caller
+        .reauthorize(&mut tx, Some(Permission::CatalogRead))
+        .await?;
+    let scope = access::catalog_scope(&principal);
+    usable_profile(&mut tx, &principal, &profile).await?;
     let (clause, all, ids) = super::scope_clause(&scope, "f.library_id");
     // Resumable (positively progressed, effectively unwatched) timelines whose
     // work has an original in scope, newest first. Scope is applied before
@@ -483,12 +493,11 @@ pub async fn continue_watching(
     .await?;
     let mut entries = Vec::new();
     for (timeline_id, updated_at) in rows {
-        let row: TimelineRow = sqlx::query_as(
-            "SELECT t.*,e.item_id FROM timelines t JOIN editions e ON e.id=t.edition_id WHERE t.id=?",
-        )
-        .bind(&timeline_id)
-        .fetch_one(&mut *tx)
-        .await?;
+        let row = match readable_timeline(&mut tx, &principal, &timeline_id).await {
+            Ok(row) => row,
+            Err(p) if p.status == StatusCode::NOT_FOUND => continue,
+            Err(p) => return Err(p),
+        };
         let Ok((item_row, _)) = catalog::load_item(&mut tx, &scope, &row.item_id, false).await
         else {
             continue;
@@ -501,7 +510,7 @@ pub async fn continue_watching(
             json!({"item": item, "timeline": timeline, "viewing": view_json(&profile, &timeline_id, &view)}),
         ));
     }
-    let value: Page<Value> = page(&mut tx, &caller.principal, entries, limit).await?;
+    let value: Page<Value> = page(&mut tx, &principal, entries, limit).await?;
     tx.commit().await?;
     Ok(Json(value).into_response())
 }
@@ -518,9 +527,12 @@ pub async fn next_timeline(
     Path((profile, timeline)): Path<(String, String)>,
 ) -> Result<Response, Problem> {
     caller.require(Permission::CatalogRead)?;
-    let scope = access::catalog_scope(&caller.principal);
-    let mut tx = app.db.begin().await?;
-    let current = admit_view(&mut tx, &caller.principal, &profile, &timeline).await?;
+    let mut tx = begin_catalog_application(&app, false).await?;
+    let principal = caller
+        .reauthorize(&mut tx, Some(Permission::CatalogRead))
+        .await?;
+    let scope = access::catalog_scope(&principal);
+    let current = admit_view(&mut tx, &principal, &profile, &timeline).await?;
     let placed: Option<(Option<String>, Option<i64>)> =
         sqlx::query_as("SELECT order_group_id,order_position FROM timelines WHERE id=?")
             .bind(&current.id)
@@ -539,14 +551,14 @@ pub async fn next_timeline(
         .fetch_all(&mut *tx)
         .await?;
         for id in candidates {
-            let Ok(row) = readable_timeline(&mut tx, &caller.principal, &id).await else {
+            let Ok(row) = readable_timeline(&mut tx, &principal, &id).await else {
                 continue;
             };
             values.push((id, catalog::timeline_body(&mut tx, &scope, row).await?));
             break;
         }
     }
-    let value = page(&mut tx, &caller.principal, values, 1).await?;
+    let value = page(&mut tx, &principal, values, 1).await?;
     tx.commit().await?;
     Ok(Json(value).into_response())
 }
@@ -599,7 +611,7 @@ pub async fn create_viewing(
     let input = body.value;
     let expected = decimal(&input.expected_viewing_revision)
         .ok_or_else(|| Problem::invalid("invalid_revision", "Invalid viewing revision"))?;
-    let mut tx = begin_write(&app.db).await?;
+    let mut tx = begin_catalog_application(&app, true).await?;
     let principal = caller
         .reauthorize(&mut tx, Some(Permission::ViewingWrite))
         .await?;
@@ -628,7 +640,7 @@ pub async fn create_viewing(
     }
     let (owner, duration) =
         open_delivery(&app, &input.delivery_id).ok_or_else(Problem::not_found)?;
-    let facts = file_facts(&mut tx, &owner.file).await?;
+    let facts = super::content::transport_file_facts(&mut tx, &principal, &owner.file).await?;
     if !session_core::may_view(&owner, &principal, facts.as_ref()) {
         return Err(Problem::not_found());
     }
@@ -696,8 +708,11 @@ pub async fn get_viewing_session(
     caller: Caller,
     Path(id): Path<String>,
 ) -> Result<Response, Problem> {
-    let mut tx = app.db.begin().await?;
-    let row = recordable(&mut tx, &caller.principal, &id).await?;
+    let mut tx = begin_catalog_application(&app, false).await?;
+    let principal = caller
+        .reauthorize(&mut tx, Some(Permission::ViewingWrite))
+        .await?;
+    let row = recordable(&mut tx, &principal, &id).await?;
     tx.commit().await?;
     Ok(tagged(
         StatusCode::OK,
@@ -750,7 +765,7 @@ pub async fn record_viewing(
     if event.sequence >= 1 << 53 || event.generation >= 1 << 53 {
         return Err(invalid());
     }
-    let mut tx = begin_write(&app.db).await?;
+    let mut tx = begin_catalog_application(&app, true).await?;
     let principal = caller
         .reauthorize(&mut tx, Some(Permission::ViewingWrite))
         .await?;
@@ -835,14 +850,14 @@ pub async fn replace_viewing_delivery(
     caller.require(Permission::ViewingWrite)?;
     let expected = if_match(&headers)?;
     let delivery_id = body.value.delivery_id;
-    let mut tx = begin_write(&app.db).await?;
+    let mut tx = begin_catalog_application(&app, true).await?;
     let principal = caller
         .reauthorize(&mut tx, Some(Permission::ViewingWrite))
         .await?;
     require_history_identity(&mut tx, &headers).await?;
     let row = recordable(&mut tx, &principal, &id).await?;
     let (owner, duration) = open_delivery(&app, &delivery_id).ok_or_else(Problem::not_found)?;
-    let facts = file_facts(&mut tx, &owner.file).await?;
+    let facts = super::content::transport_file_facts(&mut tx, &principal, &owner.file).await?;
     if !session_core::may_view(&owner, &principal, facts.as_ref()) {
         return Err(Problem::not_found());
     }

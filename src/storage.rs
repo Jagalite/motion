@@ -1,4 +1,5 @@
 //! Local operational storage: bounded logs, verifiable snapshots, and retention.
+pub(crate) mod native_history;
 use crate::{
     App,
     api::{ApiError, admin},
@@ -194,12 +195,21 @@ pub async fn backup(app: &App) -> anyhow::Result<Snapshot> {
     .await?;
     result
 }
+async fn legacy_publication_custody(
+    db: &sqlx::SqlitePool,
+) -> anyhow::Result<sqlx::Transaction<'static, sqlx::Sqlite>> {
+    let mut custody = db.begin_with("BEGIN IMMEDIATE").await?;
+    crate::db::require_legacy_single_database(&mut custody).await?;
+    Ok(custody)
+}
+
 async fn make_snapshot(
     app: &App,
     permit: Arc<tokio::sync::OwnedSemaphorePermit>,
     requested: Option<String>,
     include_generated: bool,
 ) -> anyhow::Result<Snapshot> {
+    crate::db::require_legacy_single_database(&mut *app.db.acquire().await?).await?;
     let pages: i64 = sqlx::query_scalar("PRAGMA page_count")
         .fetch_one(&app.db)
         .await?;
@@ -249,6 +259,7 @@ async fn make_snapshot(
         .filename(&database)
         .read_only(true);
     let mut check = sqlx::SqliteConnection::connect_with(&options).await?;
+    crate::db::require_legacy_single_database(&mut check).await?;
     let integrity: Vec<String> = sqlx::query_scalar("PRAGMA integrity_check")
         .fetch_all(&mut check)
         .await?;
@@ -283,7 +294,11 @@ async fn make_snapshot(
     check.close().await?;
     let keep = app.storage.settings.backups_keep;
     let min_free = app.storage.settings.min_free_bytes;
+    // The copy is already complete. Never VACUUM under this writer. Binding
+    // must commit before this check (refuse) or after durable publication.
+    let custody = legacy_publication_custody(&app.db).await?;
     blocking(permit, move || {
+        let _publication_custody = custody;
         use sha2::{Digest, Sha256};
         let mut file = std::fs::File::open(&database)?;
         let mut hash = Sha256::new();
@@ -540,6 +555,9 @@ pub(crate) async fn requested_backup(
     include_generated: bool,
     permit: Arc<tokio::sync::OwnedSemaphorePermit>,
 ) -> anyhow::Result<VerifiedBackup> {
+    // Must run even for an existing destination: an old Motion-only artifact
+    // cannot become a recoverable native pair by idempotent reuse.
+    crate::db::require_legacy_single_database(&mut *app.db.acquire().await?).await?;
     let _maintenance = app.processing.maintenance.lock().await;
     let name = format!("request-{id}");
     let destination = app.storage.root.join("backups").join(&name);
@@ -572,6 +590,7 @@ pub(crate) async fn requested_backup(
         .filename(destination.join("playscale.sqlite3"))
         .read_only(true);
     let mut check = sqlx::SqliteConnection::connect_with(&options).await?;
+    crate::db::require_legacy_single_database(&mut check).await?;
     let integrity: Vec<String> = sqlx::query_scalar("PRAGMA integrity_check")
         .fetch_all(&mut check)
         .await?;
@@ -592,7 +611,11 @@ pub(crate) async fn requested_backup(
     check.close().await?;
     let expected_assets=serde_json::json!(assets.into_iter().map(|(id,bytes)|serde_json::json!({"asset_id":id,"bytes":bytes.to_string(),"storage":"database"})).collect::<Vec<_>>());
     let expected_media=serde_json::json!(media.into_iter().map(|(id,revision,bytes)|serde_json::json!({"file_id":id,"file_revision":revision,"path":format!("generated/{id}"),"bytes":bytes.to_string(),"sha256":revision})).collect::<Vec<_>>());
+    // Old-directory reuse has the same current-source linearization point as
+    // a new publication, not merely a successful entry-time check.
+    let custody = legacy_publication_custody(&app.db).await?;
     blocking(permit, move || {
+        let _acknowledgment_custody = custody;
         let manifest = read_backup_manifest(&destination)?;
         let value: serde_json::Value = serde_json::from_slice(&manifest)?;
         anyhow::ensure!(
@@ -730,3 +753,7 @@ mod tests {
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
     }
 }
+
+#[cfg(test)]
+#[path = "storage_native_backup_tests.rs"]
+mod native_backup_tests;

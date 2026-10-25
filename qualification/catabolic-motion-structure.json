@@ -1,0 +1,90 @@
+{
+  "base_commit": "4594ef70c83894e37f216e70ea65f6dd170602cf",
+  "catabolic_commit": "6969f08c5d9b207afe8eec819555759be136644d",
+  "source_sha256": {
+    "crates/catalog-backend/src/motion_export.rs": "fd032a2af7e0eeba43a1dd937c112fbe97cec7e76760fbd81db874ff1e91ff56",
+    "crates/catalog-backend/tests/motion_export.rs": "f0a1cb5cf09f84562ae37350f694a420036b1053a5b0ee178b5394afaa53d063"
+  },
+  "kyoto_jobs": [
+    {
+      "id": "b9ef54604aa14d3890fe3b23895a2c1f",
+      "status": "succeeded",
+      "command": [
+        "cargo",
+        "test",
+        "-p",
+        "motion-catalog-backend",
+        "-j",
+        "1",
+        "--config",
+        "profile.dev.debug=0",
+        "--config",
+        "profile.test.debug=0",
+        "--no-run"
+      ]
+    },
+    {
+      "id": "9da481a3de2943d79ad28371f321fd49",
+      "status": "succeeded",
+      "command": [
+        "cargo",
+        "clippy",
+        "-p",
+        "motion-catalog-backend",
+        "--all-targets",
+        "-j",
+        "1",
+        "--config",
+        "profile.dev.debug=0",
+        "--config",
+        "profile.test.debug=0",
+        "--",
+        "-D",
+        "warnings"
+      ]
+    }
+  ],
+  "executions": [
+    {
+      "binary": "target/debug/deps/motion_catalog_backend-881985bb4926479f",
+      "exit_code": 0,
+      "log": "artifacts/catabolic-integration/structure-final-motion_catalog_backend.log",
+      "binary_sha256": "0ee688e9686fadf3fb37fcc414f10b486cd293c885e496bb575d981e606db209",
+      "log_sha256": "8ac30ab2fd30e72521ab869fe249983946e7ead2ab0d67844f9676ebd8f692e9",
+      "summary": "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.95s"
+    },
+    {
+      "binary": "target/debug/deps/motion_export-e11a138e69012b90",
+      "exit_code": 0,
+      "log": "artifacts/catabolic-integration/structure-final-motion_export.log",
+      "binary_sha256": "c5fa408d7d1f2582d34813035bb4994fc82af2feda91b3137c809f47c0fbaaf0",
+      "log_sha256": "32e095dfc48c0ff54b5c4b66f32a76867da206b93364da00a6bbc26944f85d2f",
+      "summary": "test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 31.80s"
+    },
+    {
+      "binary": "target/debug/deps/native-0b62a5052064d916",
+      "exit_code": 0,
+      "log": "artifacts/catabolic-integration/structure-final-native.log",
+      "binary_sha256": "4947287b204e9c8f1147aaa7057be5aaec6ad2c03cba66b4f1f550ba7afe7f9d",
+      "log_sha256": "be71309a6e82545e0ec84a6a90b7b8cab65b8fcaf13b8ff7854665553d9b2178",
+      "summary": "test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 24.41s"
+    }
+  ],
+  "earlier_failures": [
+    "initial fixture omitted editions revision column; corrected with named column inserts",
+    "edition media kind rejected by native vocabulary; corrected to custom:motion_edition"
+  ],
+  "earlier_export_failure_log": {
+    "path": "artifacts/catabolic-integration/structure-motion_export.log",
+    "sha256": "d89b2582a64955de84ec87a8559e520d99e2f7311b5181b2fd498f516b41befe"
+  },
+  "scope": "Edition owners and provisional timeline native import rehearsal; no publication",
+  "remaining": [
+    "work/edition relationships and labels",
+    "native file observations and version bindings",
+    "tag integration",
+    "reference audit",
+    "activation recovery and server routing",
+    "playback and real-library qualification"
+  ]
+}

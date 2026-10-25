@@ -129,7 +129,7 @@ function message(error) {
 }
 
 // Idempotency keys survive retries of the same request until its outcome is
-// known: one key per (operation, body), kept across edits and page reloads in
+// known: one key per (operation, precondition, body), kept across edits and page reloads in
 // this tab, dropped only on success or a definite rejection.
 const keyStore = 'motion:pending-idempotency-keys';
 function pendingKeys() {
@@ -157,9 +157,77 @@ function settleKey(identity) {
   savePendingKeys(stored);
 }
 
+// Native job recovery is deliberately narrower than generic form retries. The
+// server renders a slot only while the separate capability and current permission
+// are present. Its digest binds this user/profile/server/restore/browser session;
+// sessionStorage is same-origin. New-action hints are NOT replay authority.
+const jobRecoveries = new WeakMap();
+function nativeJobContext(form, body) {
+  if (body !== undefined) return null;
+  const slot = form.closest?.('td')?.querySelector('[data-job-control-recovery]');
+  const scope = slot?.dataset.jobControlScope;
+  const job = slot?.dataset.jobControlRecovery;
+  if (!/^[0-9a-f]{64}$/.test(scope ?? '') || !/^[A-Za-z0-9_-]{1,128}$/.test(job ?? '')) return null;
+  const command = form.dataset.command;
+  const ifMatch = form.dataset.ifMatch ?? '';
+  if (command === `POST /api/v2/jobs/${job}/cancel` && ifMatch === '') return {scope};
+  if (command === `POST /api/v2/jobs/${job}/retry` && /^"r-(0|[1-9][0-9]{0,19})"$/.test(ifMatch)) return {scope};
+  return null;
+}
+function pendingNativeJobIntents(slot) {
+  const scope = slot.dataset.jobControlScope;
+  const job = slot.dataset.jobControlRecovery;
+  if (!/^[0-9a-f]{64}$/.test(scope ?? '') || !/^[A-Za-z0-9_-]{1,128}$/.test(job ?? '')) return [];
+  const intents = [];
+  for (const [identity, key] of Object.entries({...pendingKeys(), ...memoryKeys})) {
+    if (typeof key !== 'string' || !/^[0-9a-f]{32}$/.test(key)) continue;
+    const match = /^native-job ([0-9a-f]{64}) (POST \/api\/v2\/jobs\/([A-Za-z0-9_-]{1,128})\/(cancel|retry)) (|"r-(?:0|[1-9][0-9]{0,19})") null$/.exec(identity);
+    if (!match || match[1] !== scope || match[3] !== job) continue;
+    const [, , command, , operation, ifMatch] = match;
+    if ((operation === 'cancel') !== (ifMatch === '')) continue;
+    intents.push({identity, key, command, operation, ifMatch, settled: false});
+  }
+  return intents;
+}
+function restoreNativeJobCommands() {
+  for (const slot of document.querySelectorAll?.('[data-job-control-recovery]') ?? []) {
+    const intents = pendingNativeJobIntents(slot);
+    if (!intents.length) continue;
+    // An unresolved request is not a reason to start another attempt at a newer
+    // revision. Keep new actions hidden until an exact check settles and reloads.
+    for (const form of slot.parentElement.querySelectorAll('form[data-command]')) form.hidden = true;
+    for (const intent of intents) {
+      const form = document.createElement('form');
+      form.className = 'command inline';
+      form.dataset.command = intent.command;
+      form.dataset.idempotent = 'true';
+      if (intent.ifMatch) form.dataset.ifMatch = intent.ifMatch;
+      const button = document.createElement('button');
+      button.type = 'submit';
+      button.textContent = `Check previous ${intent.operation} request`;
+      const status = document.createElement('span');
+      status.className = 'command-status';
+      status.setAttribute('role', 'status');
+      status.textContent = 'Its outcome is uncertain. This resends only the original request, not a new action.';
+      form.append(button, status);
+      jobRecoveries.set(form, intent);
+      slot.append(form);
+    }
+  }
+}
+restoreNativeJobCommands();
+
 /** True only when the server definitely did not apply the request. */
 function definitelyRejected(error) {
   return Boolean(error.status) && error.status >= 400 && error.status < 500 && ![408, 425, 429].includes(error.status);
+}
+
+// After an unknown native attempt, auth, visibility and syntax refusals happen
+// before receipt lookup and cannot settle the earlier action. Only a domain
+// conflict/precondition answered after lookup does, never a receipt conflict.
+function nativeResubmissionRejected(error) {
+  return [409, 412].includes(error.status)
+    && !['idempotency_key_reused', 'idempotent_replay_unavailable'].includes(error.code);
 }
 
 // After a command the page is rendered again by the server. A keyboard or
@@ -226,7 +294,8 @@ function markRetryRevision(current, renderedManualEpoch, renderedSession) {
 }
 
 async function submitCommand(form) {
-  if (submitting.has(form)) return;
+  const recovery = jobRecoveries.get(form);
+  if (submitting.has(form) || recovery?.settled) return;
   if (form.classList.contains('invitation')) return redeemBrowserInvitation(form);
   submitting.add(form);
   const [method, path] = form.dataset.command.split(' ');
@@ -237,6 +306,7 @@ async function submitCommand(form) {
   const generation = edits.get(form) ?? 0;
   const button = form.querySelector('button[type="submit"]');
   let identity;
+  let nativeResubmission = Boolean(recovery);
   try {
     const file = form.dataset.body === 'file' ? form.querySelector('input[type="file"]')?.files?.[0] : undefined;
     if (form.dataset.body === 'file' && !file) throw Object.assign(new Error('Choose a file first.'), {status: 400});
@@ -245,9 +315,26 @@ async function submitCommand(form) {
     const body = file ?? (fixed === undefined ? bodyOf(form) : JSON.parse(fixed));
     // A file's identity is its name, size and modification time, not its bytes.
     const described = file ? {file: file.name, size: file.size, modified: file.lastModified} : body ?? null;
-    identity = `${form.dataset.command} ${form.dataset.ifMatch ?? ''} ${JSON.stringify(described)}`;
+    const nativeJob = nativeJobContext(form, body);
+    identity = `${nativeJob ? `native-job ${nativeJob.scope} ` : ''}${form.dataset.command} ${form.dataset.ifMatch ?? ''} ${JSON.stringify(described)}`;
+    // A normal offered form may itself be resubmitted after a lost ACK, without
+    // a page reload or recovery form. Observe retained identity BEFORE keyFor.
+    if (nativeJob) {
+      nativeResubmission ||= [pendingKeys()[identity], memoryKeys[identity]]
+        .some(key => typeof key === 'string' && /^[0-9a-f]{32}$/.test(key));
+    }
+    if (recovery && (identity !== recovery.identity
+        || (memoryKeys[identity] ?? pendingKeys()[identity]) !== recovery.key)) {
+      // Cleared storage, changed session/capability or edited markup cannot turn
+      // recovery into a new intent. In particular, never call keyFor here.
+      recovery.settled = true;
+      button?.setAttribute('disabled', '');
+      if (status) status.textContent = 'This saved request is no longer available here. Reload to review the current job.';
+      return;
+    }
     const headers = {};
-    if (form.dataset.idempotent === 'true') headers['Idempotency-Key'] = keyFor(identity);
+    if (recovery) headers['Idempotency-Key'] = recovery.key;
+    else if (form.dataset.idempotent === 'true') headers['Idempotency-Key'] = keyFor(identity);
     if (form.dataset.ifMatch) headers['If-Match'] = form.dataset.ifMatch;
     // Viewing-history writes name the history they were rendered against.
     if (form.dataset.viewingEpoch) headers['X-Motion-Viewing-Epoch'] = form.dataset.viewingEpoch;
@@ -265,6 +352,7 @@ async function submitCommand(form) {
       result = await call(method, path, body, {...headers, 'If-Match': `"r-${revision}"`});
     }
     settleKey(identity);
+    if (recovery) recovery.settled = true;
     // Pairing keeps the button disabled for the whole flow (one flow at a time).
     if (form.classList.contains('pairing')) return await pair(form, result);
     if (form.classList.contains('plan')) {
@@ -277,16 +365,24 @@ async function submitCommand(form) {
     }
     reloadAfter(form);
   } catch (error) {
-    // Only a definite rejection ends this request's identity; 5xx, 408/429
-    // and network failures may have been applied, so a retry reuses the key.
-    if (definitelyRejected(error)) settleKey(identity);
+    // Generic first-attempt behavior stays unchanged. Native resubmissions
+    // retain their original key/precondition until a reply resolves the earlier
+    // unknown outcome, not merely the latest authentication/visibility failure.
+    const rejected = nativeResubmission ? nativeResubmissionRejected(error) : definitelyRejected(error);
+    if (rejected) {
+      settleKey(identity);
+      if (recovery) recovery.settled = true;
+    }
     if (status) {
-      status.textContent = message(error);
+      const receiptConflict = nativeResubmission
+        && ['idempotency_key_reused', 'idempotent_replay_unavailable'].includes(error.code);
+      status.textContent = (receiptConflict ? 'The server could not replay the saved request.' : message(error))
+        + (nativeResubmission && !rejected ? ' The earlier request is still unresolved; its original request is saved for an exact check.' : '');
       status.setAttribute('role', 'alert');
     }
   } finally {
     submitting.delete(form);
-    button?.removeAttribute('disabled');
+    if (!recovery?.settled) button?.removeAttribute('disabled');
   }
 }
 

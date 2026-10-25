@@ -15,8 +15,8 @@ use axum::{
     response::sse::{Event, KeepAlive, Sse},
 };
 use playscale_core::access::{
-    AccessError, Disclosure, EventCursor, Permission, Principal, Recheck, ResetReason, Resource,
-    Resume, disclose, recheck, resume,
+    AccessError, CatalogScope, Disclosure, EventCursor, Permission, Principal, Recheck,
+    ResetReason, Resource, Resume, disclose, recheck, resume,
 };
 use serde::{Deserialize, Serialize};
 use std::{convert::Infallible, sync::Once, time::Duration};
@@ -172,6 +172,115 @@ async fn classify(
     })
 }
 
+/// Admission and disclosure share one current writer. Prepared native selections
+/// carry no grant until the same principal/scope is revalidated in that writer.
+async fn authorize_hint(
+    app: &App,
+    caller: &Caller,
+    subscribed: u64,
+    row: &Row,
+) -> Result<(Principal, Option<Disclosure>), Problem> {
+    let initial = {
+        let mut conn = app.db.acquire().await?;
+        caller
+            .reauthorize(&mut conn, Some(Permission::EventsRead))
+            .await?
+    };
+    if initial.policy_revision != subscribed {
+        return Ok((initial, None));
+    }
+    let scope = playscale_core::access::catalog_scope(&initial);
+    let item = matches!(row.1.as_str(), "catalog" | "metadata" | "artwork");
+    let prepared = if item && !initial.is_admin() {
+        match (app.native_catalog.as_ref(), &scope) {
+            (Some(runtime), CatalogScope::Libraries(ids)) => Some(
+                runtime
+                    .prepare_library_read_scope(ids.clone())
+                    .await
+                    .map_err(Problem::internal)?,
+            ),
+            _ => None,
+        }
+    } else {
+        None
+    };
+    let mut tx = super::playback::begin_catalog_application(app, false).await?;
+    let current = caller
+        .reauthorize(&mut tx, Some(Permission::EventsRead))
+        .await?;
+    if current.policy_revision != subscribed
+        || playscale_core::access::catalog_scope(&current) != scope
+    {
+        return Ok((current, None));
+    }
+    let native_scan: Option<(String, String)> = if row.1 == "scan" && app.native_catalog.is_some() {
+        sqlx::query_as("SELECT requester_id,library_id FROM catabolic_scan_requests WHERE id=?")
+            .bind(&row.2)
+            .fetch_optional(&mut *tx)
+            .await?
+    } else {
+        None
+    };
+    let resource = if let Some((requester, library)) = native_scan {
+        if !current.allows(Permission::SourcesManage)
+            || !playscale_core::access::catalog_scope(&current).library(&library)
+        {
+            tx.commit().await?;
+            return Ok((current, Some(Disclosure::Withhold)));
+        }
+        Resource::Job { requester }
+    } else if row.1 == "scan" && app.native_catalog.is_some() {
+        // An old log entry is not authority to resurrect a legacy scan owner.
+        tx.commit().await?;
+        return Ok((current, Some(Disclosure::Withhold)));
+    } else if row.1 == "schedules" && app.native_catalog.is_some() {
+        let current_library = crate::native_schedules::lookup_in(app, &mut tx, &row.2)
+            .await
+            .map_err(Problem::internal)?
+            .filter(|view| !view.tombstoned)
+            .map(|view| view.row.library_id);
+        Resource::Schedule {
+            current_library,
+            prior_library: row.4.clone(),
+        }
+    } else if item && app.native_catalog.is_some() && !current.is_admin() {
+        let mut libraries = Default::default();
+        if let Some(prepared) = prepared {
+            let runtime = app.native_catalog.as_ref().expect("prepared native scope");
+            let definitions = runtime
+                .validate_library_read_scope(&mut tx, &prepared)
+                .await
+                .map_err(Problem::internal)?;
+            let rows = match runtime
+                .read_projectable_items(&mut tx, vec![prepared.selection], Some(row.2.clone()))
+                .await
+            {
+                Ok(rows) => rows,
+                Err(error) if error.downcast_ref::<crate::native_catalog::ReadFailure>()
+                    .is_some_and(|failure| failure.0 == catabolic_store::catalog_scope::ScopeErrorCode::NotFoundOrNotVisible) => Vec::new(),
+                Err(error) => return Err(Problem::internal(error)),
+            };
+            if let Some(row) = rows.first() {
+                let body =
+                    super::catalog::projected_native_work(runtime, &mut tx, row, &definitions)
+                        .await?;
+                libraries = body.library_ids().iter().cloned().collect();
+            }
+        }
+        Resource::Item {
+            libraries,
+            prior: row.4.iter().cloned().collect(),
+        }
+    } else {
+        classify(&mut tx, &current, row).await?
+    };
+    let disclosure = disclose(&current, &resource);
+    // No connection is retained across SSE backpressure. The authorization
+    // linearization point is this writer, not the earlier ingress principal.
+    tx.commit().await?;
+    Ok((current, Some(disclosure)))
+}
+
 async fn reauthenticate(app: &App, caller: &Caller) -> Result<Principal, AccessError> {
     let mut conn = app
         .db
@@ -258,18 +367,20 @@ pub async fn subscribe(
         problem.retry_after = Some(5);
         problem
     })?;
+    let initial = {
+        let mut tx = app.db.begin_with("BEGIN IMMEDIATE").await?;
+        let principal = caller
+            .reauthorize(&mut tx, Some(Permission::EventsRead))
+            .await?;
+        tx.commit().await?;
+        principal
+    };
     let (oldest, newest, epoch, _) = batch(&app, i64::MAX).await?;
-    let start = resume(
-        requested.as_ref(),
-        &epoch,
-        &caller.principal,
-        oldest,
-        newest,
-    );
+    let start = resume(requested.as_ref(), &epoch, &initial, oldest, newest);
     let mut wake = app.access.changes.subscribe(&app);
     let stream = async_stream::stream! {
         let _permit = permit;
-        let mut principal = caller.principal.clone();
+        let mut principal = initial;
         let mut epoch = epoch;
         let mut position = match start {
             Resume::Continue(position) => position,
@@ -313,15 +424,10 @@ pub async fn subscribe(
                 // previous hint: authorize the principal and decide
                 // disclosure from current facts immediately before each
                 // hint, holding no connection across the yield.
-                if recheck(principal.policy_revision, &reauthenticate(&app, &caller).await)
-                    != Recheck::Continue
-                {
-                    continue 'stream;
-                }
-                let disclosure = {
-                    let Ok(mut conn) = app.db.acquire().await else { break 'stream };
-                    let Ok(resource) = classify(&mut conn, &principal, &row).await else { break 'stream };
-                    disclose(&principal, &resource)
+                let disclosure = match authorize_hint(&app, &caller, principal.policy_revision, &row).await {
+                    Ok((_, Some(disclosure))) => disclosure,
+                    Ok((_, None)) => continue 'stream,
+                    Err(_) => break 'stream,
                 };
                 let (id, topic, resource_id, kind, _, _) = row;
                 position = id;

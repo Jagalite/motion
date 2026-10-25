@@ -24,6 +24,28 @@ use playscale_core::access::{
 };
 use serde::Deserialize;
 
+mod generated_membership;
+mod native_membership;
+mod transport;
+
+/// Explicit transport-only admission under a current native application writer.
+/// Existing catalog/processing/download consumers retain original-only facts.
+pub(crate) async fn transport_file_facts(
+    conn: &mut sqlx::SqliteConnection,
+    principal: &Principal,
+    file: &str,
+) -> Result<Option<FileFacts>, Problem> {
+    transport::facts(conn, principal, file).await
+}
+
+pub(crate) async fn transport_version_ready(
+    conn: &mut sqlx::SqliteConnection,
+    principal: &Principal,
+    version: &str,
+) -> Result<bool, Problem> {
+    transport::version_ready(conn, principal, version).await
+}
+
 impl From<TicketError> for Problem {
     fn from(e: TicketError) -> Self {
         match e {
@@ -73,14 +95,61 @@ pub(crate) async fn file_facts(
     conn: &mut sqlx::SqliteConnection,
     file_id: &str,
 ) -> Result<Option<FileFacts>, Problem> {
-    let revision: Option<String> =
-        sqlx::query_scalar("SELECT revision FROM media_files WHERE id=? AND available=1")
+    let file: Option<(String, bool)> =
+        sqlx::query_as("SELECT revision,generated FROM media_files WHERE id=? AND available=1")
             .bind(file_id)
             .fetch_optional(&mut *conn)
             .await?;
-    let Some(revision) = revision else {
+    let Some((revision, generated)) = file else {
         return Ok(None);
     };
+    if super::playback::native_bound(conn).await? {
+        // A native output occurrence alone does not prove its inherited source
+        // authority. Generated lineage and managed-store descriptor custody
+        // require separate qualification; legacy rendition rows cannot grant it.
+        if generated {
+            return Ok(None);
+        }
+        let current: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM catabolic_projection_files f \
+             JOIN catabolic_projection_state s ON s.singleton=1 AND s.generation=f.generation \
+             WHERE f.file_id=? AND f.available=1 \
+             AND json_extract(f.mapping_json,'$.motion_file.revision')=?)",
+        )
+        .bind(file_id)
+        .bind(&revision)
+        .fetch_one(&mut *conn)
+        .await?;
+        if !current {
+            return Ok(None);
+        }
+        let versions: Vec<String> = sqlx::query_scalar(
+            "SELECT DISTINCT version_id FROM version_files WHERE file_id=? AND file_revision=?",
+        )
+        .bind(file_id)
+        .bind(&revision)
+        .fetch_all(&mut *conn)
+        .await?;
+        let mut bound = false;
+        for version in versions {
+            bound |= super::playback::native_version_ready(conn, &version).await?;
+        }
+        if !bound {
+            return Ok(None);
+        }
+        let source:String=sqlx::query_scalar("SELECT json_extract(mapping_json,'$.source.library_id') FROM catabolic_projection_files WHERE file_id=?").bind(file_id).fetch_one(&mut *conn).await?;
+        let lifecycle = motion_catalog_backend::source_lifecycle::current_in(conn, &source)
+            .await
+            .map_err(Problem::internal)?;
+        if lifecycle.state != motion_catalog_backend::source_lifecycle::State::Active {
+            return Ok(None);
+        }
+        let library_ids = native_membership::libraries(conn, file_id).await?;
+        return Ok(Some(FileFacts {
+            library_ids,
+            revision,
+        }));
+    }
     // A generated rendition lives in the managed output store, which is no
     // logical library: it is in the libraries of the source it renders, while
     // its registration still matches both current revisions. A stale or
@@ -127,8 +196,9 @@ fn with_ticket(path: &str, token: &str) -> String {
 
 /// The complete opaque token is hashed in SQLite. Altering its scope suffix
 /// invalidates the lookup; a generation token is never a file credential.
-pub(crate) async fn delivery_ticket(
+pub(crate) async fn delivery_ticket_in(
     app: &App,
+    conn: &mut sqlx::SqliteConnection,
     token: &str,
     id: &str,
     generation: &str,
@@ -137,7 +207,6 @@ pub(crate) async fn delivery_ticket(
     if !token.ends_with(&suffix) || !crate::delivery::serves_generation(app, id, generation) {
         return Err(TicketError::TicketInvalid.into());
     }
-    let mut conn = app.db.acquire().await?;
     let row: Option<TicketRow> = sqlx::query_as(
         "SELECT principal_id,file_id,file_revision,purpose,credential_hash,expires_at,revoked FROM content_tickets WHERE token_hash=?",
     ).bind(auth::token_hash(token)).fetch_optional(&mut *conn).await?;
@@ -146,8 +215,11 @@ pub(crate) async fn delivery_ticket(
     if purpose != "playback" {
         return Err(TicketError::TicketInvalid.into());
     }
-    let principal = ticket_principal(&mut conn, &issuer, credential.as_deref()).await;
-    let facts = file_facts(&mut conn, &file).await?;
+    let principal = ticket_principal(&mut *conn, &issuer, credential.as_deref()).await;
+    let facts = match &principal {
+        Ok(principal) => transport_file_facts(&mut *conn, principal, &file).await?,
+        Err(_) => None,
+    };
     core::admit_file_ticket(
         &FileTicket {
             file_id: file.clone(),
@@ -163,7 +235,8 @@ pub(crate) async fn delivery_ticket(
         now(),
     )?;
     let principal = principal.map_err(Problem::from)?;
-    super::playback::controlled_by(app, &mut conn, &principal, id).await?;
+    super::playback::require_native_scope(&mut *conn, &principal).await?;
+    super::playback::controlled_by(app, &mut *conn, &principal, id).await?;
     Ok(principal)
 }
 
@@ -190,8 +263,9 @@ pub async fn create(
         ));
     }
     let now = now();
-    let mut tx = begin_write(&app.db).await?;
+    let mut tx = super::playback::begin_catalog_application(&app, true).await?;
     let principal = caller.reauthorize(&mut tx, None).await?;
+    super::playback::require_native_scope(&mut tx, &principal).await?;
     let scope = Scope {
         principal: &principal.id,
         operation: "createContentAccess",
@@ -245,7 +319,7 @@ pub async fn create(
         (input.file.ok_or_else(Problem::not_found)?, None)
     };
     // Reauthorize exact issuance retries as well as first admissions.
-    let facts = file_facts(&mut tx, &file.file_id).await?;
+    let facts = transport_file_facts(&mut tx, &principal, &file.file_id).await?;
     let parent_expiry = caller.credential().map(|(_, c)| c.expires_at);
     // Ingress without a durable parent credential cannot mint a bearer grant.
     if caller.credential().is_none() && !caller.is_local_operator() {
@@ -388,10 +462,15 @@ pub async fn file_content(
     method: Method,
     headers: HeaderMap,
 ) -> Result<Response, Problem> {
-    let mut conn = app.db.acquire().await?;
-    let facts = file_facts(&mut conn, &file_id).await?;
+    let caller = if params.ticket.is_none() {
+        Some(auth::resolve(&app, &method, &headers).await?)
+    } else {
+        None
+    };
+    let mut conn = super::playback::begin_catalog_application(&app, false).await?;
     // Who is reading, to attribute direct-play bytes to their live delivery.
     let reader: Option<String>;
+    let admitted: Principal;
     if let Some(token) = &params.ticket {
         if token.contains(".delivery.") {
             return Err(TicketError::TicketInvalid.into());
@@ -418,6 +497,10 @@ pub async fn file_content(
         let principal =
             ticket_principal(&mut conn, &principal_id, credential_hash.as_deref()).await;
         reader = Some(principal_id.clone());
+        let facts = match &principal {
+            Ok(principal) => transport_file_facts(&mut conn, principal, &file_id).await?,
+            Err(_) => None,
+        };
         core::admit_file_ticket(
             &ticket,
             &file_id,
@@ -426,11 +509,17 @@ pub async fn file_content(
             facts.as_ref(),
             now(),
         )?;
+        let principal = principal.map_err(Problem::from)?;
+        super::playback::require_native_scope(&mut conn, &principal).await?;
+        admitted = principal;
     } else {
-        drop(conn);
-        let caller = auth::resolve(&app, &method, &headers).await?;
-        core::admit_file_bytes(&caller.principal, facts.as_ref())?;
-        reader = Some(caller.principal.id.clone());
+        let caller = caller.ok_or_else(|| Problem::internal("missing resolved content caller"))?;
+        let principal = caller.reauthorize(&mut conn, None).await?;
+        super::playback::require_native_scope(&mut conn, &principal).await?;
+        let facts = transport_file_facts(&mut conn, &principal, &file_id).await?;
+        core::admit_file_bytes(&principal, facts.as_ref())?;
+        reader = Some(principal.id.clone());
+        admitted = principal;
     }
     // Only reads pinned to a revision are attributed: a delivery's media URL
     // always pins its own, and serving refuses any other. Reserved before
@@ -448,12 +537,14 @@ pub async fn file_content(
     let query = media::MediaQuery {
         revision: params.revision,
     };
-    media::serve(
-        State(app.clone()),
-        Path(file_id),
-        Query(query),
+    media::serve_authorized(
+        app.clone(),
+        file_id,
+        query,
         method,
         headers,
+        conn,
+        &admitted,
     )
     .await
     .map(|response| crate::delivery::count(transfer, response))

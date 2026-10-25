@@ -228,6 +228,12 @@ func (m Model) tableEmpty() string {
 	case pageApprovals:
 		return "No pending action approvals. A device that lacks recent sign-in shows a code here when it requests one sensitive change."
 	case pageProcessing:
+		if m.readOnlyJobs() {
+			return "No processing job history. This server exposes read-only rendition jobs."
+		}
+		if m.nativeJobsSeen {
+			return "No processing job history. Controls are limited to supported native preparations."
+		}
 		return "No jobs. Scans, matching and conversions appear here while they run."
 	case pageScans:
 		return "No scans yet."
@@ -338,8 +344,10 @@ func (m *Model) tableKeyMsg(msg tea.KeyPressMsg) tea.Cmd {
 	case key.Matches(msg, keys.Back):
 		return m.back()
 	case m.route.page == pageProcessing && key.Matches(msg, keys.Cancel):
-		// The server decides per job kind who may cancel; a refusal is shown.
 		if id := m.selectedID(); id != "" {
+			if !m.canCancelJob(id) {
+				return m.say("Cancellation is unavailable for this job on this server.", true)
+			}
 			m.askCancel(id)
 		}
 	case m.route.page == pageProcessing && key.Matches(msg, keys.Retry):

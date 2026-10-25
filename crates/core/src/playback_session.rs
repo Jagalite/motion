@@ -587,7 +587,19 @@ pub fn may_continue(
     household: Option<crate::access::HouseholdScope<'_>>,
     file: Option<&FileFacts>,
 ) -> bool {
-    let principal = if owner.principal == "operator" {
+    continuation_principal(owner, device, household)
+        .as_ref()
+        .is_some_and(|p| may_control(owner, p, file))
+}
+
+/// Current authority for background delivery continuation, not a credential or
+/// a new session grant. Adapters use this same policy before scoped file reads.
+pub fn continuation_principal(
+    owner: &Owner,
+    device: Option<&crate::access::Device>,
+    household: Option<crate::access::HouseholdScope<'_>>,
+) -> Option<Principal> {
+    if owner.principal == "operator" {
         Some(Principal::operator())
     } else if owner.principal == crate::access::HOUSEHOLD_PRINCIPAL_ID {
         household.map(crate::access::household_principal)
@@ -602,10 +614,7 @@ pub fn may_continue(
                 policy: d.policy.clone(),
                 policy_revision: d.revision,
             })
-    };
-    principal
-        .as_ref()
-        .is_some_and(|p| may_control(owner, p, file))
+    }
 }
 
 /// A replan may change route and streams but never the delivery's timeline,
@@ -1493,6 +1502,43 @@ mod tests {
         // Both rungs leave room for video under their caps.
         assert!(rate_cap(ADAPTIVE_MAIN_BPS, 3_000).is_some());
         assert!(rate_cap(ADAPTIVE_LOW_BPS, 3_000).is_some());
+    }
+
+    #[test]
+    fn continuation_principal_keeps_current_policy_and_never_borrows_another_owner() {
+        let p = principal("device", &[Permission::PlaybackRequest], &["p"]);
+        let owner = Owner {
+            principal: "device".into(),
+            profile: "p".into(),
+            timeline: "t".into(),
+            file: "f".into(),
+            file_revision: "r".into(),
+        };
+        let mut device = crate::access::Device::approved("device".into(), p.grant);
+        device.policy = p.policy;
+        device.revision = 17;
+        let current = continuation_principal(&owner, Some(&device), None).unwrap();
+        assert_eq!(current.policy_revision, 17);
+        assert_eq!(current.policy, device.policy);
+        assert_eq!(current.device_id.as_deref(), Some("device"));
+        assert!(may_continue(
+            &owner,
+            Some(&device),
+            None,
+            Some(&facts("r", "lib"))
+        ));
+        device.policy.library_ids.clear();
+        assert!(!may_continue(
+            &owner,
+            Some(&device),
+            None,
+            Some(&facts("r", "lib"))
+        ));
+        device.revoked = true;
+        assert!(continuation_principal(&owner, Some(&device), None).is_none());
+        device.revoked = false;
+        device.id = "other".into();
+        assert!(continuation_principal(&owner, Some(&device), None).is_none());
     }
 
     #[test]

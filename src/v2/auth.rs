@@ -5,6 +5,8 @@
 //! SHA-256 of the secret, so a lost acknowledgement can be replayed with the
 //! same secret without the database ever holding it. Every request
 //! re-authenticates against the current device and parent rows.
+pub(crate) mod retained;
+
 use super::Problem;
 use crate::App;
 use axum::{
@@ -439,6 +441,69 @@ pub fn ingress_csrf(app: &App, login: &str) -> String {
 }
 
 impl Caller {
+    /// Descriptive storage accounting only; neither the cached principal nor
+    /// this number authenticates the caller. The service admits this named
+    /// bounded cohort before taking the caller. String capacities are actual;
+    /// 512 bytes per BTree entry is a conservative logical node share, not a
+    /// measured allocator/RSS claim. Traversal is bounded and observes the
+    /// original operation's cancellation and deadline at every entry.
+    pub(crate) const RETAINED_STORAGE_LIMIT: u64 = 1024 * 1024;
+    pub(crate) fn retained_storage(
+        &self,
+        cancel: &std::sync::atomic::AtomicBool,
+        deadline: std::time::Instant,
+    ) -> anyhow::Result<u64> {
+        let mut total = 0u64;
+        let mut work = 0usize;
+        let mut add = |capacity: usize, node: bool| -> anyhow::Result<()> {
+            anyhow::ensure!(
+                !cancel.load(std::sync::atomic::Ordering::Acquire)
+                    && std::time::Instant::now() < deadline,
+                "caller storage observation cancelled or expired"
+            );
+            work += 1;
+            anyhow::ensure!(work <= 4096, "caller storage traversal exceeded cohort");
+            total = total
+                .checked_add(u64::try_from(capacity)?)
+                .and_then(|n| n.checked_add(if node { 512 } else { 0 }))
+                .ok_or_else(|| anyhow::anyhow!("caller storage accounting overflow"))?;
+            anyhow::ensure!(
+                total <= Self::RETAINED_STORAGE_LIMIT,
+                "caller storage exceeds preadmitted service share"
+            );
+            Ok(())
+        };
+        add(self.principal.id.capacity(), false)?;
+        if let Some(id) = &self.principal.device_id {
+            add(id.capacity(), false)?;
+        }
+        if let Some(csrf) = &self.csrf {
+            add(csrf.capacity(), false)?;
+        }
+        for set in [
+            &self.principal.grant.profile_ids,
+            &self.principal.policy.library_ids,
+            &self.principal.policy.allowed_ratings,
+            &self.principal.policy.blocked_labels,
+        ] {
+            anyhow::ensure!(set.len() <= 4096, "caller set exceeds bounded traversal");
+            for value in set {
+                add(value.capacity(), true)?;
+            }
+        }
+        for _ in &self.principal.grant.permissions {
+            add(0, true)?;
+        }
+        match &self.source {
+            CallerSource::Credential { hash, admitted } => {
+                add(hash.capacity(), false)?;
+                add(admitted.device_id.capacity(), false)?;
+            }
+            CallerSource::TrustedIngress { device_id } => add(device_id.capacity(), false)?,
+            CallerSource::LocalOperator | CallerSource::Household { .. } => {}
+        }
+        Ok(total)
+    }
     /// Durable authority reference for existing ticket/job storage. Absence
     /// alone does not establish operator authority; retain the principal ID.
     pub fn credential(&self) -> Option<(&str, &Credential)> {

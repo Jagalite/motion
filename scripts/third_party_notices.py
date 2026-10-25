@@ -47,6 +47,18 @@ def notice_files(package):
         selected = {base / 'LICENSE-MIT', base / 'LICENSE-APACHE'}
         prefix = 'vendored-upstream/'
     if not selected:
+        omissions = {
+            ('Inflector', '0.11.4'): ('Inflector-0.11.4', 'LICENSE.md'),
+            **{(name, '0.58.6'): ('jsonschema-0.58.6', 'LICENSE') for name in
+               ('jsonschema-macros', 'jsonschema-macros-core', 'jsonschema-regex', 'jsonschema-value')},
+            **{(name, '0.8.0'): ('simd-0.8.0', 'LICENSE') for name in ('uuid-simd', 'vsimd')},
+        }
+        omitted = omissions.get((package['name'], package['version']))
+        if omitted:
+            base = ROOT / 'third_party/licenses' / omitted[0]
+            selected = {base / omitted[1]}
+            prefix = 'vendored-upstream/'
+    if not selected:
         raise ValueError(f"No license/notice files found: {package['name']} {package['version']}")
     notices = []
     for path in sorted(selected):

@@ -1,0 +1,1282 @@
+{
+  "_sqlx_migrations": [
+    "version",
+    "description",
+    "installed_on",
+    "success",
+    "checksum",
+    "execution_time"
+  ],
+  "access_invitations": [
+    "id",
+    "code_hash",
+    "user_id",
+    "user_revision",
+    "issuer_id",
+    "issuer_revision",
+    "issuer_credential_hash",
+    "profile_ids",
+    "permissions",
+    "policy",
+    "created_at",
+    "expires_at",
+    "revision",
+    "revoked",
+    "claim_hash",
+    "device_id",
+    "generation",
+    "credential_nonce",
+    "email",
+    "identity_id"
+  ],
+  "access_owner_setup": [
+    "singleton",
+    "user_id",
+    "created_at"
+  ],
+  "access_users": [
+    "id",
+    "name",
+    "revision",
+    "disabled",
+    "profile_ids",
+    "permissions",
+    "policy",
+    "legacy",
+    "created_at"
+  ],
+  "api_schedules": [
+    "id",
+    "revision",
+    "library_id",
+    "task",
+    "interval_seconds",
+    "enabled",
+    "next_run",
+    "requester_id",
+    "credential_hash",
+    "ingress_id"
+  ],
+  "artwork_assets": [
+    "id",
+    "mime",
+    "width",
+    "height",
+    "bytes"
+  ],
+  "artwork_contributions": [
+    "item_id",
+    "role",
+    "source",
+    "asset_id",
+    "revision"
+  ],
+  "artwork_selections": [
+    "item_id",
+    "role",
+    "asset_id",
+    "revision"
+  ],
+  "backup_jobs": [
+    "id",
+    "revision",
+    "phase",
+    "attempt",
+    "requester_id",
+    "credential_hash",
+    "ingress_id",
+    "include_generated_media",
+    "created_at",
+    "manifest_digest",
+    "error"
+  ],
+  "catabolic_aggregate_issuance": [
+    "work_id",
+    "state_json"
+  ],
+  "catabolic_binding": [
+    "id",
+    "identity_json"
+  ],
+  "catabolic_command_attempts": [
+    "business_id",
+    "attempt",
+    "original_envelope_json",
+    "prior_envelope_json",
+    "envelope_json",
+    "stale_witness_json",
+    "created_at"
+  ],
+  "catabolic_commands": [
+    "operation_id",
+    "envelope_json",
+    "created_at"
+  ],
+  "catabolic_cutover": [
+    "singleton",
+    "import_id",
+    "checkpoint_json",
+    "activation_envelope",
+    "phase"
+  ],
+  "catabolic_cutover_parts": [
+    "import_id",
+    "ordinal",
+    "checkpoint_json",
+    "activation_envelope",
+    "phase"
+  ],
+  "catabolic_cutover_sets": [
+    "singleton",
+    "root_import_id",
+    "manifest_digest",
+    "manifest_json",
+    "freeze_revision",
+    "phase"
+  ],
+  "catabolic_discovery_intents": [
+    "operation_id",
+    "source_id",
+    "native_profile",
+    "native_file_id",
+    "native_revision",
+    "identity_json",
+    "ids_json",
+    "observed_json",
+    "probe_json",
+    "command_json",
+    "receipt_json",
+    "state",
+    "created_at"
+  ],
+  "catabolic_export_freezes": [
+    "import_id",
+    "freeze_revision"
+  ],
+  "catabolic_export_plan_parts": [
+    "import_id",
+    "root_import_id",
+    "ordinal",
+    "snapshot_digest"
+  ],
+  "catabolic_export_plans": [
+    "root_import_id",
+    "source_snapshot_id",
+    "source_namespace",
+    "audit_digest",
+    "plan_json"
+  ],
+  "catabolic_generated_publications": [
+    "operation_id",
+    "job_id",
+    "attempt",
+    "source_json",
+    "output_relative",
+    "output_json",
+    "command_json",
+    "receipt_json",
+    "acknowledged",
+    "created_at"
+  ],
+  "catabolic_generated_source": [
+    "id",
+    "mapping_json",
+    "created_at"
+  ],
+  "catabolic_import_snapshots": [
+    "import_id",
+    "input_digest",
+    "snapshot_json",
+    "created_at"
+  ],
+  "catabolic_imported_source_descriptors": [
+    "source_id",
+    "descriptor_json",
+    "proof_json",
+    "activation_digest",
+    "created_at"
+  ],
+  "catabolic_motion_exports": [
+    "import_id",
+    "input_digest",
+    "format_version"
+  ],
+  "catabolic_native_upgrade_ack": [
+    "singleton",
+    "proof_json"
+  ],
+  "catabolic_native_upgrade_intent": [
+    "singleton",
+    "intent_json"
+  ],
+  "catabolic_occurrence_mappings": [
+    "import_id",
+    "motion_file_id",
+    "native_profile",
+    "native_file_id",
+    "mapping_json"
+  ],
+  "catabolic_processing_admissions": [
+    "job_id",
+    "capture_json",
+    "created_at"
+  ],
+  "catabolic_projection_file_libraries": [
+    "file_id",
+    "library_id",
+    "generation",
+    "proof_json"
+  ],
+  "catabolic_projection_files": [
+    "file_id",
+    "native_profile",
+    "native_file_id",
+    "native_revision",
+    "generation",
+    "available",
+    "mapping_json"
+  ],
+  "catabolic_projection_generated_libraries": [
+    "file_id",
+    "library_id",
+    "generation",
+    "proof_json"
+  ],
+  "catabolic_projection_items": [
+    "native_id",
+    "native_revision",
+    "metadata_json",
+    "generation"
+  ],
+  "catabolic_projection_state": [
+    "singleton",
+    "catalog_id",
+    "incarnation",
+    "generation",
+    "model_version"
+  ],
+  "catabolic_projection_versions": [
+    "version_id",
+    "motion_version_revision",
+    "timeline_id",
+    "motion_timeline_revision",
+    "native_version_revision",
+    "native_timeline_revision",
+    "native_current_timeline_revision",
+    "generation",
+    "ready",
+    "manifest_json"
+  ],
+  "catabolic_reference_audits": [
+    "import_id",
+    "input_digest",
+    "audit_json"
+  ],
+  "catabolic_revision_bridges": [
+    "native_id",
+    "catalog_id",
+    "incarnation",
+    "motion_base",
+    "native_base",
+    "proof_json"
+  ],
+  "catabolic_scan_demands": [
+    "id",
+    "request_id",
+    "source_id",
+    "mapping_json",
+    "barrier",
+    "phase",
+    "status",
+    "attempt",
+    "started_barrier",
+    "result_json",
+    "error"
+  ],
+  "catabolic_scan_requests": [
+    "admission",
+    "id",
+    "library_id",
+    "requester_id",
+    "scope_json",
+    "verify",
+    "require_complete",
+    "revision",
+    "created_at"
+  ],
+  "catabolic_scan_schedule_adoptions": [
+    "schedule_id",
+    "catalog_id",
+    "incarnation",
+    "original_json",
+    "progress_json",
+    "created_at"
+  ],
+  "catabolic_scan_schedule_cursors": [
+    "schedule_id",
+    "definition_revision",
+    "due_at",
+    "retry_at"
+  ],
+  "catabolic_scan_schedule_definitions": [
+    "id",
+    "catalog_id",
+    "incarnation",
+    "origin",
+    "revision",
+    "library_id",
+    "enabled",
+    "tombstoned",
+    "definition_json",
+    "adoption_id",
+    "created_at",
+    "updated_at"
+  ],
+  "catabolic_scan_schedule_occurrences": [
+    "schedule_id",
+    "definition_revision",
+    "due_at",
+    "request_id",
+    "accepted_scope_json",
+    "created_at"
+  ],
+  "catabolic_server_scopes": [
+    "profile",
+    "library_id",
+    "library_revision",
+    "catalog_id",
+    "incarnation",
+    "source_digest",
+    "source_mappings_json",
+    "query_id",
+    "query_revision",
+    "query_digest",
+    "created_at"
+  ],
+  "catabolic_source_events": [
+    "revision",
+    "input_json",
+    "state_json"
+  ],
+  "catabolic_source_guards": [
+    "trigger_name",
+    "table_name",
+    "trigger_sql"
+  ],
+  "catabolic_source_lifecycle": [
+    "source_id",
+    "epoch",
+    "catalog_id",
+    "incarnation",
+    "mapping_digest",
+    "source_revision",
+    "binding_revision",
+    "state",
+    "operation_id",
+    "proof_json",
+    "created_at"
+  ],
+  "catabolic_source_mappings": [
+    "library_id",
+    "profile",
+    "native_source",
+    "mapping_json",
+    "created_at"
+  ],
+  "catabolic_source_registration_intents": [
+    "operation_id",
+    "source_id",
+    "request_digest",
+    "descriptor_json",
+    "created_at"
+  ],
+  "catabolic_source_registry": [
+    "id",
+    "descriptor_json",
+    "created_at"
+  ],
+  "catabolic_source_state": [
+    "singleton",
+    "revision",
+    "writes_allowed",
+    "state_json"
+  ],
+  "catabolic_source_watch_admissions": [
+    "watch_id",
+    "watch_revision",
+    "source_id",
+    "native_dirty_generation",
+    "request_id",
+    "accepted_scope_json",
+    "created_at"
+  ],
+  "catabolic_source_watch_definitions": [
+    "id",
+    "revision",
+    "catalog_id",
+    "incarnation",
+    "origin",
+    "library_id",
+    "source_id",
+    "enabled",
+    "tombstoned",
+    "definition_json",
+    "created_at"
+  ],
+  "catalog_libraries": [
+    "id",
+    "revision",
+    "name",
+    "kind",
+    "language"
+  ],
+  "catalog_receipts": [
+    "id",
+    "kind",
+    "created_at",
+    "document_json"
+  ],
+  "change_events": [
+    "id",
+    "topic",
+    "resource_id",
+    "kind",
+    "scope_library",
+    "scope_profile"
+  ],
+  "collection_items": [
+    "collection_id",
+    "item_id"
+  ],
+  "collections": [
+    "id",
+    "revision",
+    "profile_id",
+    "name",
+    "kind",
+    "filter_id"
+  ],
+  "content_tickets": [
+    "id",
+    "token_hash",
+    "principal_id",
+    "credential_hash",
+    "file_id",
+    "file_revision",
+    "purpose",
+    "expires_at",
+    "revoked",
+    "download_id"
+  ],
+  "credentials": [
+    "token_hash",
+    "device_id",
+    "kind",
+    "generation",
+    "expires_at",
+    "parent_hash",
+    "csrf_token"
+  ],
+  "delivery_admissions": [
+    "principal",
+    "request_key",
+    "request_digest",
+    "delivery_id",
+    "acknowledgement_json",
+    "created_at"
+  ],
+  "delivery_owners": [
+    "delivery_id",
+    "principal_id",
+    "profile_id",
+    "timeline_id",
+    "version_id",
+    "file_id",
+    "file_revision",
+    "created_at"
+  ],
+  "delivery_sessions": [
+    "id",
+    "file_id",
+    "file_revision",
+    "revision",
+    "status",
+    "state_json",
+    "updated_at"
+  ],
+  "devices": [
+    "id",
+    "name",
+    "client_name",
+    "revision",
+    "profile_ids",
+    "permissions",
+    "policy",
+    "revoked",
+    "generation",
+    "credential_expires_at",
+    "created_at",
+    "user_id"
+  ],
+  "download_subtitle_artifacts": [
+    "download_id",
+    "state",
+    "size_bytes",
+    "digest"
+  ],
+  "download_transfers": [
+    "download_id",
+    "sequence",
+    "download_revision",
+    "state",
+    "bytes_received",
+    "reported_at"
+  ],
+  "downloads": [
+    "id",
+    "revision",
+    "principal_id",
+    "device_id",
+    "profile_id",
+    "timeline_id",
+    "timeline_revision",
+    "version_id",
+    "file_id",
+    "file_revision",
+    "content_type",
+    "size_bytes",
+    "duration_ms",
+    "state",
+    "created_at",
+    "updated_at",
+    "subtitle_track_id"
+  ],
+  "editions": [
+    "id",
+    "item_id",
+    "label",
+    "revision"
+  ],
+  "idempotency_records": [
+    "principal_id",
+    "operation",
+    "target",
+    "key",
+    "digest",
+    "status",
+    "body",
+    "issued_nonce",
+    "expires_at"
+  ],
+  "invitation_attempts": [
+    "singleton",
+    "window_start",
+    "attempts"
+  ],
+  "item_aliases": [
+    "alias_id",
+    "item_id",
+    "receipt_id"
+  ],
+  "item_artwork_assets": [
+    "item_id",
+    "asset_id"
+  ],
+  "item_origins": [
+    "item_id",
+    "title"
+  ],
+  "item_relationships": [
+    "id",
+    "revision",
+    "source_item_id",
+    "target_item_id",
+    "kind",
+    "position"
+  ],
+  "item_structure": [
+    "item_id",
+    "media_type",
+    "parent_id",
+    "number",
+    "revision"
+  ],
+  "items": [
+    "id",
+    "title",
+    "kind",
+    "catalog_revision",
+    "match_state"
+  ],
+  "jobs": [
+    "id",
+    "library_id",
+    "phase",
+    "attempt",
+    "error",
+    "created_at",
+    "full_scan",
+    "reused_files",
+    "inspected_files",
+    "outcome",
+    "complete_directories",
+    "incomplete_directories",
+    "binding_revision",
+    "requester_id",
+    "revision",
+    "started_barrier",
+    "direct_request"
+  ],
+  "legacy_progress_attribution": [
+    "profile_id",
+    "item_id",
+    "outcome",
+    "timeline_id",
+    "candidates_json",
+    "receipt_id"
+  ],
+  "libraries": [
+    "id",
+    "name",
+    "root",
+    "root_identity",
+    "managed",
+    "enabled",
+    "revision",
+    "binding_revision",
+    "exclusions_json",
+    "scan_barrier"
+  ],
+  "library_sources": [
+    "library_id",
+    "source_id"
+  ],
+  "maintenance_state": [
+    "name",
+    "last_success",
+    "last_attempt",
+    "error"
+  ],
+  "markers": [
+    "id",
+    "revision",
+    "timeline_id",
+    "timeline_revision",
+    "kind",
+    "start_ms",
+    "end_ms",
+    "label",
+    "provenance",
+    "creation_order"
+  ],
+  "match_proposals": [
+    "id",
+    "revision",
+    "file_id",
+    "file_revision",
+    "status",
+    "candidates_json",
+    "decision_json",
+    "created_at",
+    "updated_at"
+  ],
+  "media_files": [
+    "id",
+    "edition_id",
+    "library_id",
+    "relative_path",
+    "revision",
+    "fingerprint",
+    "bytes",
+    "duration_seconds",
+    "tracks_json",
+    "available",
+    "generated",
+    "chapters_json",
+    "native_history"
+  ],
+  "media_versions": [
+    "id",
+    "timeline_id",
+    "revision",
+    "label",
+    "origin",
+    "equivalence"
+  ],
+  "metadata_documents": [
+    "item_id",
+    "source",
+    "revision",
+    "external_id",
+    "document_json",
+    "updated_at"
+  ],
+  "metadata_jobs": [
+    "id",
+    "item_id",
+    "requester_id",
+    "credential_hash",
+    "ingress_id",
+    "revision",
+    "phase",
+    "attempt",
+    "error",
+    "created_at"
+  ],
+  "nfo_origins": [
+    "item_id",
+    "file_id"
+  ],
+  "offline_events": [
+    "device_id",
+    "profile_id",
+    "sequence",
+    "event_id",
+    "timeline_id",
+    "event_json",
+    "outcome",
+    "code",
+    "created_at"
+  ],
+  "offline_lineage": [
+    "device_id",
+    "profile_id",
+    "timeline_id",
+    "base_viewing_revision",
+    "base_manual_epoch",
+    "produced_revision"
+  ],
+  "offline_sequences": [
+    "device_id",
+    "profile_id",
+    "next_sequence",
+    "pruned_through"
+  ],
+  "operational_metric_counters": [
+    "run_id",
+    "failed_total"
+  ],
+  "operational_metric_failures": [
+    "run_id",
+    "source",
+    "job_id"
+  ],
+  "operational_metrics": [
+    "id",
+    "series_id",
+    "sampled_at",
+    "run_id",
+    "value"
+  ],
+  "order_groups": [
+    "id",
+    "edition_id",
+    "name",
+    "kind",
+    "revision"
+  ],
+  "pairings": [
+    "id",
+    "device_code_hash",
+    "user_code",
+    "device_name",
+    "client_name",
+    "expires_at",
+    "phase",
+    "device_id",
+    "last_claim_at",
+    "credential_nonce",
+    "claimed_generation",
+    "denied",
+    "created_at"
+  ],
+  "playback_monitor_sessions": [
+    "delivery_id",
+    "principal_id",
+    "profile_id",
+    "timeline_id",
+    "version_id",
+    "file_id",
+    "mode",
+    "client_network",
+    "started_at",
+    "last_activity_at",
+    "ended_at",
+    "end_reason",
+    "bytes_sent",
+    "peak_bps",
+    "watched_ms",
+    "start_position_ms",
+    "end_position_ms",
+    "stalls"
+  ],
+  "playback_preferences": [
+    "profile_id",
+    "revision",
+    "document_json"
+  ],
+  "playback_sessions": [
+    "id",
+    "profile_id",
+    "item_id",
+    "file_id",
+    "file_revision",
+    "duration_seconds",
+    "sequence",
+    "position_seconds",
+    "status",
+    "created_at",
+    "updated_at"
+  ],
+  "playlist_entries": [
+    "playlist_id",
+    "position",
+    "entry_id",
+    "timeline_id"
+  ],
+  "playlists": [
+    "id",
+    "revision",
+    "profile_id",
+    "name"
+  ],
+  "preparations": [
+    "job_id",
+    "timeline_id",
+    "recipe_digest",
+    "tracks_json",
+    "credential_hash",
+    "ingress_id",
+    "revision"
+  ],
+  "preview_jobs": [
+    "id",
+    "revision",
+    "phase",
+    "attempt",
+    "file_id",
+    "file_revision",
+    "requester_id",
+    "credential_hash",
+    "ingress_id",
+    "created_at",
+    "error",
+    "layout_identity"
+  ],
+  "preview_retention_cursor": [
+    "id",
+    "after_file"
+  ],
+  "preview_sheet_artifacts": [
+    "file_id",
+    "file_revision",
+    "sheet",
+    "layout_identity",
+    "digest",
+    "size_bytes"
+  ],
+  "previews": [
+    "file_id",
+    "file_revision",
+    "job_id",
+    "interval_ms",
+    "tile_width",
+    "tile_height",
+    "columns",
+    "rows",
+    "tiles",
+    "sheets",
+    "created_at",
+    "layout_identity"
+  ],
+  "processing_jobs": [
+    "id",
+    "source_file_id",
+    "source_revision",
+    "recipe",
+    "backend",
+    "idempotency_key",
+    "phase",
+    "attempt",
+    "progress_seconds",
+    "output_file_id",
+    "error",
+    "created_at",
+    "updated_at",
+    "expired",
+    "cache_cleaned",
+    "video_profile",
+    "requester_id",
+    "revision"
+  ],
+  "profiles": [
+    "id",
+    "name",
+    "revision"
+  ],
+  "progress": [
+    "profile_id",
+    "item_id",
+    "position_seconds",
+    "updated_at"
+  ],
+  "queue_entries": [
+    "queue_id",
+    "position",
+    "entry_id",
+    "timeline_id"
+  ],
+  "queues": [
+    "id",
+    "revision",
+    "profile_id",
+    "repeat",
+    "shuffle_seed",
+    "current_entry_id"
+  ],
+  "registration_activations": [
+    "user_id",
+    "at"
+  ],
+  "renditions": [
+    "id",
+    "item_id",
+    "source",
+    "external_id",
+    "file_id",
+    "file_revision",
+    "source_file_id",
+    "source_revision",
+    "label",
+    "recipe_json",
+    "updated_at"
+  ],
+  "restore_baseline_epoch": [
+    "singleton",
+    "restore_epoch",
+    "captured"
+  ],
+  "restore_baselines": [
+    "profile_id",
+    "timeline_id",
+    "revision",
+    "manual_epoch"
+  ],
+  "saved_filters": [
+    "id",
+    "revision",
+    "profile_id",
+    "name",
+    "terms_json"
+  ],
+  "scan_admissions": [
+    "singleton",
+    "last"
+  ],
+  "scan_demands": [
+    "id",
+    "request_id",
+    "source_id",
+    "barrier",
+    "verify",
+    "status",
+    "job_id",
+    "error",
+    "complete_directories",
+    "incomplete_directories"
+  ],
+  "scan_incomplete_directories": [
+    "job_id",
+    "directory",
+    "reason"
+  ],
+  "scan_requests": [
+    "id",
+    "library_id",
+    "require_complete",
+    "created_at",
+    "revision",
+    "admission"
+  ],
+  "scan_schedules": [
+    "library_id",
+    "interval_seconds",
+    "next_run"
+  ],
+  "schedule_dispatch_progress": [
+    "schedule_id",
+    "after_item"
+  ],
+  "search_dirty": [
+    "item_id"
+  ],
+  "search_fts": [
+    "item_id",
+    "body"
+  ],
+  "search_fts_config": [
+    "k",
+    "v"
+  ],
+  "search_fts_content": [
+    "id",
+    "c0",
+    "c1"
+  ],
+  "search_fts_data": [
+    "id",
+    "block"
+  ],
+  "search_fts_docsize": [
+    "id",
+    "sz"
+  ],
+  "search_fts_idx": [
+    "segid",
+    "term",
+    "pgno"
+  ],
+  "search_rows": [
+    "item_id",
+    "fts_rowid"
+  ],
+  "server_identity": [
+    "singleton",
+    "server_id",
+    "restore_epoch"
+  ],
+  "server_viewing_histories": [
+    "viewing_epoch"
+  ],
+  "sidecar_subtitles": [
+    "file_id",
+    "name",
+    "fingerprint",
+    "language",
+    "forced",
+    "hearing_impaired",
+    "format"
+  ],
+  "signin_audit": [
+    "id",
+    "actor",
+    "target",
+    "action",
+    "outcome",
+    "at"
+  ],
+  "signin_families": [
+    "id",
+    "device_id",
+    "user_id",
+    "identity_id",
+    "identity_revision",
+    "method_revision",
+    "epoch",
+    "issued_at",
+    "authenticated_at",
+    "expires_at",
+    "revoked",
+    "revision",
+    "parent_hash",
+    "session_hash",
+    "last_seen_at"
+  ],
+  "signin_identities": [
+    "id",
+    "user_id",
+    "kind",
+    "provider_id",
+    "issuer",
+    "subject",
+    "address",
+    "enabled",
+    "revision",
+    "profile_ids",
+    "permissions",
+    "policy",
+    "created_at"
+  ],
+  "signin_limits": [
+    "bucket",
+    "window_start",
+    "attempts"
+  ],
+  "signin_mail_tests": [
+    "id",
+    "actor_id",
+    "config_revision",
+    "mode",
+    "recipient_domain",
+    "code_hash",
+    "attempts",
+    "created_at",
+    "expires_at",
+    "confirmed_at"
+  ],
+  "signin_outbox": [
+    "id",
+    "purpose",
+    "transaction_id",
+    "owner_id",
+    "payload",
+    "phase",
+    "attempts",
+    "next_attempt",
+    "expires_at",
+    "mode",
+    "config_revision",
+    "key_id",
+    "epoch",
+    "lease_token",
+    "lease_attempt",
+    "lease_until",
+    "ambiguous",
+    "last_error",
+    "last_attempt_at",
+    "accepted_at",
+    "recipient_domain",
+    "destination_hash",
+    "message_hash",
+    "created_at",
+    "updated_at"
+  ],
+  "signin_proofs": [
+    "id",
+    "actor_id",
+    "actor_credential_hash",
+    "action",
+    "target",
+    "epoch",
+    "code_hash",
+    "expires_at",
+    "approved_by",
+    "approver_credential_hash",
+    "consumed",
+    "created_at"
+  ],
+  "signin_providers": [
+    "id",
+    "revision",
+    "name",
+    "issuer",
+    "client_id",
+    "secret",
+    "destinations",
+    "enabled",
+    "test_at",
+    "test_ok",
+    "login_test_at"
+  ],
+  "signin_requests": [
+    "id",
+    "kind",
+    "provider_id",
+    "provider_revision",
+    "issuer",
+    "subject",
+    "email",
+    "name",
+    "address",
+    "status",
+    "revision",
+    "created_at",
+    "expires_at",
+    "user_id"
+  ],
+  "signin_settings": [
+    "singleton",
+    "revision",
+    "public_origin",
+    "reviewed_epoch",
+    "email_json",
+    "email_secret",
+    "email_revision",
+    "email_test_at",
+    "email_test_ok",
+    "registration_json",
+    "registration_revision",
+    "dkim_secret",
+    "dkim_public",
+    "email_receipt_at"
+  ],
+  "signin_transactions": [
+    "id",
+    "state_hash",
+    "provider_id",
+    "state_json",
+    "nonce",
+    "verifier",
+    "address",
+    "code_hash",
+    "ceiling_json",
+    "return_to",
+    "actor_id",
+    "actor_credential_hash",
+    "identity_id",
+    "created_at",
+    "expires_at",
+    "result",
+    "registration_name"
+  ],
+  "timeline_viewing": [
+    "profile_id",
+    "timeline_id",
+    "revision",
+    "manual_epoch",
+    "position_ms",
+    "automatic_watched",
+    "manual_watched",
+    "session_id",
+    "updated_at"
+  ],
+  "timelines": [
+    "id",
+    "edition_id",
+    "revision",
+    "duration_ms",
+    "order_group_id",
+    "order_position"
+  ],
+  "version_files": [
+    "version_id",
+    "part",
+    "file_id",
+    "file_revision",
+    "start_ms",
+    "end_ms"
+  ],
+  "viewing_events": [
+    "session_id",
+    "sequence",
+    "event_id",
+    "delivery_generation",
+    "position_ms",
+    "status",
+    "acknowledgement_json",
+    "created_at"
+  ],
+  "viewing_sessions": [
+    "id",
+    "profile_id",
+    "timeline_id",
+    "delivery_id",
+    "principal_id",
+    "revision",
+    "manual_epoch",
+    "sequence",
+    "position_ms",
+    "status",
+    "duration_ms",
+    "created_at",
+    "updated_at"
+  ],
+  "viewing_state": [
+    "profile_id",
+    "item_id",
+    "automatic_watched",
+    "manual_watched",
+    "revision",
+    "session_id"
+  ]
+}

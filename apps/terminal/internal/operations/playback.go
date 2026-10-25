@@ -42,7 +42,9 @@ type PlayResult struct {
 }
 
 // PlaybackReady interprets the principal and capabilities for discovery. It
-// grants nothing: the server authorizes the player's own requests.
+// grants nothing: the server authorizes the player's own requests. Enabled
+// playback.v2 permits launch, not every presentation route; Limits may restrict
+// the server to whole-file original/prepared playback.
 func PlaybackReady(me api.Principal, caps api.Capabilities) error {
 	if !me.Allows(api.PermPlaybackRequest) {
 		return &api.Problem{Status: 403, Code: "forbidden", Detail: "playback:request permission is required"}

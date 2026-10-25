@@ -93,3 +93,22 @@ func TestLaunchPlayerChecksCapabilityAndOpensOneTokenFreeURL(t *testing.T) {
 		t.Fatalf("no browser: %v", err)
 	}
 }
+
+func TestNativeWholeFileLaunchKeepsPermissionAndFeatureGates(t *testing.T) {
+	limits := map[string]string{"routes": "original,prepared", "timeline_binding": "whole", "subtitles": "off", "unsupported": "replan,hls,interval,multipart,components,subtitles"}
+	feature := api.Feature{ID: PlaybackFeature, Implemented: true, Enabled: true, Limits: limits}
+	p := &player{permissions: []string{api.PermPlaybackRequest}, features: []api.Feature{feature, {ID: "catalog.v2", Implemented: true, Enabled: false}}}
+	result, err := LaunchPlayer(context.Background(), p, PlayInput{Server: "https://srv", TimelineID: "whole", ProfileID: "default"}, nil)
+	if err != nil || result.URL != "https://srv/play/whole?profile_id=default" || result.Opened {
+		t.Fatalf("native whole-file launch: %+v %v", result, err)
+	}
+	p.permissions = nil
+	if err := PlaybackReady(api.Principal{}, api.Capabilities{Features: p.features}); !api.IsCode(err, "forbidden") {
+		t.Fatalf("limits granted permission: %v", err)
+	}
+	p.permissions = []string{api.PermPlaybackRequest}
+	p.features[0].Enabled = false
+	if _, err := LaunchPlayer(context.Background(), p, PlayInput{Server: "https://srv", TimelineID: "whole"}, nil); !api.IsCode(err, "feature_unavailable") {
+		t.Fatalf("disabled native player launched: %v", err)
+	}
+}

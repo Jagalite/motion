@@ -1464,11 +1464,15 @@
       "cli": "jobs cancel",
       "tui": "Processing page: c, then confirm",
       "capabilities": [
-        "processing:request (server selects per job kind)"
+        "processing:request (server selects per job kind)",
+        "TUI native offers: processing.native_preparation_controls contract 1 plus per-row cohort and cancel request hint"
       ],
       "tests": {
         "operations": [
           "internal/operations:TestLostAcknowledgementIsUncertainAndResubmissionAppliesOnce",
+          "internal/operations:TestNativeJobControlCapabilityIsSeparateAndFailClosed",
+          "internal/operations:TestNativeJobControlOffersRequireTheExactRowContract",
+          "internal/operations:TestNativeJobControlPartialWireHintsFailClosedForBothActions",
           "internal/operations:TestOutcomeClassification",
           "internal/operations:TestResumedKeysAndInputsAreValidated"
         ],
@@ -1478,6 +1482,8 @@
         ],
         "tui": [
           "internal/tui:TestUnconfirmedCancellationIsResubmittedWithItsKey",
+          "internal/tui:TestNativeJobControlsOfferOnlySupportedMixedHistoryRows",
+          "internal/tui:TestNativeJobControlsPreserveExactReplayAcrossHintChanges",
           "internal/tui:TestJobReplyAfterSignOutIsIgnored",
           "internal/tui:TestCancellationIsLeftToTheServer"
         ]
@@ -1500,7 +1506,8 @@
       "cli": "jobs retry",
       "tui": "Processing page: R reviews the job, then confirm",
       "capabilities": [
-        "processing:request (server selects per job kind)"
+        "processing:request (server selects per job kind)",
+        "TUI native offers: processing.native_preparation_controls contract 1 plus per-row cohort and retry request hint"
       ],
       "tests": {
         "operations": [
@@ -1509,11 +1516,15 @@
         ],
         "cli": [
           "internal/cli:TestJobsRetryCommandUsesFreshOperationIdentityAndReportsConflicts",
+          "internal/cli:TestNativeJobCLIReplaysWithoutCapabilityOrReviewFetch",
           "internal/cli:TestRetryCarriesTheGivenRevisionAndReportsAStaleOne",
           "internal/cli:TestUncertainOutcomeIsExplainedInHumanOutput"
         ],
         "tui": [
           "internal/tui:TestRetryReviewsTheJobAndSendsThatRevision",
+          "internal/tui:TestNativeJobControlsWithdrawalRetainsUncertainIntent",
+          "internal/tui:TestNativeJobControlsWithdrawUnsubmittedConfirmationsAndDelayedReviews",
+          "internal/tui:TestNativeJobControlsHintsWithdrawAtTheSameJobRevision",
           "internal/tui:TestRetryOfAChangedJobIsRefusedNotRefetched"
         ]
       }

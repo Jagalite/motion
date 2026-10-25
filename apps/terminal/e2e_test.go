@@ -387,4 +387,60 @@ func TestE2EPlaybackCapabilityNegotiationAgainstRealServer(t *testing.T) {
 	if play.code != cli.ExitNotFound || strings.Contains(play.stderr, "feature_unavailable") {
 		t.Fatalf("play capability negotiation: %+v", play)
 	}
+	// Consume the real native capability, source/scan owner and current timeline.
+	// This checks CLI launch negotiation and the served player destination; it
+	// does not substitute for the Rust actual plan/delivery/range fixtures.
+	tokenBytes, err := os.ReadFile(srv.operator)
+	if err != nil { t.Fatal(err) }
+	get := func(path string) map[string]any {
+		req, err := http.NewRequest(http.MethodGet, srv.url+path, nil)
+		if err != nil { t.Fatal(err) }
+		req.Header.Set("Authorization", "Bearer "+strings.TrimSpace(string(tokenBytes)))
+		response, err := (&http.Client{Timeout: 10*time.Second}).Do(req)
+		if err != nil { t.Fatal(err) }
+		defer response.Body.Close()
+		body, err := io.ReadAll(response.Body)
+		if err != nil || response.StatusCode != http.StatusOK { t.Fatalf("GET %s: %d %s %v", path, response.StatusCode, body, err) }
+		var result map[string]any
+		if err := json.Unmarshal(body, &result); err != nil { t.Fatal(err) }
+		return result
+	}
+	var playback map[string]any
+	for _, raw := range get("/api/v2/system/capabilities")["features"].([]any) {
+		f := raw.(map[string]any)
+		if f["id"] == "playback.v2" { playback = f }
+	}
+	if playback == nil || playback["enabled"] != true || playback["implemented"] != true { t.Fatalf("playback capability: %v", playback) }
+	limits := playback["limits"].(map[string]any)
+	if limits["routes"] != "original,prepared" || limits["timeline_binding"] != "whole" || limits["subtitles"] != "off" { t.Fatalf("native capability overclaims legacy routes: %v", limits) }
+	mediaRoot := t.TempDir()
+	output, err := exec.Command("ffmpeg", "-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i", "color=c=black:s=64x64:r=10", "-t", "2", "-c:v", "libx264", "-pix_fmt", "yuv420p", "-movflags", "+faststart", filepath.Join(mediaRoot, "launch.mp4")).CombinedOutput()
+	if err != nil { t.Fatalf("real compatible media required: %v %s", err, output) }
+	config := t.TempDir()
+	invoke := func(args ...string) map[string]any {
+		r := run(t, srv, config, append([]string{"--operator-token-file", srv.operator, "--json"}, args...)...)
+		if r.code != cli.ExitOK { t.Fatalf("%v: %+v", args, r) }
+		return data(t, r.stdout)
+	}
+	source := invoke("sources", "add", "Launch source", "--root", mediaRoot)
+	library := invoke("libraries", "add", "Launch library", "--source", source["id"].(string))
+	scan := invoke("libraries", "scan", library["id"].(string), "--require-complete")
+	deadline := time.Now().Add(120*time.Second)
+	for {
+		state := get("/api/v2/scans/"+scan["id"].(string))
+		if state["status"] == "complete" && state["complete"] == true { break }
+		if state["status"] == "failed" || state["status"] == "cancelled" || time.Now().After(deadline) { t.Fatalf("scan did not complete: %v", state) }
+		time.Sleep(100*time.Millisecond)
+	}
+	items := get("/api/v2/catalog/items")["items"].([]any)
+	if len(items) != 1 { t.Fatalf("expected actual scanned work: %v", items) }
+	timeline := items[0].(map[string]any)["default_timeline_id"].(string)
+	launched := invoke("play", timeline, "--profile", "default", "--print-url")
+	url := launched["url"].(string)
+	if url != srv.url+"/play/"+timeline+"?profile_id=default" { t.Fatalf("unexpected player URL: %q", url) }
+	response, err := (&http.Client{Timeout: 10*time.Second}).Get(url)
+	if err != nil { t.Fatal(err) }
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK || !strings.Contains(response.Header.Get("Content-Type"), "text/html") { t.Fatalf("player destination: %d %v", response.StatusCode, response.Header) }
+
 }

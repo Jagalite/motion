@@ -254,6 +254,14 @@ func (m Model) header(width int) []string {
 		lines = m.titled(title, count(keySearch, "title", "titles"))
 	case pageProcessing:
 		lines = m.titled("Processing", count(keyJobs, "job", "jobs"))
+		if m.readOnlyJobs() {
+			lines = append(lines, mutedStyle.Render("Read-only rendition job history; cancellation and retry unavailable."))
+		} else if m.nativeJobsSeen {
+			lines = append(lines, mutedStyle.Render("Native preparation controls only; other job history is read-only."))
+			if id := m.selectedID(); id != "" && !m.canCancelJob(id) && !m.canRetryJob(id) {
+				lines = append(lines, mutedStyle.Render("Selected job: no cancellation or retry request available."))
+			}
+		}
 	case pageScans:
 		lines = m.titled("Scans", count(keyScans, "scan", "scans"))
 	case pagePairings, pageUsers, pageInvitations:
@@ -437,7 +445,7 @@ func (m Model) body(f frame) []string {
 func (m Model) helpPage(width int) []string {
 	h := m.help
 	h.SetWidth(width)
-	lines := strings.Split(h.FullHelpView(fullHelp()), "\n")
+	lines := strings.Split(h.FullHelpView(m.fullHelp()), "\n")
 	return append(lines, "",
 		mutedStyle.Render("Tab moves between the sidebar and the page. Esc goes back."),
 		mutedStyle.Render("Press ")+keyStyle.Render("?")+mutedStyle.Render(" or ")+keyStyle.Render("esc")+mutedStyle.Render(" to close this page."))
@@ -639,7 +647,13 @@ func (m Model) shortHelp() []key.Binding {
 		b := []key.Binding{move("select")}
 		switch {
 		case m.route.page == pageProcessing && len(m.table.Rows()) > 0:
-			b = append(b, keys.Inspect, keys.Cancel, keys.Retry)
+			b = append(b, keys.Inspect)
+			if m.canCancelJob(m.selectedID()) {
+				b = append(b, keys.Cancel)
+			}
+			if m.canRetryJob(m.selectedID()) {
+				b = append(b, keys.Retry)
+			}
 		case m.route.page == pageProfiles && m.allows(api.PermProfilesManage):
 			b = append(b, keys.Choose, keys.New, keys.Rename, keys.Delete)
 		case m.route.page == pageProfiles:

@@ -3,6 +3,10 @@
 //! file revision, validated and published only while that revision is
 //! current (core `previews`), served only to callers who may read the file,
 //! and removed once the revision is no longer current.
+mod artifacts;
+#[cfg(test)]
+mod native_tests;
+
 use super::{Problem, Scope, auth::Caller, etag, idempotency_key};
 use crate::{App, db::begin_write};
 use axum::{
@@ -31,6 +35,42 @@ pub fn routes() -> Router<App> {
         .route("/media/files/{file_id}/previews/{sheet}", get(sheet))
 }
 
+/// A sealed pre-97 database keeps its existing capabilities, but cannot
+/// mint preview artifact ACKs before its authenticated ordered upgrade.
+async fn artifact_schema(conn: &mut sqlx::SqliteConnection) -> Result<bool, sqlx::Error> {
+    use sha2::Digest;
+    let ddl = include_str!("../../migrations/0097_preview_sheet_artifacts.sql");
+    let checksum: Option<Vec<u8>> =
+        sqlx::query_scalar("SELECT checksum FROM _sqlx_migrations WHERE version=97 AND success=1")
+            .fetch_optional(&mut *conn)
+            .await?;
+    if checksum.as_deref() != Some(sha2::Sha384::digest(ddl.as_bytes()).as_slice()) {
+        return Ok(false);
+    }
+    let actual: Option<String> = sqlx::query_scalar(
+        "SELECT sql FROM sqlite_schema WHERE type='table' AND name='preview_sheet_artifacts'",
+    )
+    .fetch_optional(&mut *conn)
+    .await?;
+    let expected = ddl[ddl.find("CREATE TABLE").expect("artifact DDL")..]
+        .trim()
+        .trim_end_matches(';');
+    Ok(actual
+        .as_deref()
+        .is_some_and(|sql| sql.trim().trim_end_matches(';') == expected))
+}
+
+async fn require_artifact_schema(conn: &mut sqlx::SqliteConnection) -> Result<(), Problem> {
+    if !artifact_schema(conn).await? {
+        return Err(Problem::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "preview_artifact_schema_unavailable",
+            "Preview artifacts require an authenticated database upgrade",
+        ));
+    }
+    Ok(())
+}
+
 /// How long one rendering may run before it is stopped.
 const RENDER_DEADLINE: Duration = Duration::from_secs(30 * 60);
 /// At most this many preview jobs wait or run at once.
@@ -45,6 +85,7 @@ async fn original(
     timeline: &str,
 ) -> Result<Option<(String, String, Option<u64>, u32, u32)>, Problem> {
     type Row = (String, String, String, Option<f64>, Option<i64>, String);
+    let native = super::playback::native_bound(conn).await?;
     let mut after = (String::new(), String::new());
     loop {
         let rows: Vec<Row> = sqlx::query_as(
@@ -53,10 +94,11 @@ async fn original(
              WHERE t.id=? AND v.origin='original' AND f.generated=0 AND f.available=1 AND b.file_revision=f.revision \
              AND b.start_ms IS NULL AND b.end_ms IS NULL \
              AND NOT EXISTS(SELECT 1 FROM version_files o WHERE o.version_id=v.id AND o.part<>1) \
-             AND f.library_id IN (SELECT id FROM libraries WHERE enabled=1) \
+             AND (? OR f.library_id IN (SELECT id FROM libraries WHERE enabled=1)) \
              AND (v.id>? OR (v.id=? AND f.id>?)) ORDER BY v.id,f.id LIMIT 100",
         )
         .bind(timeline)
+        .bind(native)
         .bind(&after.0)
         .bind(&after.0)
         .bind(&after.1)
@@ -66,7 +108,19 @@ async fn original(
             return Ok(None);
         };
         after = (version.clone(), file.clone());
-        for (_, file, revision, seconds, _timeline_ms, tracks) in rows {
+        for (version, file, revision, mut seconds, _timeline_ms, mut tracks) in rows {
+            if native {
+                if !super::playback::native_version_ready(conn, &version).await? {
+                    continue;
+                }
+                let Some(facts) =
+                    crate::delivery::native_previews::facts_in(conn, &file, &revision).await?
+                else {
+                    continue;
+                };
+                seconds = facts.seconds;
+                tracks = facts.tracks;
+            }
             if !playscale_core::playback_session::readable(
                 principal,
                 super::content::file_facts(conn, &file).await?.as_ref(),
@@ -109,6 +163,15 @@ pub(crate) async fn layout_identity(
     file: &str,
     revision: &str,
 ) -> Result<Option<String>, sqlx::Error> {
+    if super::playback::native_bound(conn)
+        .await
+        .map_err(|e| sqlx::Error::Protocol(format!("{e:?}")))?
+    {
+        return crate::delivery::native_previews::facts_in(conn, file, revision)
+            .await
+            .map(|facts| facts.map(|facts| facts.identity()))
+            .map_err(|e| sqlx::Error::Protocol(format!("{e:?}")));
+    }
     let facts: Option<(Option<f64>, String)> = sqlx::query_as("SELECT duration_seconds,tracks_json FROM media_files WHERE id=? AND revision=? AND available=1")
         .bind(file).bind(revision).fetch_optional(conn).await?;
     Ok(facts.map(|facts| super::sha256(serde_json::to_string(&facts).unwrap().as_bytes())))
@@ -185,6 +248,26 @@ async fn manifest_body(
     .bind(&identity)
     .fetch_optional(&mut *tx)
     .await?;
+    if super::playback::native_bound(tx).await? {
+        if let Some(row) = &ready {
+            if !(1..=20).contains(&row.7) {
+                return Err(Problem::new(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "preview_artifact_unqualified",
+                    "Preview output has no qualified artifact inventory",
+                ));
+            }
+            let count: i64 = sqlx::query_scalar("SELECT count(*) FROM preview_sheet_artifacts WHERE file_id=? AND file_revision=? AND layout_identity=? AND sheet BETWEEN 1 AND ?")
+                .bind(file).bind(revision).bind(&identity).bind(row.7).fetch_one(&mut *tx).await?;
+            if count != row.7 {
+                return Err(Problem::new(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "preview_artifact_unqualified",
+                    "Preview output requires a qualified rebuild",
+                ));
+            }
+        }
+    }
     let pending: Option<String> = sqlx::query_scalar(
         "SELECT id FROM preview_jobs WHERE file_id=? AND file_revision=? AND layout_identity=? AND phase IN ('queued','running','cancelling') LIMIT 1",
     )
@@ -216,9 +299,13 @@ async fn manifest(
     Path(timeline): Path<String>,
 ) -> Result<Json<Value>, Problem> {
     caller.require(Permission::CatalogRead)?;
-    let mut tx = app.db.begin().await?;
-    super::playback::readable_timeline(&mut tx, &caller.principal, &timeline).await?;
-    let Some((file, revision, ..)) = original(&mut tx, &caller.principal, &timeline).await? else {
+    let mut tx = super::playback::begin_catalog_application(&app, false).await?;
+    let principal = caller
+        .reauthorize(&mut tx, Some(Permission::CatalogRead))
+        .await?;
+    require_artifact_schema(&mut tx).await?;
+    super::playback::readable_timeline(&mut tx, &principal, &timeline).await?;
+    let Some((file, revision, ..)) = original(&mut tx, &principal, &timeline).await? else {
         return Ok(Json(json!({"timeline_id": timeline, "status": "none"})));
     };
     let body = manifest_body(&mut tx, &timeline, &file, &revision).await?;
@@ -239,10 +326,11 @@ async fn create(
     caller.require(Permission::ProcessingRequest)?;
     let key = idempotency_key(&headers)?;
     let _guard = app.jobs.lock().await;
-    let mut tx = begin_write(&app.db).await?;
+    let mut tx = super::playback::begin_catalog_application(&app, true).await?;
     let principal = caller
         .reauthorize(&mut tx, Some(Permission::ProcessingRequest))
         .await?;
+    require_artifact_schema(&mut tx).await?;
     let record = Scope {
         principal: &principal.id,
         operation: "createTimelinePreviews",
@@ -333,10 +421,43 @@ async fn sheet(
     Query(query): Query<SheetQuery>,
 ) -> Result<Response, Problem> {
     caller.require(Permission::CatalogRead)?;
-    let _guard = app.jobs.lock().await;
-    let mut tx = app.db.begin().await?;
+    let (mut reply, result) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        let stop = CancellationToken::new();
+        let work = sheet_owned(app, caller, file, sheet, query, stop.clone());
+        tokio::pin!(work);
+        let outcome = tokio::select! { result=&mut work=>result, _=reply.closed()=>{stop.cancel();work.await} };
+        let _ = reply.send(outcome);
+    });
+    result.await.map_err(Problem::internal)?
+}
+
+async fn sheet_owned(
+    app: App,
+    caller: Caller,
+    file: String,
+    sheet: u32,
+    query: SheetQuery,
+    stop: CancellationToken,
+) -> Result<Response, Problem> {
+    let lease = std::sync::Arc::new(tokio::select! {
+        _=stop.cancelled()=>return Err(Problem::not_found()),
+        lease=app.processing.execution.reserve(format!("preview-read:{file}"), playscale_core::work::Class::Interactive, 1)=>lease.map_err(|_| Problem::not_found())?,
+    });
+    let admission = std::sync::Arc::new(
+        app.processing
+            .artifacts
+            .pin([file.clone()])
+            .ok_or_else(Problem::not_found)?,
+    );
+    let guard = app.jobs.clone().lock_owned().await;
+    let mut tx = super::playback::begin_catalog_application(&app, false).await?;
+    let principal = caller
+        .reauthorize(&mut tx, Some(Permission::CatalogRead))
+        .await?;
+    require_artifact_schema(&mut tx).await?;
     if !playscale_core::playback_session::readable(
-        &caller.principal,
+        &principal,
         super::content::file_facts(&mut tx, &file).await?.as_ref(),
     ) {
         return Err(Problem::not_found());
@@ -357,33 +478,80 @@ async fn sheet(
     .bind(&query.layout)
     .fetch_optional(&mut *tx)
     .await?;
-    tx.commit().await?;
     let sheets = sheets.ok_or_else(Problem::not_found)?;
     if sheet == 0 || i64::from(sheet) > sheets {
         return Err(Problem::not_found());
     }
-    let path = published_dir(&app, &file, &query.revision).join(format!("sheet-{sheet}.jpg"));
-    use tokio::io::AsyncReadExt;
-    let file = tokio::fs::File::open(&path)
+    if app.native_catalog.is_some() {
+        let facts = crate::delivery::native_previews::facts_in(&mut tx, &file, &query.revision)
+            .await?
+            .ok_or_else(Problem::not_found)?;
+        let (writer, source_current) = crate::delivery::native_previews::validate_path_in(
+            tx,
+            &facts,
+            lease.clone(),
+            admission.clone(),
+            &stop,
+        )
         .await
         .map_err(|_| Problem::not_found())?;
-    if file
-        .metadata()
-        .await
-        .map_err(|_| Problem::not_found())?
-        .len()
-        > core::MAX_SHEET_BYTES
-    {
+        tx = writer;
+        if !source_current {
+            return Err(Problem::not_found());
+        }
+    }
+    let artifact: Option<(String, i64)> = if app.native_catalog.is_some() {
+        Some(sqlx::query_as("SELECT digest,size_bytes FROM preview_sheet_artifacts WHERE file_id=? AND file_revision=? AND sheet=? AND layout_identity=?")
+            .bind(&file).bind(&query.revision).bind(i64::from(sheet)).bind(&query.layout)
+            .fetch_optional(&mut *tx).await?.ok_or_else(Problem::not_found)?)
+    } else {
+        None
+    };
+    let root = previews_root(&app);
+    let relative = PathBuf::from(&file)
+        .join(&query.revision)
+        .join(format!("sheet-{sheet}.jpg"));
+    let (tx, bytes) = crate::execution::prepare(
+        lease,
+        &stop,
+        Duration::from_secs(5),
+        move || -> anyhow::Result<_> {
+            let _custody = (guard, admission);
+            use std::io::Read;
+            let mut file = crate::scan::open_file(&root, &relative)?;
+            let before = file.metadata()?;
+            anyhow::ensure!(
+                before.is_file() && before.len() <= core::MAX_SHEET_BYTES,
+                "invalid preview sheet"
+            );
+            let mut bytes = Vec::new();
+            std::io::Read::by_ref(&mut file)
+                .take(core::MAX_SHEET_BYTES + 1)
+                .read_to_end(&mut bytes)?;
+            anyhow::ensure!(
+                bytes.len() as u64 <= core::MAX_SHEET_BYTES
+                    && crate::scan::fingerprint(&before)
+                        == crate::scan::fingerprint(&file.metadata()?),
+                "preview sheet changed"
+            );
+            if let Some((digest, size)) = artifact {
+                anyhow::ensure!(
+                    size == bytes.len() as i64 && digest == super::sha256(&bytes),
+                    "preview artifact does not match ACK"
+                );
+            }
+            Ok((tx, bytes))
+        },
+        || {},
+    )
+    .await
+    .ok_or_else(Problem::not_found)?
+    .map_err(Problem::internal)?
+    .map_err(|_| Problem::not_found())?;
+    if stop.is_cancelled() {
         return Err(Problem::not_found());
     }
-    let mut bytes = Vec::new();
-    file.take(core::MAX_SHEET_BYTES + 1)
-        .read_to_end(&mut bytes)
-        .await
-        .map_err(|_| Problem::not_found())?;
-    if bytes.len() as u64 > core::MAX_SHEET_BYTES {
-        return Err(Problem::not_found());
-    }
+    tx.commit().await?;
     Ok((
         [
             (header::CONTENT_TYPE, "image/jpeg".to_owned()),
@@ -401,6 +569,60 @@ async fn sheet(
 /// Render queued preview jobs one at a time, and remove previews whose
 /// revision is no longer current.
 pub async fn worker(app: App, stop: CancellationToken) -> anyhow::Result<()> {
+    worker_inner(app, stop, None).await
+}
+
+pub(crate) async fn service_worker(
+    app: App,
+    stop: CancellationToken,
+    intent: crate::native_service::ServiceStopIntent,
+) -> anyhow::Result<()> {
+    worker_inner(app, stop, Some(intent)).await
+}
+
+#[derive(Debug)]
+struct PreviewReservationRejected(playscale_core::work::Rejection);
+impl std::fmt::Display for PreviewReservationRejected {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "preview reservation rejected: {:?}", self.0)
+    }
+}
+impl std::error::Error for PreviewReservationRejected {}
+
+pub(crate) async fn reserve_execution(
+    coordinator: &std::sync::Arc<crate::execution::Coordinator>,
+    stop: &CancellationToken,
+    intent: Option<&crate::native_service::ServiceStopIntent>,
+    units: u32,
+) -> Result<Option<crate::execution::Lease>, playscale_core::work::Rejection> {
+    use playscale_core::work::{Class, Rejection};
+    tokio::select! {
+        _ = stop.cancelled() => Ok(None),
+        result = coordinator.reserve(format!("preview:{}", crate::new_id()), Class::Maintenance, units) => {
+            match result {
+                Ok(lease) => Ok(Some(lease)),
+                Err(Rejection::AdmissionClosed) if intent.is_some_and(|i| i.requested_for(coordinator)) => Ok(None),
+                Err(error) => Err(error),
+            }
+        }
+    }
+}
+
+async fn worker_inner(
+    app: App,
+    stop: CancellationToken,
+    intent: Option<crate::native_service::ServiceStopIntent>,
+) -> anyhow::Result<()> {
+    let stop = stop.child_token();
+    let _stop_on_drop = stop.clone().drop_guard();
+    {
+        let mut conn = app.db.acquire().await?;
+        if !artifact_schema(&mut conn).await? {
+            drop(conn);
+            stop.cancelled().await;
+            return Ok(());
+        }
+    }
     recover(&app).await?;
     let mut last_retention = std::time::Instant::now() - Duration::from_secs(3600);
     loop {
@@ -423,22 +645,59 @@ pub async fn worker(app: App, stop: CancellationToken) -> anyhow::Result<()> {
         }
         // Capacity first, as preparations do: a preview never starves
         // interactive playback of encoder units.
-        let lease = tokio::select! {
-            _ = stop.cancelled() => return Ok(()),
-            lease = app.processing.execution.reserve(format!("preview:{}", crate::new_id()), playscale_core::work::Class::Maintenance, 1)
-                => lease.map_err(|e| anyhow::anyhow!("preview reservation rejected: {e:?}"))?,
+        let Some(lease) = reserve_execution(&app.processing.execution, &stop, intent.as_ref(), 1)
+            .await
+            .map_err(PreviewReservationRejected)?
+        else {
+            return Ok(());
         };
         let lease = std::sync::Arc::new(lease);
-        if let Some(job) = start(&app).await? {
-            let rendered = render(&app, &job, &stop, &lease).await;
-            // Stopping the server leaves the attempt to be recovered at the
-            // next start, not failed.
-            if stop.is_cancelled() {
+        let started = match start(&app).await {
+            Ok(job) => job,
+            Err(error)
+                if stop.is_cancelled()
+                    && error
+                        .downcast_ref::<crate::native_catalog::OrdinaryAdmissionDraining>()
+                        .is_some() =>
+            {
                 return Ok(());
             }
-            // A renderer not confirmed gone keeps its staging (and witness),
-            // so recovery after a restart still accounts for it.
-            finish(&app, &job, rendered, lease.is_stuck()).await?;
+            Err(error) => return Err(error),
+        };
+        if let Some(job) = started {
+            let owned_app = app.clone();
+            let owned_stop = stop.clone();
+            let owned_lease = lease.clone();
+            tokio::spawn(async move {
+                let admission = std::sync::Arc::new(
+                    owned_app
+                        .processing
+                        .artifacts
+                        .pin([job.file.clone()])
+                        .ok_or_else(|| anyhow::anyhow!("preview source is being collected"))?,
+                );
+                let rendered = render(
+                    &owned_app,
+                    &job,
+                    &owned_stop,
+                    &owned_lease,
+                    admission.clone(),
+                )
+                .await;
+                if owned_stop.is_cancelled() {
+                    return Ok(());
+                }
+                finish(
+                    &owned_app,
+                    &job,
+                    rendered,
+                    owned_lease.clone(),
+                    admission,
+                    &owned_stop,
+                )
+                .await
+            })
+            .await??;
         }
         drop(lease);
     }
@@ -495,7 +754,7 @@ async fn recover(app: &App) -> anyhow::Result<()> {
 /// Start the oldest queued job (core `jobs::transition`).
 async fn start(app: &App) -> anyhow::Result<Option<Started>> {
     let _guard = app.jobs.lock().await;
-    let mut tx = begin_write(&app.db).await?;
+    let mut tx = super::playback::begin_catalog_application_typed(app, true).await?;
     let row: Option<(String, String, i64, String, String)> = sqlx::query_as(
         "SELECT id,phase,attempt,file_id,file_revision FROM preview_jobs WHERE phase='queued' ORDER BY created_at,id LIMIT 1",
     )
@@ -548,14 +807,66 @@ async fn render(
     job: &Started,
     stop: &CancellationToken,
     lease: &std::sync::Arc<crate::execution::Lease>,
-) -> anyhow::Result<(Layout, Vec<Sheet>, bool)> {
-    let facts: (Option<f64>, String) = sqlx::query_as(
-        "SELECT duration_seconds,tracks_json FROM media_files WHERE id=? AND revision=?",
-    )
-    .bind(&job.file)
-    .bind(&job.revision)
-    .fetch_one(&app.db)
-    .await?;
+    admission: std::sync::Arc<impl Send + Sync + 'static>,
+) -> anyhow::Result<(
+    Layout,
+    Vec<Sheet>,
+    bool,
+    Option<Value>,
+    std::sync::Arc<std::fs::File>,
+    Vec<artifacts::Artifact>,
+)> {
+    let mut initial_writer = super::playback::begin_catalog_application_typed(app, true).await?;
+    let native = super::playback::native_bound(&mut initial_writer)
+        .await
+        .map_err(|e| anyhow::anyhow!("{e:?}"))?;
+    let mut native_writer = if native {
+        Some(initial_writer)
+    } else {
+        drop(initial_writer);
+        None
+    };
+    let native_facts = if let Some(tx) = native_writer.as_mut() {
+        let (requester, credential, ingress): (String, Option<String>, Option<String>) = sqlx::query_as(
+            "SELECT requester_id,credential_hash,ingress_id FROM preview_jobs WHERE id=? AND phase='running' AND attempt=?")
+            .bind(&job.id).bind(job.attempt).fetch_one(&mut **tx).await?;
+        let principal = crate::metadata_jobs::principal(
+            tx,
+            &requester,
+            credential.as_deref(),
+            ingress.as_deref(),
+            Permission::ProcessingRequest,
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("{e:?}"))?;
+        let readable = playscale_core::playback_session::readable(
+            &principal,
+            super::content::file_facts(tx, &job.file)
+                .await
+                .map_err(|e| anyhow::anyhow!("{e:?}"))?
+                .as_ref(),
+        );
+        anyhow::ensure!(readable, "preview requester no longer authorized");
+        Some(
+            crate::delivery::native_previews::facts_in(tx, &job.file, &job.revision)
+                .await
+                .map_err(|e| anyhow::anyhow!("{e:?}"))?
+                .ok_or_else(|| anyhow::anyhow!("preview original unavailable"))?,
+        )
+    } else {
+        None
+    };
+    let facts: (Option<f64>, String) = if let Some(facts) = &native_facts {
+        (facts.seconds, facts.tracks.clone())
+    } else {
+        sqlx::query_as(
+            "SELECT duration_seconds,tracks_json FROM media_files WHERE id=? AND revision=?",
+        )
+        .bind(&job.file)
+        .bind(&job.revision)
+        .fetch_one(&app.db)
+        .await?
+    };
     let expected: String =
         sqlx::query_scalar("SELECT layout_identity FROM preview_jobs WHERE id=?")
             .bind(&job.id)
@@ -581,13 +892,53 @@ async fn render(
         video.display_dimensions().1,
     )
     .ok_or_else(|| anyhow::anyhow!("no layout"))?;
-    let (input, fingerprint) =
+    let (input, fingerprint) = if let (Some(tx), Some(facts)) =
+        (native_writer.take(), native_facts.as_ref())
+    {
+        crate::delivery::native_previews::open_in(tx, facts, lease.clone(), admission.clone(), stop)
+            .await?
+    } else {
         crate::delivery::open_source(app, &job.file, &job.revision, lease.clone(), stop)
             .await
-            .map_err(|e| anyhow::anyhow!("source: {}", e.parts().1))?;
+            .map_err(|e| anyhow::anyhow!("source: {}", e.parts().1))?
+    };
+    let input = std::sync::Arc::new(input);
+    if app.native_catalog.is_some() {
+        let root = previews_root(app);
+        let guard = app.jobs.clone().lock_owned().await;
+        // Pool-owned transaction must outlive this borrowed App when the
+        // blocking capacity walk retains custody after caller cancellation.
+        let mut writer: sqlx::Transaction<'static, sqlx::Sqlite> =
+            app.db.begin_with("BEGIN IMMEDIATE").await?;
+        let active: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM preview_jobs WHERE phase IN ('running','cancelling')",
+        )
+        .fetch_one(&mut *writer)
+        .await?;
+        let owners = app.processing.execution.snapshot();
+        // A recovered/requeued attempt may still own blocking preparation
+        // before publishing its witness. Count all unsettled owners
+        // conservatively and add disjoint sets (duplicates can refuse capacity),
+        // rather than treating absent witness or phase as exit.
+        let reserved = (active.max(1) as u64)
+            .checked_add((owners.running + owners.terminating + owners.stuck.len()) as u64)
+            .ok_or_else(|| anyhow::anyhow!("preview owner reservation overflow"))?;
+        let custody = (lease.clone(), admission.clone(), input.clone());
+        let (writer, result) = tokio::task::spawn_blocking(move || {
+            let _custody = (custody, guard);
+            let result = artifacts::capacity(&root, reserved);
+            (writer, result)
+        })
+        .await?;
+        writer.commit().await?;
+        result?;
+    }
     let staging = staging_dir(app, &job.id, job.attempt);
-    let _ = tokio::fs::remove_dir_all(&staging).await;
-    tokio::fs::create_dir_all(&staging).await?;
+    // Attempts are descriptor-relative and create-only, including ancestors.
+    let staging_descriptor = std::sync::Arc::new(artifacts::create_staging(
+        &previews_root(app),
+        &format!("{}-{}", job.id, job.attempt),
+    )?);
     let (w, h) = (layout.tile_width, layout.tile_height);
     // One thumbnail per tile, at exactly 0, interval, 2·interval, …: the
     // last frame at or before each (key frames only; `round=up` places a
@@ -601,7 +952,8 @@ async fn render(
         interval = layout.interval_ms,
     );
     let tiles = layout.tiles.to_string();
-    let output = staging.join("thumb-%d.jpg");
+    // fd 5 anchors renderer output to the created staging directory.
+    let output = PathBuf::from("/dev/fd/5/thumb-%d.jpg");
     let mut supervisor = tokio::process::Command::new(&app.processing.supervisor);
     supervisor
         .arg("--internal-ffmpeg-supervisor")
@@ -636,19 +988,34 @@ async fn render(
         .kill_on_drop(false);
     // fd 3: the validated source; fd 4: the ownership witness. Capacity
     // returns only once the witness is free (recovered after a restart).
-    let owner = staging.join(".owner");
+    use std::os::fd::AsRawFd;
+    let owner = PathBuf::from(format!("/dev/fd/{}/.owner", staging_descriptor.as_raw_fd()));
     let (witness, held) = crate::execution::Witness::create(&owner)?;
     #[cfg(unix)]
-    crate::execution::inherit(&mut supervisor, &[&input, &held.0]);
+    crate::execution::inherit(&mut supervisor, &[&input, &held.0, &staging_descriptor]);
     lease.started(&owner)?;
     let child = supervisor.spawn();
     drop(held);
-    let mut child = child?;
+    let mut child = match child {
+        Ok(child) => child,
+        Err(error) => {
+            let retained = (input.clone(), staging_descriptor.clone(), admission.clone());
+            crate::execution::confirm_exit(
+                lease,
+                None,
+                Some(witness),
+                crate::execution::TERMINATION_DEADLINE,
+                move || drop(retained),
+            )
+            .await;
+            return Err(error.into());
+        }
+    };
     let heartbeat = child.stdin.take();
     let deadline = tokio::time::Instant::now() + RENDER_DEADLINE;
     let status = loop {
         tokio::select! {
-            status = child.wait() => break Some(status?),
+            status = child.wait() => break Some(status),
             _ = tokio::time::sleep(Duration::from_millis(500)) => {
                 if stop.is_cancelled()
                     || lease.termination_requested().is_cancelled()
@@ -661,82 +1028,51 @@ async fn render(
         }
     };
     drop(heartbeat);
+    let retained_input = input.clone();
+    let retained_admission = admission.clone();
+    let retained_staging = staging_descriptor.clone();
     let confirmed = crate::execution::confirm_exit(
         lease,
-        status.is_none().then_some(child),
+        (!status.as_ref().is_some_and(Result::is_ok)).then_some(child),
         Some(witness),
         crate::execution::TERMINATION_DEADLINE,
-        || {},
+        move || {
+            drop((retained_input, retained_admission, retained_staging));
+        },
     )
     .await;
     anyhow::ensure!(confirmed, "renderer outlived its supervisor");
-    let status = status.ok_or_else(|| anyhow::anyhow!("rendering stopped"))?;
+    let status = status.ok_or_else(|| anyhow::anyhow!("rendering stopped"))??;
     anyhow::ensure!(status.success(), "renderer failed");
     // The renderer read the descriptor after it was validated: observe it
     // again before trusting what it rendered.
+    let checked_input = input.clone();
+    let stat_custody = (lease.clone(), admission.clone());
     let unchanged = tokio::task::spawn_blocking(move || {
-        input
+        let _custody = stat_custody;
+        checked_input
             .metadata()
             .is_ok_and(|m| crate::scan::fingerprint(&m) == fingerprint)
     })
     .await?;
-    let observed = tokio::task::spawn_blocking(move || -> anyhow::Result<(bool, Vec<Sheet>)> {
-        let mut thumbnails = Vec::new();
-        for n in 1.. {
-            let path = staging.join(format!("thumb-{n}.jpg"));
-            let Ok(meta) = std::fs::metadata(&path) else {
-                break;
-            };
-            let (width, height) = image::image_dimensions(&path)?;
-            thumbnails.push(Sheet {
-                width,
-                height,
-                bytes: meta.len(),
-            });
-        }
-        if !core::valid_thumbnails(&layout, &thumbnails) {
-            return Ok((false, vec![]));
-        }
-        // Assemble each sheet row by row from its thumbnails.
-        let per_sheet = layout.columns * layout.rows;
-        let mut sheets = Vec::new();
-        for sheet in 0..layout.sheets {
-            let mut canvas = image::RgbImage::new(
-                layout.tile_width * layout.columns,
-                layout.tile_height * layout.rows,
-            );
-            for within in 0..per_sheet {
-                let n = sheet * per_sheet + within;
-                if n >= layout.tiles {
-                    break;
-                }
-                let tile = image::open(staging.join(format!("thumb-{}.jpg", n + 1)))?.to_rgb8();
-                image::imageops::replace(
-                    &mut canvas,
-                    &tile,
-                    i64::from(within % layout.columns * layout.tile_width),
-                    i64::from(within / layout.columns * layout.tile_height),
-                );
-            }
-            let path = staging.join(format!("sheet-{}.jpg", sheet + 1));
-            let mut file = std::io::BufWriter::new(std::fs::File::create(&path)?);
-            image::codecs::jpeg::JpegEncoder::new_with_quality(&mut file, 80)
-                .encode_image(&canvas)?;
-            std::io::Write::flush(&mut file)?;
-            drop(file);
-            sheets.push(Sheet {
-                width: canvas.width(),
-                height: canvas.height(),
-                bytes: std::fs::metadata(&path)?.len(),
-            });
-        }
-        for n in 1..=layout.tiles {
-            std::fs::remove_file(staging.join(format!("thumb-{n}.jpg")))?;
-        }
-        Ok((true, sheets))
+    let assembly_custody = (lease.clone(), admission.clone(), input.clone());
+    let assembled = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+        let _custody = assembly_custody;
+        artifacts::named_directory(&staging, &staging_descriptor)?;
+        let output = artifacts::assemble(&staging_descriptor, &layout)?;
+        artifacts::named_directory(&staging, &staging_descriptor)?;
+        Ok(output)
     })
     .await??;
-    Ok((layout, observed.1, unchanged && observed.0))
+    let sheets = assembled.iter().map(|a| a.sheet).collect();
+    Ok((
+        layout,
+        sheets,
+        unchanged,
+        native_facts.map(|f| f.commitment),
+        input,
+        assembled,
+    ))
 }
 
 /// Publish a valid attempt's sheets, or discard them (core
@@ -745,14 +1081,34 @@ async fn render(
 async fn finish(
     app: &App,
     job: &Started,
-    rendered: anyhow::Result<(Layout, Vec<Sheet>, bool)>,
-    stuck: bool,
+    rendered: anyhow::Result<(
+        Layout,
+        Vec<Sheet>,
+        bool,
+        Option<Value>,
+        std::sync::Arc<std::fs::File>,
+        Vec<artifacts::Artifact>,
+    )>,
+    lease: std::sync::Arc<crate::execution::Lease>,
+    admission: std::sync::Arc<impl Send + Sync + 'static>,
+    stop: &CancellationToken,
 ) -> anyhow::Result<()> {
     if let Err(error) = &rendered {
         tracing::warn!(job_id=%job.id, %error, "preview rendering failed");
     }
     let _guard = app.jobs.lock().await;
-    let mut tx = begin_write(&app.db).await?;
+    let mut tx = match super::playback::begin_catalog_application_typed(app, true).await {
+        Ok(tx) => tx,
+        Err(error)
+            if stop.is_cancelled()
+                && error
+                    .downcast_ref::<crate::native_catalog::OrdinaryAdmissionDraining>()
+                    .is_some() =>
+        {
+            return Ok(());
+        }
+        Err(error) => return Err(error),
+    };
     let (phase, attempt, requester, credential, ingress): (
         String,
         i64,
@@ -793,12 +1149,33 @@ async fn finish(
         Err(_) => false,
     };
     let (layout, sheets_valid) = match &rendered {
-        Ok((layout, sheets, unchanged)) => (
+        Ok((layout, sheets, unchanged, _, _, _)) => (
             Some(*layout),
             *unchanged && core::valid_sheets(layout, sheets),
         ),
         Err(_) => (None, false),
     };
+    let mut source_current = source_current;
+    if app.native_catalog.is_some() {
+        let current = crate::delivery::native_previews::facts_in(&mut tx, &job.file, &job.revision)
+            .await
+            .map_err(|e| anyhow::anyhow!("{e:?}"))?;
+        match (current, rendered.as_ref().ok().and_then(|r| r.3.as_ref())) {
+            (Some(current), Some(expected)) if &current.commitment == expected => {
+                let (writer, path_current) = crate::delivery::native_previews::validate_path_in(
+                    tx,
+                    &current,
+                    lease.clone(),
+                    admission.clone(),
+                    stop,
+                )
+                .await?;
+                tx = writer;
+                source_current &= path_current;
+            }
+            _ => source_current = false,
+        }
+    }
     let facts = PublicationFacts {
         attempt_current: phase == "running" && attempt == job.attempt,
         source_current,
@@ -816,11 +1193,11 @@ async fn finish(
             success: facts.publishable(),
         },
     );
-    let staging = staging_dir(app, &job.id, job.attempt);
+    let _publication_input = rendered.as_ref().ok().map(|r| r.4.clone());
+    let mut publication_custody = None;
     if effects.iter().any(|e| matches!(e, Effect::Publish { .. }))
         && let Some(layout) = layout
     {
-        let target = published_dir(app, &job.file, &job.revision);
         let published = sqlx::query_scalar::<_, i64>(
             "SELECT 1 FROM previews WHERE file_id=? AND file_revision=? AND layout_identity=?",
         )
@@ -831,44 +1208,39 @@ async fn finish(
         .await?
         .is_some();
         if !published {
-            // Durable sheets and their directory entries, then the immutable
-            // directory under durable ancestors, then the row: a committed
-            // row never names sheets a power loss could take away.
-            let (from, to, root) = (staging.clone(), target.clone(), previews_root(app));
-            tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
-                let sync = |dir: &std::path::Path| -> anyhow::Result<()> {
-                    #[cfg(unix)]
-                    std::fs::File::open(dir)?.sync_all()?;
-                    Ok(())
-                };
-                let _ = std::fs::remove_file(from.join(".owner"));
-                for entry in std::fs::read_dir(&from)? {
-                    std::fs::File::open(entry?.path())?.sync_all()?;
-                }
-                sync(&from)?;
-                if let Some(parent) = root.parent() {
-                    sync(parent)?;
-                }
-                if to.exists() {
-                    std::fs::remove_dir_all(&to)?;
-                }
-                let parent = to.parent().unwrap_or(&to).to_path_buf();
-                let created = !parent.exists();
-                std::fs::create_dir_all(&parent)?;
-                if created {
-                    sync(&root)?;
-                }
-                std::fs::rename(&from, &to)?;
-                sync(&to)?;
-                sync(&parent)?;
-                Ok(())
-            })
-            .await??;
+            // Publish only exact in-memory artifacts through held directories.
+            // Collisions/refusals leave an unacknowledged orphan, never delete
+            // a possibly substituted path.
+            let root = previews_root(app);
+            let file = job.file.clone();
+            let revision = job.revision.clone();
+            let (_, _, _, _, input, output) = rendered?;
+            let retained = (lease.clone(), admission.clone(), input);
+            let (writer, output, custody) =
+                tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+                    let _retained = retained;
+                    let custody = artifacts::publish(&root, &file, &revision, &output)?;
+                    Ok((tx, output, custody))
+                })
+                .await??;
+            tx = writer;
+            publication_custody = Some(custody);
             sqlx::query("INSERT INTO previews(file_id,file_revision,job_id,interval_ms,tile_width,tile_height,columns,rows,tiles,sheets,created_at,layout_identity) VALUES (?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(file_id,file_revision) DO UPDATE SET job_id=excluded.job_id,interval_ms=excluded.interval_ms,tile_width=excluded.tile_width,tile_height=excluded.tile_height,columns=excluded.columns,rows=excluded.rows,tiles=excluded.tiles,sheets=excluded.sheets,created_at=excluded.created_at,layout_identity=excluded.layout_identity")
                 .bind(&job.file).bind(&job.revision).bind(&job.id)
                 .bind(layout.interval_ms as i64).bind(layout.tile_width).bind(layout.tile_height)
                 .bind(layout.columns).bind(layout.rows).bind(layout.tiles).bind(layout.sheets)
                 .bind(crate::now()).bind(&identity).execute(&mut *tx).await?;
+            sqlx::query("DELETE FROM preview_sheet_artifacts WHERE file_id=? AND file_revision=?")
+                .bind(&job.file)
+                .bind(&job.revision)
+                .execute(&mut *tx)
+                .await?;
+            for (index, artifact) in output.iter().enumerate() {
+                sqlx::query("INSERT INTO preview_sheet_artifacts(file_id,file_revision,sheet,layout_identity,digest,size_bytes) VALUES (?,?,?,?,?,?)")
+                    .bind(&job.file).bind(&job.revision).bind((index+1) as i64)
+                    .bind(&identity).bind(&artifact.digest).bind(artifact.bytes.len() as i64)
+                    .execute(&mut *tx).await?;
+            }
         }
     }
     sqlx::query("UPDATE preview_jobs SET phase=?,error=? WHERE id=?")
@@ -878,10 +1250,9 @@ async fn finish(
         .execute(&mut *tx)
         .await?;
     tx.commit().await?;
+    drop(publication_custody);
     drop(_guard);
-    if !stuck {
-        let _ = tokio::fs::remove_dir_all(&staging).await;
-    }
+    // Staging/orphan retention owns later cleanup; no check-then-unlink here.
     Ok(())
 }
 
@@ -982,7 +1353,9 @@ fn orphan_page(root: &std::path::Path) -> Vec<(String, String, PathBuf)> {
 pub async fn retain(app: &App) -> anyhow::Result<()> {
     {
         let _guard = app.jobs.lock().await;
-        let mut tx = begin_write(&app.db).await?;
+        let mut tx = super::playback::begin_catalog_application(app, true)
+            .await
+            .map_err(|e| anyhow::anyhow!("{e:?}"))?;
         let mut stale: Vec<(String, String)> = sqlx::query_as(
             "SELECT file_id,file_revision FROM previews p WHERE NOT EXISTS(SELECT 1 FROM media_files f WHERE f.id=p.file_id AND f.revision=p.file_revision AND f.available=1) LIMIT 100",
         )
@@ -1026,6 +1399,12 @@ pub async fn retain(app: &App) -> anyhow::Result<()> {
                 .await?;
         }
         tx.commit().await?;
+        if app.native_catalog.is_some() {
+            // ACK withdrawal is safe. Native path deletion is deferred until
+            // an identity-safe cleanup owner exists; render admission counts
+            // these retained bytes and bounds further output.
+            return Ok(());
+        }
         // Published directories without a row (a publication interrupted
         // between its rename and its commit), under the lock publication
         // holds, so none is removed while being published.

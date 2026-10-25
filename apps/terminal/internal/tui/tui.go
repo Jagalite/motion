@@ -120,6 +120,8 @@ type Model struct {
 	// whose outcome is unknown.
 	acting map[string]operations.JobActionKind
 	jobs   *operations.PendingJobActions
+	// Once observed, disappearing native leaves cannot enable legacy controls.
+	nativeJobsSeen bool
 	// epoch counts credential rejections: a reply to an action or review
 	// sent before the latest one is ignored.
 	epoch int
@@ -431,6 +433,9 @@ func (m *Model) update(msg tea.Msg) tea.Cmd {
 			// A late answer after access ended, or the server withdrawing it.
 			m.forgetPlayback()
 			return nil
+		}
+		if msg.key == keySession || msg.key == keyJobs {
+			m.refreshJobControls()
 		}
 		if msg.err == nil {
 			if cmd := m.observe(msg); cmd != nil {

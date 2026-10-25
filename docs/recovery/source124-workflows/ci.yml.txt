@@ -1,0 +1,113 @@
+name: CI
+
+# The fast merge gate. Long-running suites (debug-build Stateless models, live
+# FFmpeg delivery, real-process integration, upgrade/restore and packaging)
+# run in ci-full.yml on macOS. This gate runs on Linux: hosted macOS runners
+# queue for long periods, and nothing here needs macOS (VideoToolbox tests
+# skip without an encoder session; packaging stays on macOS in ci-full.yml).
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: never
+  CARGO_INCREMENTAL: '0'
+
+jobs:
+  rust:
+    name: Rust (fmt, clippy, fast tests)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Install project Rust toolchain
+        run: rustup toolchain install 1.99.0 --profile minimal --component rustfmt,clippy
+      - name: Install FFmpeg
+        # tests/server.rs requires ffprobe, and the delivery tests skip their
+        # media checks without these tools; the runner image has neither.
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ffmpeg
+          ffmpeg -version | head -1
+          ffprobe -version | head -1
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            target
+          key: rust-${{ runner.os }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}
+          restore-keys: rust-${{ runner.os }}-
+      - name: Format
+        run: cargo fmt --all --check
+      - name: Clippy
+        # Two lints are allowed until their owners refactor the flagged code:
+        # src/delivery.rs (ProbeFailure size, observe arity) and
+        # src/processing.rs (command arity). Every other warning fails.
+        run: >-
+          cargo clippy --locked --workspace --all-targets --
+          -D warnings -A clippy::too_many_arguments -A clippy::result_large_err
+      - name: Native qualification runner policy
+        run: python3 scripts/ci/test_workspace_runner.py
+      - name: Fast tests (unit, doc, contract, HTTP; scripts/ci/test_tier.py)
+        run: python3 scripts/ci/test_tier.py fast
+
+  contract:
+    name: API contract (structure, JSON parity)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Install pinned validator
+        run: |
+          python3 -m venv "$RUNNER_TEMP/contract"
+          "$RUNNER_TEMP/contract/bin/pip" install --disable-pip-version-check -r scripts/ci/contract-requirements.txt
+      - name: Validate contract
+        run: '"$RUNNER_TEMP/contract/bin/python" scripts/check_contract.py'
+      - name: JSON form matches YAML (Ruby)
+        run: ruby scripts/contract_json.rb --check
+
+  clients:
+    name: Client controllers, desktop host and Go terminal
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: apps/terminal/go.mod
+          cache-dependency-path: apps/terminal/go.sum
+      - name: Playback, UI bridge and desktop host regressions
+        run: node --test packages/playback/*.test.mjs packages/ui-bridge/*.test.mjs apps/desktop/test/*.test.mjs
+      - name: Terminal regressions
+        working-directory: apps/terminal
+        run: go test ./...
+      - name: Development migration copy and restore authority regressions
+        run: python3 -m unittest scripts/test_reconcile_development_migrations.py scripts/test_backup.py
+      - name: Package source inventory regressions
+        run: python3 scripts/test_packaging.py
+      - name: Published npm player assembly (fixture Shaka assets)
+        env:
+          MOTION_NPM_TEST_CACHE: ${{ runner.temp }}/motion-npm
+        run: python3 scripts/test_motion_provider.py
