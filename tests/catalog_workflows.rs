@@ -974,6 +974,65 @@ async fn reassignment_keeps_reviewed_content_with_its_copy() {
 // Sidecar NFO
 
 #[tokio::test]
+async fn nfo_conflicting_identity_keeps_both_documents_and_original_owner() {
+    let f = Fixture::new().await;
+    f.write("first.mkv", b"first");
+    f.write(
+        "first.nfo",
+        br#"<movie><title>First</title><uniqueid type="tmdb">77</uniqueid></movie>"#,
+    );
+    assert_eq!(f.scan().await.phase, "completed");
+    let (first_file, first, ..) = f.file("first.mkv").await;
+    f.write("second.mkv", b"second");
+    f.write(
+        "second.nfo",
+        br#"<movie><title>Second</title><uniqueid type="tmdb">77</uniqueid></movie>"#,
+    );
+    assert_eq!(f.scan().await.phase, "completed");
+    let (second_file, second, ..) = f.file("second.mkv").await;
+    let rows: Vec<(String, Option<String>, String, String)> = sqlx::query_as("SELECT m.item_id,m.external_id,json_extract(m.document_json,'$.values.title'),o.file_id FROM metadata_documents m JOIN nfo_origins o ON o.item_id=m.item_id WHERE m.source='nfo' ORDER BY m.item_id")
+        .fetch_all(&f.app.db).await.unwrap();
+    assert!(rows.contains(&(first, Some("tmdb:77".into()), "First".into(), first_file)));
+    assert!(rows.contains(&(second, None, "Second".into(), second_file)));
+    assert_eq!(rows.len(), 2);
+}
+
+#[tokio::test]
+async fn nfo_publication_failure_rolls_back_document_origin_and_generation() {
+    let f = Fixture::new().await;
+    f.write("movie.mkv", b"movie");
+    f.write("movie.nfo", b"<movie><title>Before</title></movie>");
+    assert_eq!(f.scan().await.phase, "completed");
+    let (_, item, ..) = f.file("movie.mkv").await;
+    let snapshot = |db: sqlx::SqlitePool, item: String| async move {
+        sqlx::query_as::<_, (String, i64, String, i64)>("SELECT d.document_json,d.revision,o.file_id,g.generation FROM metadata_documents d JOIN nfo_origins o ON o.item_id=d.item_id JOIN metadata_resource_generations g ON g.item_id=d.item_id WHERE d.item_id=? AND d.source='nfo'")
+            .bind(item).fetch_one(&db).await.unwrap()
+    };
+    let before = snapshot(f.app.db.clone(), item.clone()).await;
+    sqlx::query("CREATE TRIGGER reject_nfo_origin BEFORE UPDATE ON nfo_origins BEGIN SELECT RAISE(ABORT,'injected nfo origin failure'); END")
+        .execute(&f.app.db).await.unwrap();
+    f.write("movie.nfo", b"<movie><title>After</title></movie>");
+    assert_eq!(f.scan().await.phase, "failed");
+    assert_eq!(snapshot(f.app.db.clone(), item.clone()).await, before);
+    sqlx::query("DROP TRIGGER reject_nfo_origin")
+        .execute(&f.app.db)
+        .await
+        .unwrap();
+    assert_eq!(f.scan().await.phase, "completed");
+    let after = snapshot(f.app.db.clone(), item.clone()).await;
+    assert_ne!(after.0, before.0);
+    assert_eq!(after.1, before.1 + 1);
+    assert_eq!(after.2, before.2);
+    assert_eq!(after.3, before.3 + 1);
+    sqlx::query("UPDATE metadata_documents SET revision=9223372036854775807 WHERE item_id=? AND source='nfo'")
+        .bind(&item).execute(&f.app.db).await.unwrap();
+    let exhausted = snapshot(f.app.db.clone(), item.clone()).await;
+    f.write("movie.nfo", b"<movie><title>Beyond limit</title></movie>");
+    assert_eq!(f.scan().await.phase, "failed");
+    assert_eq!(snapshot(f.app.db.clone(), item).await, exhausted);
+}
+
+#[tokio::test]
 async fn sidecar_nfo_contributes_and_is_withdrawn_only_by_its_origin() {
     let f = Fixture::new().await;
     f.write("heat.mkv", b"heat bytes");
@@ -1268,6 +1327,88 @@ async fn nfo_ownership_follows_contributions_through_merges_and_splits() {
 
 // ---------------------------------------------------------------------------
 // Component evidence
+
+#[tokio::test]
+async fn chapter_evidence_follows_the_exact_file_revision() {
+    let f = Fixture::new().await;
+    f.write("movie.mkv", b"not a media file");
+    assert_eq!(f.scan().await.phase, "completed");
+    let (file, ..) = f.file("movie.mkv").await;
+    let old_revision: String = sqlx::query_scalar("SELECT revision FROM media_files WHERE id=?")
+        .bind(&file)
+        .fetch_one(&f.app.db)
+        .await
+        .unwrap();
+    let chapters = "[{\"start_ms\":0,\"end_ms\":null,\"title\":\"Old\"}]";
+    sqlx::query("UPDATE media_files SET chapters_json=? WHERE id=?")
+        .bind(chapters)
+        .bind(&file)
+        .execute(&f.app.db)
+        .await
+        .unwrap();
+    assert_eq!(f.scan().await.phase, "completed");
+    let same: (String, Option<String>) =
+        sqlx::query_as("SELECT revision,chapters_json FROM media_files WHERE id=?")
+            .bind(&file)
+            .fetch_one(&f.app.db)
+            .await
+            .unwrap();
+    assert_eq!(same, (old_revision.clone(), Some(chapters.into())));
+    f.write("movie.mkv", b"different invalid media bytes");
+    assert_eq!(f.scan().await.phase, "completed");
+    let changed: (String, Option<String>) =
+        sqlx::query_as("SELECT revision,chapters_json FROM media_files WHERE id=?")
+            .bind(file)
+            .fetch_one(&f.app.db)
+            .await
+            .unwrap();
+    assert_ne!(changed.0, old_revision);
+    assert_eq!(changed.1, None);
+}
+
+#[tokio::test]
+async fn complete_sidecar_coverage_and_write_failure_are_atomic() {
+    let f = Fixture::new().await;
+    f.write("film.mkv", b"film");
+    f.write("film.en.srt", b"old english");
+    f.write("film.fr.srt", b"old french");
+    assert_eq!(f.scan().await.outcome.as_deref(), Some("complete"));
+    let (file, ..) = f.file("film.mkv").await;
+    let read = |db: sqlx::SqlitePool, file: String| async move {
+        sqlx::query_as::<_, (String, String)>(
+            "SELECT name,fingerprint FROM sidecar_subtitles WHERE file_id=? ORDER BY name",
+        )
+        .bind(file)
+        .fetch_all(&db)
+        .await
+        .unwrap()
+    };
+    let before = read(f.app.db.clone(), file.clone()).await;
+    assert_eq!(before.len(), 2);
+    std::fs::remove_file(f.root.join("film.fr.srt")).unwrap();
+    f.write("film.en.srt", b"new english with changed size");
+    f.write("film.de.srt", b"new german");
+    assert_eq!(f.scan().await.outcome.as_deref(), Some("complete"));
+    let complete = read(f.app.db.clone(), file.clone()).await;
+    assert_eq!(
+        complete
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .collect::<Vec<_>>(),
+        ["film.de.srt", "film.en.srt"]
+    );
+    sqlx::query("CREATE TRIGGER reject_sidecar BEFORE INSERT ON sidecar_subtitles WHEN NEW.name='film.it.srt' BEGIN SELECT RAISE(ABORT,'injected sidecar failure'); END")
+        .execute(&f.app.db).await.unwrap();
+    f.write("film.it.srt", b"italian");
+    assert_eq!(f.scan().await.phase, "failed");
+    assert_eq!(read(f.app.db.clone(), file.clone()).await, complete);
+    sqlx::query("DROP TRIGGER reject_sidecar")
+        .execute(&f.app.db)
+        .await
+        .unwrap();
+    assert_eq!(f.scan().await.phase, "completed");
+    assert_eq!(read(f.app.db.clone(), file).await.len(), 3);
+}
 
 #[tokio::test]
 async fn components_combine_embedded_tracks_and_sidecar_subtitles() {

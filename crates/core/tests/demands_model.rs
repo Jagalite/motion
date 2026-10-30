@@ -2,8 +2,8 @@
 //! `demands` decisions and the production job reducer.
 use playscale_core::{
     demands::{
-        Admission, Attempt, Demand, DemandStatus, FollowUp, admit, can_satisfy, cancel, follow_up,
-        resolve,
+        Admission, Attempt, Demand, DemandStatus, FollowUp, RecoveryEffect, admit, can_satisfy,
+        cancel, follow_up, recover, resolve,
     },
     jobs::{Input as JobInput, Job, Phase, transition},
 };
@@ -36,7 +36,7 @@ enum Input {
         outcome: Option<bool>,
     },
     CancelDemand(usize),
-    /// Server restart: running attempts recover through the job reducer.
+    /// Server restart: recover identities and ownership through the core plan.
     Restart,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -45,6 +45,7 @@ enum Effect {
     Resolved(Vec<(String, DemandStatus)>),
     Stopped(Vec<String>),
     FollowedUp(FollowUp),
+    Recovered(Vec<RecoveryEffect>),
 }
 
 fn attempts(s: &State) -> Vec<Attempt> {
@@ -90,9 +91,9 @@ impl Model for Demands {
     fn metadata(&self) -> ModelMetadata {
         ModelMetadata {
             name: "playscale.scan_demands".into(),
-            model_version: 1,
-            properties_version: 1,
-            codec_version: 1,
+            model_version: 2,
+            properties_version: 2,
+            codec_version: 2,
             build: concat!(
                 include_str!("../src/demands.rs"),
                 include_str!("../src/jobs.rs")
@@ -220,29 +221,36 @@ impl Model for Demands {
             }
             Input::Restart => {
                 next.restarts += 1;
-                for (a, job) in next.attempts.iter_mut() {
-                    let (j, _) = transition(job, JobInput::Recover);
-                    *job = j;
-                    a.phase = job.phase;
-                    if a.phase == Phase::Queued {
-                        a.started_barrier = None;
+                let effects = recover(&next.attempts);
+                for effect in &effects {
+                    match effect {
+                        RecoveryEffect::MergeQueued {
+                            job,
+                            verify,
+                            direct,
+                        } => {
+                            let (a, _) = next
+                                .attempts
+                                .iter_mut()
+                                .find(|(a, _)| &a.job == job)
+                                .unwrap();
+                            a.verify = *verify;
+                            a.direct = *direct;
+                        }
+                        RecoveryEffect::ResetInterrupted { job, phase } => {
+                            let (a, j) = next
+                                .attempts
+                                .iter_mut()
+                                .find(|(a, _)| &a.job == job)
+                                .unwrap();
+                            a.phase = *phase;
+                            a.started_barrier = None;
+                            j.phase = *phase;
+                        }
                     }
                 }
+                outputs.push(Effect::Recovered(effects));
                 retire_finished(&mut next);
-                // Two queued attempts can result (recovered + follow-up); keep
-                // the recovered one and merge modes.
-                let queued: Vec<usize> = next
-                    .attempts
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, (a, _))| a.phase == Phase::Queued)
-                    .map(|(i, _)| i)
-                    .collect();
-                if queued.len() == 2 {
-                    let verify = next.attempts[queued[1]].0.verify;
-                    next.attempts[queued[0]].0.verify |= verify;
-                    next.attempts.remove(queued[1]);
-                }
                 apply_follow_up(&mut next, &mut outputs);
             }
         }
@@ -267,6 +275,10 @@ impl Model for Demands {
         Ok(vec![
             check("scan.one_running_one_queued", running <= 1 && queued <= 1),
             check("scan.no_lost_demand", served),
+            check(
+                "scan.phase_observations_agree",
+                s.attempts.iter().all(|(a, j)| a.phase == j.phase),
+            ),
         ])
     }
     fn check_transition(
@@ -309,10 +321,73 @@ impl Model for Demands {
             (Input::CancelDemand(_), _) => false,
             _ => true,
         };
+        let mut recovery_exact = true;
+        let mut recovery_preserves_work = true;
+        if matches!(input, Input::Restart) {
+            let queued = before
+                .attempts
+                .iter()
+                .find(|(a, _)| a.phase == Phase::Queued);
+            let interrupted = before
+                .attempts
+                .iter()
+                .find(|(a, _)| matches!(a.phase, Phase::Running | Phase::Cancelling));
+            let mut expected = Vec::new();
+            if let Some(old_attempt) = interrupted {
+                let (old, old_job) = old_attempt;
+                let retryable = old.phase == Phase::Running && old_job.attempt < u32::MAX;
+                let phase = if old.phase == Phase::Cancelling {
+                    Phase::Cancelled
+                } else if !retryable {
+                    Phase::Failed
+                } else if queued.is_some() {
+                    Phase::Cancelled
+                } else {
+                    Phase::Queued
+                };
+                if retryable {
+                    let (survivor, counter) = queued.unwrap_or(old_attempt);
+                    recovery_preserves_work = after.attempts.iter().any(|(a, j)| {
+                        a.job == survivor.job
+                            && a.phase == Phase::Queued
+                            && j.attempt == counter.attempt
+                            && a.started_barrier.is_none()
+                            && a.direct == (survivor.direct || old.direct)
+                            && (!old.verify || a.verify)
+                            && (!survivor.verify || a.verify)
+                    });
+                    if let Some((q, _)) = queued {
+                        expected.push(RecoveryEffect::MergeQueued {
+                            job: q.job.clone(),
+                            verify: q.verify || old.verify,
+                            direct: q.direct || old.direct,
+                        });
+                    }
+                }
+                if phase != Phase::Queued {
+                    recovery_preserves_work &=
+                        !after.attempts.iter().any(|(a, _)| a.job == old.job);
+                }
+                expected.push(RecoveryEffect::ResetInterrupted {
+                    job: old.job.clone(),
+                    phase,
+                });
+            }
+            recovery_exact = matches!(next.outputs,
+                [Effect::Recovered(actual)] | [Effect::Recovered(actual), Effect::FollowedUp(_)]
+                    if *actual == expected)
+                && after.barrier == before.barrier
+                && after.demands == before.demands;
+        }
         Ok(vec![
             check("scan.terminal_demands_stable", terminal_stable),
             check("scan.freshness_preserved", fresh),
             check("scan.cancel_isolated", isolated),
+            check("scan.recovery_exact_effects", recovery_exact),
+            check(
+                "scan.recovery_preserves_identity_mode_and_direct_owner",
+                recovery_preserves_work,
+            ),
         ])
     }
 }
@@ -446,4 +521,54 @@ fn cancelling_one_demand_keeps_the_scan_another_needs() {
     assert_eq!(s.attempts[0].0.phase, Phase::Queued, "still needed by d1");
     s = Demands.step(&s, &Input::CancelDemand(1)).unwrap().state;
     assert!(s.attempts.is_empty(), "no demand needs it any more");
+}
+
+#[test]
+fn restart_keeps_the_follow_up_identity_and_direct_ownership() {
+    let mut s = Demands.initial_state().unwrap();
+    for input in [
+        Input::Request { verify: true },
+        Input::Direct,
+        Input::Start,
+        Input::Request { verify: false },
+    ] {
+        s = Demands.step(&s, &input).unwrap().state;
+    }
+    let restarted = Demands.step(&s, &Input::Restart).unwrap();
+    assert_eq!(
+        restarted.outputs,
+        vec![Effect::Recovered(vec![
+            RecoveryEffect::MergeQueued {
+                job: "j2".into(),
+                verify: true,
+                direct: true
+            },
+            RecoveryEffect::ResetInterrupted {
+                job: "j1".into(),
+                phase: Phase::Cancelled
+            },
+        ])]
+    );
+    s = restarted.state;
+    assert_eq!(
+        s.attempts,
+        vec![(
+            Attempt {
+                job: "j2".into(),
+                phase: Phase::Queued,
+                verify: true,
+                started_barrier: None,
+                direct: true,
+            },
+            Job::default()
+        )]
+    );
+    let duplicate = Demands.step(&s, &Input::Restart).unwrap();
+    assert_eq!(duplicate.state.attempts, s.attempts);
+    assert_eq!(duplicate.outputs, vec![Effect::Recovered(vec![])]);
+    for i in 0..2 {
+        s = Demands.step(&s, &Input::CancelDemand(i)).unwrap().state;
+    }
+    assert_eq!(s.attempts.len(), 1, "direct requester still owns j2");
+    assert_eq!(s.attempts[0].0.job, "j2");
 }

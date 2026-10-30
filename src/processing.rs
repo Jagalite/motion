@@ -235,10 +235,11 @@ pub async fn submit(
         ));
     }
     let _lock = app.jobs.lock().await;
+    let mut tx = db::begin_write(&app.db).await?;
     if let Some(old) =
         sqlx::query_as::<_, ProcessingJob>("SELECT * FROM processing_jobs WHERE idempotency_key=?")
             .bind(&r.idempotency_key)
-            .fetch_optional(&app.db)
+            .fetch_optional(&mut *tx)
             .await?
     {
         use playscale_core::processing::{RequestIdentity, reuse};
@@ -273,7 +274,7 @@ pub async fn submit(
     let row: db::ItemRow =
         sqlx::query_as("SELECT * FROM catalog_files WHERE id=? AND available=1 AND generated=0 AND library_id IN (SELECT id FROM libraries WHERE enabled=1)")
             .bind(&r.source_file_id)
-            .fetch_one(&app.db)
+            .fetch_one(&mut *tx)
             .await?;
     playscale_core::processing::SourceAdmission {
         revision: &row.revision,
@@ -317,7 +318,7 @@ pub async fn submit(
     let queued: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM processing_jobs WHERE phase IN ('queued','running','cancelling')",
     )
-    .fetch_one(&app.db)
+    .fetch_one(&mut *tx)
     .await?;
     if !playscale_core::processing::queue_admits(queued) {
         return Err(ApiError::new(
@@ -328,8 +329,13 @@ pub async fn submit(
     }
     let id = new_id();
     sqlx::query("INSERT INTO processing_jobs(id,source_file_id,source_revision,recipe,backend,idempotency_key,phase,created_at,updated_at,video_profile) VALUES (?,?,?,?,?,?,'queued',?,?,?)")
-        .bind(&id).bind(r.source_file_id).bind(r.source_revision).bind(name(&r.recipe)).bind(name(&r.backend)).bind(r.idempotency_key).bind(now()).bind(now()).bind(r.video_profile.map(sqlx::types::Json)).execute(&app.db).await?;
-    Ok((StatusCode::CREATED, Json(load(&app, &id).await?)))
+        .bind(&id).bind(r.source_file_id).bind(r.source_revision).bind(name(&r.recipe)).bind(name(&r.backend)).bind(r.idempotency_key).bind(now()).bind(now()).bind(r.video_profile.map(sqlx::types::Json)).execute(&mut *tx).await?;
+    let job = sqlx::query_as("SELECT * FROM processing_jobs WHERE id=?")
+        .bind(&id)
+        .fetch_one(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok((StatusCode::CREATED, Json(job)))
 }
 #[utoipa::path(operation_id="list_processing_jobs",get,path="/api/v1/processing-jobs",responses((status=200,description="Most recent 100 processing jobs",body=Vec<ProcessingJob>)))]
 pub async fn list(State(app): State<App>) -> Result<Json<Vec<ProcessingJob>>, ApiError> {
@@ -361,20 +367,36 @@ pub async fn control(
     admin(&app, &headers)?;
     let r = json(body)?;
     let _lock = app.jobs.lock().await;
-    let old = load(&app, &id).await?;
-    let input = match r.action.as_str() {
-        "cancel" => Input::Cancel,
-        "retry" if old.state().map_err(ApiError::internal)?.retryable() => Input::Retry,
+    let mut tx = db::begin_write(&app.db).await?;
+    let old: ProcessingJob = sqlx::query_as("SELECT * FROM processing_jobs WHERE id=?")
+        .bind(&id)
+        .fetch_one(&mut *tx)
+        .await?;
+    let previous = old.state().map_err(ApiError::internal)?;
+    let next = match r.action.as_str() {
+        "cancel" => transition(&previous, Input::Cancel).0,
         "retry" => {
-            return Err(ApiError::conflict(
-                "not_retryable",
-                "Only failed or cancelled jobs can retry",
-            ));
+            let active: i64 = sqlx::query_scalar("SELECT count(*) FROM processing_jobs WHERE phase IN ('queued','running','cancelling')")
+                .fetch_one(&mut *tx).await?;
+            playscale_core::processing::retry(&previous, None, active).map_err(|reason| {
+                match reason {
+                    playscale_core::processing::RetryRefusal::NotRetryable
+                    | playscale_core::processing::RetryRefusal::StaleRevision => {
+                        ApiError::conflict(
+                            "not_retryable",
+                            "Only failed or cancelled jobs can retry",
+                        )
+                    }
+                    playscale_core::processing::RetryRefusal::QueueFull => ApiError::new(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "processing_limit",
+                        "Processing queue is full",
+                    ),
+                }
+            })?
         }
         _ => return Err(ApiError::bad("action must be cancel or retry")),
     };
-    let previous = old.state().map_err(ApiError::internal)?;
-    let (next, _) = transition(&previous, input);
     if next == previous {
         return Ok(Json(old));
     }
@@ -384,8 +406,9 @@ pub async fn control(
     .bind(db::phase_name(next.phase))
     .bind(now())
     .bind(&id)
-    .execute(&app.db)
+    .execute(&mut *tx)
     .await?;
+    tx.commit().await?;
     Ok(Json(load(&app, &id).await?))
 }
 /// Witness files under `root` still held by live executions. Fails rather than

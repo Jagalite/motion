@@ -298,7 +298,19 @@ pub(super) async fn process(app: &App, id: &str) -> Result<Phase, Problem> {
     let mut tx = begin_write(&app.db).await?;
     let m = load(&mut tx, id).await?.ok_or_else(Problem::not_found)?;
     let (facts, mail) = observe_facts(&mut tx, app, &m).await?;
-    let attempt = match policy::claim(&m, &facts.current(), &token) {
+    let sealed: Option<String> = sqlx::query_scalar("SELECT payload FROM signin_outbox WHERE id=?")
+        .bind(id)
+        .fetch_one(&mut *tx)
+        .await?;
+    let payload: Option<Payload> = sealed
+        .and_then(|sealed| open(app, &format!("mail:{id}"), &sealed).ok())
+        .and_then(|clear| serde_json::from_str(&clear).ok());
+    let availability = if payload.is_some() {
+        policy::PayloadAvailability::Available
+    } else {
+        policy::PayloadAvailability::Unavailable
+    };
+    let attempt = match policy::claim_with_payload(&m, &facts.current(), &token, availability) {
         Decision::Wait => {
             tx.commit().await?;
             return Ok(m.phase);
@@ -308,26 +320,14 @@ pub(super) async fn process(app: &App, id: &str) -> Result<Phase, Problem> {
             tx.commit().await?;
             return Ok(next.phase);
         }
+        Decision::PayloadUnavailable(next) => {
+            persist(&mut tx, &next, Some("payload unavailable")).await?;
+            tx.commit().await?;
+            return Ok(next.phase);
+        }
         Decision::Attempt(next) => next,
     };
-    let sealed: Option<String> = sqlx::query_scalar("SELECT payload FROM signin_outbox WHERE id=?")
-        .bind(id)
-        .fetch_one(&mut *tx)
-        .await?;
-    let payload: Option<Payload> = sealed
-        .and_then(|sealed| open(app, &format!("mail:{id}"), &sealed).ok())
-        .and_then(|clear| serde_json::from_str(&clear).ok());
-    let Some(payload) = payload else {
-        // Missing or undecryptable payload: nothing can ever be sent.
-        let failed = Message {
-            phase: Phase::Failed,
-            lease: None,
-            ..m
-        };
-        persist(&mut tx, &failed, Some("payload unavailable")).await?;
-        tx.commit().await?;
-        return Ok(Phase::Failed);
-    };
+    let payload = payload.expect("core only reserves attempts with an available payload");
     persist(&mut tx, &attempt, None).await?;
     sqlx::query("UPDATE signin_outbox SET last_attempt_at=? WHERE id=?")
         .bind(now())

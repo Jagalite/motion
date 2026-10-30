@@ -185,36 +185,68 @@ mod field_tests {
     }
 }
 
-/// Validate and normalize a contribution with the same rules the metadata
-/// API applies: at most 100 fields/tags, non-empty field names, non-null and
-/// registry-valid values, tags whitespace-collapsed and lower-cased (1–100
-/// bytes). Excluded tags are normalized the same way.
-pub fn normalize_contribution(c: &Contribution) -> Result<Contribution, &'static str> {
-    if c.values.len() > 100 || c.tags.len() > 100 || c.excluded_tags.len() > 100 {
-        return Err("too many fields or tags");
+/// Source identifiers accepted for user-supplied metadata contributions.
+pub fn valid_source(source: &str) -> bool {
+    source != "scan"
+        && !source.is_empty()
+        && source.len() <= 64
+        && source
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ContributionValidationError {
+    InvalidSource,
+    BoundsOrExclusions,
+    FieldNameOrNull,
+    ConventionalField,
+    Tag,
+}
+
+/// Normalize a contribution using one source-aware rule for API writes and
+/// imported local data. `scan` belongs to scanner-owned projection evidence.
+pub fn normalize_source_contribution(
+    source: &str,
+    c: &Contribution,
+) -> Result<Contribution, ContributionValidationError> {
+    use ContributionValidationError::*;
+    if !valid_source(source) {
+        return Err(InvalidSource);
+    }
+    if c.values.len() > 100
+        || c.tags.len() > 100
+        || c.excluded_tags.len() > 100
+        || (source != "local" && !c.excluded_tags.is_empty())
+    {
+        return Err(BoundsOrExclusions);
     }
     for (key, value) in &c.values {
-        if key.is_empty() || key.len() > 100 || value.is_null() || !valid_field(key, value) {
-            return Err("invalid metadata field");
+        if key.is_empty() || key.len() > 100 || value.is_null() {
+            return Err(FieldNameOrNull);
+        }
+        if !valid_field(key, value) {
+            return Err(ConventionalField);
         }
     }
-    let tags = |values: &BTreeSet<String>| -> Result<BTreeSet<String>, &'static str> {
-        values
-            .iter()
-            .map(|tag| {
-                let tag = tag
-                    .split_whitespace()
-                    .collect::<Vec<_>>()
-                    .join(" ")
-                    .to_lowercase();
-                if tag.is_empty() || tag.len() > 100 {
-                    Err("tags must contain 1-100 bytes")
-                } else {
-                    Ok(tag)
-                }
-            })
-            .collect()
-    };
+    let tags =
+        |values: &BTreeSet<String>| -> Result<BTreeSet<String>, ContributionValidationError> {
+            values
+                .iter()
+                .map(|tag| {
+                    let tag = tag
+                        .split_whitespace()
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                        .to_lowercase();
+                    if tag.is_empty() || tag.len() > 100 {
+                        Err(Tag)
+                    } else {
+                        Ok(tag)
+                    }
+                })
+                .collect()
+        };
     Ok(Contribution {
         values: c.values.clone(),
         tags: tags(&c.tags)?,
@@ -222,30 +254,213 @@ pub fn normalize_contribution(c: &Contribution) -> Result<Contribution, &'static
     })
 }
 
-/// The revision of an item's metadata resource, from its stored source
-/// revisions. Source revisions only increase, documents are never deleted, a
-/// merge only adds documents to the surviving work, and the scanned origin is
-/// immutable (counted as 1). The sum therefore strictly increases with every
-/// change to the item's metadata inputs and never repeats, so it is a sound
-/// precondition for the whole resource. `None` if it would overflow.
-pub fn item_revision(source_revisions: impl IntoIterator<Item = u64>) -> Option<u64> {
-    source_revisions
-        .into_iter()
-        .try_fold(1u64, |sum, revision| sum.checked_add(revision))
+/// Normalize local interchange data, retaining its historical warning wording.
+pub fn normalize_contribution(c: &Contribution) -> Result<Contribution, &'static str> {
+    normalize_source_contribution("local", c).map_err(|e| match e {
+        ContributionValidationError::BoundsOrExclusions => "too many fields or tags",
+        ContributionValidationError::FieldNameOrNull
+        | ContributionValidationError::ConventionalField => "invalid metadata field",
+        ContributionValidationError::Tag => "tags must contain 1-100 bytes",
+        ContributionValidationError::InvalidSource => unreachable!("local is a valid source"),
+    })
+}
+
+/// Advance the durable whole-resource generation after one acknowledged input
+/// change. The stored generation is positive and bounded by SQLite's signed
+/// integer range; exhaustion fails closed. Deletion and recreation count as
+/// separate changes, and the adapter retains generations as tombstones.
+pub fn item_revision(generation: u64, changed: bool) -> Option<u64> {
+    if generation == 0 || generation > i64::MAX as u64 {
+        return None;
+    }
+    let next = if changed {
+        generation.checked_add(1)?
+    } else {
+        generation
+    };
+    (next <= i64::MAX as u64).then_some(next)
+}
+
+/// A whole-metadata validator binds the item and database history. A restore
+/// may rewind the generation, so another binding or history is stale.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ResourceRevision {
+    pub binding: String,
+    pub generation: u64,
+}
+
+/// Derive a validator binding from distinct observed identity facts. Tuple
+/// encoding stays unambiguous even when a fact contains a delimiter.
+pub fn resource_revision(
+    server: &str,
+    epoch: &str,
+    item: &str,
+    generation: u64,
+) -> Option<ResourceRevision> {
+    use sha2::{Digest, Sha256};
+    let generation = item_revision(generation, false)?;
+    let identity = serde_json::to_vec(&(server, epoch, item)).ok()?;
+    Some(ResourceRevision {
+        binding: format!("{:x}", Sha256::digest(identity)),
+        generation,
+    })
+}
+
+pub fn reviewed_item_revision(current: &ResourceRevision, reviewed: &ResourceRevision) -> bool {
+    current == reviewed && item_revision(current.generation, false).is_some()
 }
 
 #[cfg(test)]
 mod revision_tests {
-    use super::item_revision;
+    use super::{ResourceRevision, item_revision, resource_revision, reviewed_item_revision};
     #[test]
-    fn item_revision_counts_origin_and_every_source_change() {
-        assert_eq!(item_revision([]), Some(1));
-        assert_eq!(item_revision([1]), Some(2));
-        // Advancing any one source advances the item.
-        assert_eq!(item_revision([1, 3]), Some(5));
-        assert_eq!(item_revision([2, 3]), Some(6));
-        assert_eq!(item_revision([u64::MAX]), None);
+    fn item_revision_advances_only_for_changes_and_fails_closed() {
+        assert_eq!(item_revision(1, false), Some(1));
+        assert_eq!(item_revision(1, true), Some(2));
+        assert_eq!(item_revision(2, true), Some(3));
+        assert_eq!(item_revision(0, false), None);
+        assert_eq!(item_revision(i64::MAX as u64, false), Some(i64::MAX as u64));
+        assert_eq!(item_revision(i64::MAX as u64, true), None);
     }
+
+    #[test]
+    fn same_generation_in_another_history_is_stale() {
+        let before = ResourceRevision {
+            binding: "old".into(),
+            generation: 2,
+        };
+        let restored = ResourceRevision {
+            binding: "new".into(),
+            generation: 2,
+        };
+        assert!(reviewed_item_revision(&before, &before));
+        assert!(!reviewed_item_revision(&restored, &before));
+        let item = resource_revision("server", "epoch", "item", 2).unwrap();
+        assert_ne!(
+            item,
+            resource_revision("server", "epoch", "other", 2).unwrap()
+        );
+        assert_ne!(
+            item,
+            resource_revision("server", "restored", "item", 2).unwrap()
+        );
+        assert_ne!(
+            resource_revision("a:b", "c", "item", 2),
+            resource_revision("a", "b:c", "item", 2)
+        );
+    }
+}
+
+/// A physical root observation must match the registered identity on both
+/// sides of the read. A missing identity is not evidence of a match.
+pub fn refresh_root_matches(expected: &str, observed: Option<&str>) -> bool {
+    observed == Some(expected)
+}
+
+/// Facts pinning one sidecar observation to the file and registered source
+/// binding from which it was read.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RefreshBinding {
+    pub work: String,
+    pub file: String,
+    pub relative: String,
+    pub root: String,
+    pub root_identity: String,
+    pub binding_revision: i64,
+    pub file_revision: String,
+}
+
+/// The current row carries source enablement, work membership and availability
+/// so the core can reject observations whose authority has changed.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CurrentRefreshBinding {
+    pub binding: RefreshBinding,
+    pub enabled: bool,
+    pub available: bool,
+}
+
+pub fn refresh_observation_current(
+    observed: &RefreshBinding,
+    current: Option<&CurrentRefreshBinding>,
+    usable: bool,
+) -> bool {
+    usable
+        && current.is_some_and(|current| {
+            current.enabled && current.available && &current.binding == observed
+        })
+}
+
+/// Decide completion from exact observation and publication identities. The
+/// adapter supplies acknowledgments only for effects actually applied in its
+/// provisional transaction; rejection requires rolling that transaction back.
+pub fn refresh_acknowledged(
+    observed: &[String],
+    usable: &[String],
+    published: &[String],
+    authorized: bool,
+) -> bool {
+    authorized && !observed.is_empty() && observed == usable && usable == published
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RefreshResult {
+    Unavailable,
+    Acknowledged {
+        observed: Vec<String>,
+        usable: Vec<String>,
+        published: Vec<String>,
+    },
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RefreshCompletion {
+    pub job: crate::jobs::Job,
+    pub commit_publication: bool,
+    pub error: Option<String>,
+}
+
+/// Publication is provisional until the final decision; current authorization,
+/// the worker attempt and the availability of observations gate its start.
+pub fn refresh_may_publish(
+    job: &crate::jobs::Job,
+    attempt: u32,
+    authorized: bool,
+    observation_available: bool,
+) -> bool {
+    job.executing(attempt) && authorized && observation_available
+}
+
+/// Derive the durable job state, error and savepoint decision from the facts.
+/// An obsolete worker leaves both phase and ancillary error untouched. A
+/// matching cancelling attempt still completes cancellation.
+pub fn finish_refresh(
+    job: &crate::jobs::Job,
+    attempt: u32,
+    authorized: bool,
+    result: &RefreshResult,
+) -> Option<RefreshCompletion> {
+    if job.attempt != attempt
+        || !matches!(
+            job.phase,
+            crate::jobs::Phase::Running | crate::jobs::Phase::Cancelling
+        )
+    {
+        return None;
+    }
+    let success = job.executing(attempt)
+        && match result {
+            RefreshResult::Unavailable => false,
+            RefreshResult::Acknowledged {
+                observed,
+                usable,
+                published,
+            } => refresh_acknowledged(observed, usable, published, authorized),
+        };
+    let next = crate::jobs::transition(job, crate::jobs::Input::Finished { attempt, success }).0;
+    Some(RefreshCompletion {
+        job: next,
+        commit_publication: success,
+        error: (!success).then(|| "refresh_unavailable_or_unauthorized".to_owned()),
+    })
 }
 
 /// A bounded refresh is complete only when every requested observation was
@@ -275,5 +490,159 @@ mod refresh_tests {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod source_validation_tests {
+    use super::*;
+    #[test]
+    fn source_ownership_and_normalization_are_shared() {
+        let mut c = Contribution::default();
+        c.tags.insert("  Drama   COMEDY  ".into());
+        c.excluded_tags.insert("  OLD  ".into());
+        let local = normalize_source_contribution("local", &c).unwrap();
+        assert_eq!(local.tags, BTreeSet::from(["drama comedy".into()]));
+        assert_eq!(local.excluded_tags, BTreeSet::from(["old".into()]));
+        assert_eq!(normalize_contribution(&c).unwrap(), local);
+        assert_eq!(
+            normalize_source_contribution("provider", &c),
+            Err(ContributionValidationError::BoundsOrExclusions)
+        );
+        assert_eq!(
+            normalize_source_contribution("scan", &c),
+            Err(ContributionValidationError::InvalidSource)
+        );
+        for name in ["", "Upper", "under_score", "bad space"] {
+            assert!(!valid_source(name));
+        }
+        assert!(valid_source("provider-42"));
+        c.excluded_tags.clear();
+        assert_eq!(
+            normalize_source_contribution("provider", &c).unwrap().tags,
+            local.tags
+        );
+        c.values.insert("title".into(), serde_json::Value::Null);
+        assert_eq!(
+            normalize_source_contribution("local", &c),
+            Err(ContributionValidationError::FieldNameOrNull)
+        );
+        c.values
+            .insert("release_year".into(), serde_json::json!("wrong"));
+        c.values.remove("title");
+        assert_eq!(
+            normalize_source_contribution("local", &c),
+            Err(ContributionValidationError::ConventionalField)
+        );
+    }
+}
+
+#[cfg(test)]
+mod refresh_identity_tests {
+    use super::*;
+    use crate::jobs::{Job, Phase};
+    #[test]
+    fn binding_and_acknowledgments_fence_refresh_completion() {
+        let observed = RefreshBinding {
+            work: "work".into(),
+            file: "f".into(),
+            relative: "film.mkv".into(),
+            root: "root".into(),
+            root_identity: "volume".into(),
+            binding_revision: 1,
+            file_revision: "v1".into(),
+        };
+        let mut current = CurrentRefreshBinding {
+            binding: observed.clone(),
+            enabled: true,
+            available: true,
+        };
+        assert!(refresh_observation_current(&observed, Some(&current), true));
+        current.binding.file_revision = "v2".into();
+        assert!(!refresh_observation_current(
+            &observed,
+            Some(&current),
+            true
+        ));
+        current.binding = observed.clone();
+        current.available = false;
+        assert!(!refresh_observation_current(
+            &observed,
+            Some(&current),
+            true
+        ));
+        assert!(!refresh_observation_current(&observed, None, true));
+        assert!(!refresh_observation_current(
+            &observed,
+            Some(&current),
+            false
+        ));
+        let ids = vec!["a".into(), "b".into()];
+        assert!(refresh_acknowledged(&ids, &ids, &ids, true));
+        assert!(!refresh_acknowledged(
+            &ids,
+            &ids,
+            &["b".into(), "a".into()],
+            true
+        ));
+        assert!(!refresh_acknowledged(
+            &ids,
+            &["a".into()],
+            &["a".into()],
+            true
+        ));
+        assert!(!refresh_acknowledged(&[], &[], &[], true));
+        assert!(!refresh_acknowledged(&ids, &ids, &ids, false));
+        let running = Job {
+            phase: Phase::Running,
+            attempt: 2,
+        };
+        assert_eq!(
+            finish_refresh(&running, 1, false, &RefreshResult::Unavailable),
+            None
+        );
+        assert_eq!(
+            finish_refresh(
+                &running,
+                2,
+                true,
+                &RefreshResult::Acknowledged {
+                    observed: ids.clone(),
+                    usable: ids.clone(),
+                    published: ids.clone()
+                }
+            )
+            .unwrap()
+            .job
+            .phase,
+            Phase::Completed
+        );
+        assert_eq!(
+            finish_refresh(
+                &Job {
+                    phase: Phase::Cancelling,
+                    attempt: 2
+                },
+                2,
+                false,
+                &RefreshResult::Unavailable
+            )
+            .unwrap()
+            .job
+            .phase,
+            Phase::Cancelled
+        );
+        assert_eq!(
+            finish_refresh(
+                &Job {
+                    phase: Phase::Queued,
+                    attempt: 2
+                },
+                2,
+                false,
+                &RefreshResult::Unavailable
+            ),
+            None
+        );
     }
 }

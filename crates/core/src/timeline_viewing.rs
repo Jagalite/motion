@@ -85,10 +85,13 @@ pub fn retract_unattributed_legacy(
     current: &View,
     backfill: &View,
     has_sessions: bool,
+    updated_at: i64,
+    backfill_updated_at: i64,
 ) -> bool {
     !matches!(attribution, crate::identity::Attribution::Exact { .. })
         && !has_sessions
         && current == backfill
+        && updated_at == backfill_updated_at
         && current.revision == 0
         && current.manual_epoch == 0
         && current.session.is_none()

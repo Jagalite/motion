@@ -178,21 +178,31 @@ pub(crate) async fn register_source_in(
     if let Some(other) = core::overlapping(&candidate.root, &refs) {
         return Err(LibraryError::Overlaps(other.into()));
     }
-    let existing: Option<(String, String)> =
-        sqlx::query_as("SELECT id,root_identity FROM libraries WHERE root=?")
+    let existing: Option<(String, String, bool)> =
+        sqlx::query_as("SELECT id,root_identity,managed FROM libraries WHERE root=?")
             .bind(&candidate.root)
             .fetch_optional(&mut *tx)
             .await?;
-    let id = match existing {
-        // Re-registering the same root with a different volume is a rebind,
-        // which needs the relocation workflow, never a silent acceptance.
-        Some((_, identity)) if identity != candidate.identity => {
+    let facts = existing
+        .as_ref()
+        .map(|(id, identity, managed)| core::ExistingRoot {
+            id,
+            identity,
+            managed: *managed,
+        });
+    let id = match core::registration(
+        &candidate.identity,
+        core::OwnershipRequirement::ExistingKind,
+        facts,
+    ) {
+        core::Registration::RelocationRequired => {
             return Err(LibraryError::Storage(anyhow::anyhow!(
                 "registered root now has a different volume identity"
             )));
         }
-        Some((id, _)) => id,
-        None => {
+        core::Registration::OwnershipConflict => unreachable!("existing ownership is accepted"),
+        core::Registration::Reuse { id } => id,
+        core::Registration::Create => {
             let id = new_id();
             sqlx::query("INSERT INTO libraries (id,name,root,root_identity,exclusions_json) VALUES (?,?,?,?,?)")
                 .bind(&id)

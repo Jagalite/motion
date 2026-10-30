@@ -188,14 +188,14 @@ async fn timeline_progress(db: &SqlitePool) -> anyhow::Result<()> {
             manual_watched: old_manual,
             ..View::default()
         };
-        if updated == old_updated
-            && playscale_core::timeline_viewing::retract_unattributed_legacy(
-                &Attribution::Orphaned,
-                &current,
-                &backfill,
-                has_sessions,
-            )
-        {
+        if playscale_core::timeline_viewing::retract_unattributed_legacy(
+            &Attribution::Orphaned,
+            &current,
+            &backfill,
+            has_sessions,
+            updated,
+            old_updated,
+        ) {
             sqlx::query("DELETE FROM timeline_viewing WHERE profile_id=? AND timeline_id=?")
                 .bind(profile)
                 .bind(timeline)

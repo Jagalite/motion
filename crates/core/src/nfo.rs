@@ -53,6 +53,160 @@ pub struct Nfo {
     pub episode: Option<u32>,
 }
 
+/// Current NFO identity and document for one work, observed under the writer.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkFacts {
+    pub item: String,
+    pub match_state: crate::matching::MatchState,
+    pub external_id: Option<String>,
+    /// The stored JSON text, or None when this work has no contribution.
+    pub document: Option<String>,
+    pub revision: Option<i64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SidecarObservation {
+    Unusable,
+    Absent,
+    Parsed {
+        document: String,
+        external_id: Option<String>,
+    },
+}
+
+/// Every effect is applied in order in the same transaction as scan publication.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PublicationEffect {
+    DeleteContribution {
+        item: String,
+    },
+    ClearOrigin {
+        item: String,
+    },
+    PutContribution {
+        item: String,
+        document: String,
+        external_id: Option<String>,
+        revision: i64,
+    },
+    SetOrigin {
+        item: String,
+        file: String,
+    },
+    ProjectTitle {
+        item: String,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PublicationError {
+    MissingTargetFacts,
+    InvalidRevision,
+    RevisionExhausted,
+}
+
+/// Plan the complete NFO publication. `owners` are all works previously
+/// supplied by this file, and `conflict_owner` is the work currently holding
+/// the proposed external identity (if any). A parsed observation requires
+/// target facts; absence and unusable observations do not. Facts must be read under the
+/// same reserved writer used to apply this plan; unique constraints remain a
+/// final persistence guard and a failed effect rolls back the whole plan.
+pub fn publication(
+    file: &str,
+    target: Option<&WorkFacts>,
+    owners: &[WorkFacts],
+    conflict_owner: Option<&str>,
+    observation: &SidecarObservation,
+) -> Result<Vec<PublicationEffect>, PublicationError> {
+    use PublicationEffect::*;
+    if matches!(observation, SidecarObservation::Unusable) {
+        return Ok(vec![]);
+    }
+    let incoming = match observation {
+        SidecarObservation::Parsed { external_id, .. } => external_id.as_ref(),
+        _ => None,
+    };
+    let allowed = |work: &WorkFacts, proposed: Option<&String>| {
+        let current = work
+            .external_id
+            .as_ref()
+            .map(|v| ("nfo".to_owned(), v.clone()));
+        let proposed = proposed.map(|v| ("nfo".to_owned(), v.clone()));
+        crate::matching::provider_identity_allowed(
+            work.match_state,
+            current.as_ref(),
+            proposed.as_ref(),
+        )
+    };
+    let target = if matches!(observation, SidecarObservation::Parsed { .. }) {
+        let target = target.ok_or(PublicationError::MissingTargetFacts)?;
+        if target.document.is_some() != target.revision.is_some()
+            || (target.document.is_none() && target.external_id.is_some())
+            || target.revision.is_some_and(|revision| revision < 0)
+        {
+            return Err(PublicationError::InvalidRevision);
+        }
+        if !allowed(target, incoming) {
+            return Ok(vec![]);
+        }
+        Some(target)
+    } else {
+        None
+    };
+    let keep = target.map(|target| target.item.as_str());
+    let mut effects = Vec::new();
+    let mut withdrawn = Vec::new();
+    for owner in owners {
+        if Some(owner.item.as_str()) != keep && allowed(owner, None) {
+            withdrawn.push(owner.item.as_str());
+            effects.push(DeleteContribution {
+                item: owner.item.clone(),
+            });
+            effects.push(ClearOrigin {
+                item: owner.item.clone(),
+            });
+            effects.push(ProjectTitle {
+                item: owner.item.clone(),
+            });
+        }
+    }
+    if let SidecarObservation::Parsed {
+        document,
+        external_id,
+    } = observation
+    {
+        let target = target.ok_or(PublicationError::MissingTargetFacts)?;
+        let blocked =
+            conflict_owner.is_some_and(|id| id != target.item && !withdrawn.contains(&id));
+        let external_id = if blocked { None } else { external_id.clone() };
+        if target.document.as_deref() != Some(document.as_str())
+            || target.external_id != external_id
+        {
+            let revision = match (&target.document, target.revision) {
+                (None, None) if target.external_id.is_none() => 1,
+                (Some(_), Some(revision)) if revision >= 0 => revision
+                    .checked_add(1)
+                    .ok_or(PublicationError::RevisionExhausted)?,
+                _ => return Err(PublicationError::InvalidRevision),
+            };
+            effects.push(PutContribution {
+                item: target.item.clone(),
+                document: document.clone(),
+                external_id,
+                revision,
+            });
+        }
+        effects.push(SetOrigin {
+            item: target.item.clone(),
+            file: file.to_owned(),
+        });
+        effects.push(ProjectTitle {
+            item: target.item.clone(),
+        });
+    }
+    Ok(effects)
+}
+
 fn decode_entities(raw: &str, at: usize) -> Result<String, NfoError> {
     let mut out = String::with_capacity(raw.len());
     let mut rest = raw;
@@ -328,4 +482,130 @@ pub fn parse(input: &[u8]) -> Result<Nfo, NfoError> {
         season: number("season"),
         episode: number("episode"),
     })
+}
+
+#[cfg(test)]
+mod publication_tests {
+    use super::*;
+    use crate::matching::MatchState;
+
+    fn work(
+        item: &str,
+        state: MatchState,
+        external: Option<&str>,
+        document: Option<&str>,
+    ) -> WorkFacts {
+        WorkFacts {
+            item: item.into(),
+            match_state: state,
+            external_id: external.map(str::to_owned),
+            document: document.map(str::to_owned),
+            revision: document.map(|_| 1),
+        }
+    }
+    #[test]
+    fn publication_fences_pins_and_plans_identity_transfer_in_order() {
+        use PublicationEffect::*;
+        let target = work("new", MatchState::Unmatched, None, None);
+        let old = work("old", MatchState::Matched, Some("tmdb:1"), Some("old"));
+        let parsed = SidecarObservation::Parsed {
+            document: "new-document".into(),
+            external_id: Some("tmdb:1".into()),
+        };
+        assert!(
+            publication(
+                "file",
+                None,
+                &[old.clone()],
+                Some("old"),
+                &SidecarObservation::Unusable
+            )
+            .unwrap()
+            .is_empty()
+        );
+        assert_eq!(
+            publication("file", Some(&target), &[old.clone()], Some("old"), &parsed),
+            Ok(vec![
+                DeleteContribution { item: "old".into() },
+                ClearOrigin { item: "old".into() },
+                ProjectTitle { item: "old".into() },
+                PutContribution {
+                    item: "new".into(),
+                    document: "new-document".into(),
+                    external_id: Some("tmdb:1".into()),
+                    revision: 1,
+                },
+                SetOrigin {
+                    item: "new".into(),
+                    file: "file".into()
+                },
+                ProjectTitle { item: "new".into() },
+            ])
+        );
+        let pinned = work("old", MatchState::Manual, Some("tmdb:1"), Some("old"));
+        assert_eq!(
+            publication(
+                "file",
+                Some(&target),
+                &[pinned.clone()],
+                Some("old"),
+                &parsed
+            ),
+            Ok(vec![
+                PutContribution {
+                    item: "new".into(),
+                    document: "new-document".into(),
+                    external_id: None,
+                    revision: 1,
+                },
+                SetOrigin {
+                    item: "new".into(),
+                    file: "file".into()
+                },
+                ProjectTitle { item: "new".into() },
+            ])
+        );
+        assert!(
+            publication("file", None, &[pinned], None, &SidecarObservation::Absent)
+                .unwrap()
+                .is_empty()
+        );
+        let pinned_target = work("new", MatchState::Manual, Some("tmdb:2"), Some("current"));
+        assert!(
+            publication("file", Some(&pinned_target), &[old], None, &parsed)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            publication("file", None, &[], None, &parsed),
+            Err(PublicationError::MissingTargetFacts)
+        );
+        let same = work(
+            "new",
+            MatchState::Matched,
+            Some("tmdb:1"),
+            Some("new-document"),
+        );
+        assert_eq!(
+            publication("file", Some(&same), &[], Some("new"), &parsed),
+            Ok(vec![
+                SetOrigin {
+                    item: "new".into(),
+                    file: "file".into()
+                },
+                ProjectTitle { item: "new".into() },
+            ])
+        );
+        let mut exhausted = work("new", MatchState::Matched, None, Some("old"));
+        exhausted.revision = Some(i64::MAX);
+        assert_eq!(
+            publication("file", Some(&exhausted), &[], None, &parsed),
+            Err(PublicationError::RevisionExhausted)
+        );
+        exhausted.revision = None;
+        assert_eq!(
+            publication("file", Some(&exhausted), &[], None, &parsed),
+            Err(PublicationError::InvalidRevision)
+        );
+    }
 }

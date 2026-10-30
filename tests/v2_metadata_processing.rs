@@ -1,6 +1,8 @@
 //! HTTP conformance for the A08 metadata adapter (A04 services): resolved
 //! metadata and contributions, identification proposals and decisions, item
 //! artwork and asset bytes. Real router, real SQLite, real transactions.
+#[path = "support/service_router.rs"]
+mod service_router;
 use axum::{
     body::Body,
     http::{HeaderMap, Request, StatusCode},
@@ -184,10 +186,12 @@ impl Fixture {
         let request = request
             .body(body.map(|v| Body::from(v.to_string())).unwrap_or_default())
             .unwrap();
-        let response = api::router(self.app.clone(), None)
-            .oneshot(request)
-            .await
-            .unwrap();
+        let router = if path.starts_with("/api/v1/") {
+            service_router::router(self.app.clone())
+        } else {
+            api::router(self.app.clone(), None)
+        };
+        let response = router.oneshot(request).await.unwrap();
         let status = response.status();
         let headers = response.headers().clone();
         let raw = response
@@ -273,10 +277,28 @@ fn auth(token: &str) -> [(&str, &str); 1] {
     [("authorization", token)]
 }
 
+async fn metadata_etag(f: &Fixture, item: &str, generation: u64) -> String {
+    let (server, epoch): (String, String) =
+        sqlx::query_as("SELECT server_id,restore_epoch FROM server_identity WHERE singleton=1")
+            .fetch_one(&f.app.db)
+            .await
+            .unwrap();
+    let history = format!(
+        "{:x}",
+        Sha256::digest(serde_json::to_vec(&(server, epoch, item)).unwrap())
+    );
+    format!("\"m2-{history}-{generation}\"")
+}
+
 #[tokio::test]
 async fn metadata_read_replace_preconditions_and_scope() {
     let f = Fixture::new().await;
     let op = bearer(OPERATOR);
+    let etag1 = metadata_etag(&f, "film-a", 1).await;
+    let etag2 = metadata_etag(&f, "film-a", 2).await;
+    let etag_a2 = metadata_etag(&f, "film-a2", 1).await;
+    let etag_b = metadata_etag(&f, "film-b", 1).await;
+    let etag7 = metadata_etag(&f, "film-a", 7).await;
     let path = "/api/v2/catalog/items/film-a/metadata";
 
     problem(
@@ -286,7 +308,7 @@ async fn metadata_read_replace_preconditions_and_scope() {
     );
     let read = f.call("GET", path, None, &auth(&op)).await;
     assert_eq!(read.status, StatusCode::OK, "{:?}", read.body);
-    assert_eq!(read.headers["etag"], "\"r-1\"");
+    assert_eq!(read.headers["etag"], etag1.as_str());
     assert_eq!(
         read.body,
         json!({"item_id":"film-a","revision":"1","values":{"title":"Film"},"field_sources":{"title":["scan"]},"contributions":[]})
@@ -347,7 +369,7 @@ async fn metadata_read_replace_preconditions_and_scope() {
             "PUT",
             put,
             Some(input.clone()),
-            &[("authorization", &op), ("if-match", "\"r-7\"")],
+            &[("authorization", &op), ("if-match", etag7.as_str())],
         )
         .await,
         StatusCode::PRECONDITION_FAILED,
@@ -358,7 +380,7 @@ async fn metadata_read_replace_preconditions_and_scope() {
             "PUT",
             put,
             Some(input.clone()),
-            &[("authorization", &reader), ("if-match", "\"r-1\"")],
+            &[("authorization", &reader), ("if-match", etag1.as_str())],
         )
         .await,
         StatusCode::FORBIDDEN,
@@ -371,7 +393,7 @@ async fn metadata_read_replace_preconditions_and_scope() {
             "PUT",
             put,
             Some(unknown),
-            &[("authorization", &op), ("if-match", "\"r-1\"")],
+            &[("authorization", &op), ("if-match", etag1.as_str())],
         )
         .await,
         StatusCode::UNPROCESSABLE_ENTITY,
@@ -384,7 +406,7 @@ async fn metadata_read_replace_preconditions_and_scope() {
             "PUT",
             put,
             Some(locked),
-            &[("authorization", &op), ("if-match", "\"r-1\"")],
+            &[("authorization", &op), ("if-match", etag1.as_str())],
         )
         .await,
         StatusCode::UNPROCESSABLE_ENTITY,
@@ -395,11 +417,24 @@ async fn metadata_read_replace_preconditions_and_scope() {
             "PUT",
             "/api/v2/catalog/items/film-a/metadata/contributions/scan",
             Some(input.clone()),
-            &[("authorization", &op), ("if-match", "\"r-1\"")],
+            &[("authorization", &op), ("if-match", etag1.as_str())],
         )
         .await,
         StatusCode::UNPROCESSABLE_ENTITY,
         "invalid_source",
+    );
+    let mut forbidden_exclusion = input.clone();
+    forbidden_exclusion["excluded_tags"] = json!(["Drama"]);
+    problem(
+        &f.call(
+            "PUT",
+            "/api/v2/catalog/items/film-a/metadata/contributions/provider",
+            Some(forbidden_exclusion),
+            &[("authorization", &op), ("if-match", etag1.as_str())],
+        )
+        .await,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "invalid_metadata",
     );
     let mut bad_year = input.clone();
     bad_year["values"]["release_year"] = json!("soon");
@@ -408,7 +443,7 @@ async fn metadata_read_replace_preconditions_and_scope() {
             "PUT",
             put,
             Some(bad_year),
-            &[("authorization", &op), ("if-match", "\"r-1\"")],
+            &[("authorization", &op), ("if-match", etag1.as_str())],
         )
         .await,
         StatusCode::UNPROCESSABLE_ENTITY,
@@ -419,7 +454,7 @@ async fn metadata_read_replace_preconditions_and_scope() {
             "PUT",
             "/api/v2/catalog/items/missing/metadata/contributions/local",
             Some(input.clone()),
-            &[("authorization", &op), ("if-match", "\"r-1\"")],
+            &[("authorization", &op), ("if-match", etag1.as_str())],
         )
         .await,
         StatusCode::NOT_FOUND,
@@ -431,11 +466,11 @@ async fn metadata_read_replace_preconditions_and_scope() {
             "PUT",
             put,
             Some(input.clone()),
-            &[("authorization", &op), ("if-match", "\"r-1\"")],
+            &[("authorization", &op), ("if-match", etag1.as_str())],
         )
         .await;
     assert_eq!(replaced.status, StatusCode::OK, "{:?}", replaced.body);
-    assert_eq!(replaced.headers["etag"], "\"r-2\"");
+    assert_eq!(replaced.headers["etag"], etag2.as_str());
     assert_eq!(replaced.body["revision"], "2");
     assert_eq!(replaced.body["values"]["title"], "My Film");
     assert_eq!(replaced.body["field_sources"]["title"], json!(["local"]));
@@ -455,7 +490,7 @@ async fn metadata_read_replace_preconditions_and_scope() {
             "PUT",
             put,
             Some(input.clone()),
-            &[("authorization", &op), ("if-match", "\"r-2\"")],
+            &[("authorization", &op), ("if-match", etag2.as_str())],
         )
         .await;
     assert_eq!(same.status, StatusCode::OK);
@@ -465,7 +500,7 @@ async fn metadata_read_replace_preconditions_and_scope() {
             "PUT",
             put,
             Some(input.clone()),
-            &[("authorization", &op), ("if-match", "\"r-1\"")],
+            &[("authorization", &op), ("if-match", etag1.as_str())],
         )
         .await,
         StatusCode::PRECONDITION_FAILED,
@@ -477,7 +512,7 @@ async fn metadata_read_replace_preconditions_and_scope() {
             "PUT",
             "/api/v2/catalog/items/film-a/metadata/contributions/catabolic",
             Some(json!({"values":{"title":"Imported"},"tags":[],"excluded_tags":[],"locked_fields":[]})),
-            &[("authorization", &op), ("if-match", "\"r-2\"")],
+            &[("authorization", &op), ("if-match", etag2.as_str())],
         )
         .await;
     assert_eq!(provider.status, StatusCode::OK, "{:?}", provider.body);
@@ -491,7 +526,7 @@ async fn metadata_read_replace_preconditions_and_scope() {
             "PUT",
             "/api/v2/catalog/items/film-b/metadata/contributions/local",
             Some(input.clone()),
-            &[("authorization", &writer), ("if-match", "\"r-1\"")],
+            &[("authorization", &writer), ("if-match", etag_b.as_str())],
         )
         .await,
         StatusCode::NOT_FOUND,
@@ -502,7 +537,7 @@ async fn metadata_read_replace_preconditions_and_scope() {
             "PUT",
             "/api/v2/catalog/items/film-a2/metadata/contributions/local",
             Some(input),
-            &[("authorization", &writer), ("if-match", "\"r-1\"")],
+            &[("authorization", &writer), ("if-match", etag_a2.as_str())],
         )
         .await;
     assert_eq!(inside.status, StatusCode::OK, "{:?}", inside.body);
@@ -1217,7 +1252,8 @@ async fn matching_uses_logical_library_membership_and_protects_shared_files() {
         )
         .await;
     problem(&decision, StatusCode::FORBIDDEN, "outside_scope");
-    let metadata = f.call("PUT", "/api/v2/catalog/items/film-a/metadata/contributions/local", Some(json!({"values":{"title":"Changed"},"tags":[],"excluded_tags":[],"locked_fields":[]})), &[("authorization", &restricted), ("if-match", "\"r-1\"")]).await;
+    let current_metadata_tag = metadata_etag(&f, "film-a", 1).await;
+    let metadata = f.call("PUT", "/api/v2/catalog/items/film-a/metadata/contributions/local", Some(json!({"values":{"title":"Changed"},"tags":[],"excluded_tags":[],"locked_fields":[]})), &[("authorization", &restricted), ("if-match", current_metadata_tag.as_str())]).await;
     problem(&metadata, StatusCode::FORBIDDEN, "outside_scope");
     let title: String = sqlx::query_scalar("SELECT title FROM items WHERE id='film-a'")
         .fetch_one(&f.app.db)
@@ -2572,4 +2608,323 @@ async fn artwork_contribution_changes_advance_selection_etags() {
     assert_ne!(moved.headers["etag"], removed.headers["etag"]);
     assert!(poster(&removed.body)["asset_id"].is_null());
     assert_eq!(poster(&removed.body)["sources"], json!([]));
+}
+
+#[tokio::test]
+async fn processing_retries_respect_capacity_for_both_apis_and_replay() {
+    let f = Fixture::new().await;
+    let op = bearer(OPERATOR);
+    sqlx::query("WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM n WHERE i<100) INSERT INTO processing_jobs(id,source_file_id,source_revision,recipe,backend,idempotency_key,phase,created_at,updated_at) SELECT printf('capacity-%03d',i),'file-a','rev-a','remux_mp4','software',printf('capacity-key-%03d',i),'queued',0,0 FROM n")
+        .execute(&f.app.db).await.unwrap();
+    for id in ["retry-v1", "retry-v2"] {
+        sqlx::query("INSERT INTO processing_jobs(id,source_file_id,source_revision,recipe,backend,idempotency_key,phase,attempt,created_at,updated_at) VALUES (?,'file-a','rev-a','remux_mp4','software',?,'failed',2,0,0)")
+            .bind(id).bind(id).execute(&f.app.db).await.unwrap();
+    }
+    let v1 = "/api/v1/processing-jobs/retry-v1/control";
+    let v2 = "/api/v2/jobs/retry-v2/retry";
+    let job = f
+        .call("GET", "/api/v2/jobs/retry-v2", None, &auth(&op))
+        .await;
+    assert_eq!(job.status, StatusCode::OK);
+    let etag = job.headers["etag"].to_str().unwrap();
+    let headers = [
+        ("authorization", op.as_str()),
+        ("idempotency-key", "processing-retry-capacity-001"),
+        ("if-match", etag),
+    ];
+    assert_eq!(
+        f.call("POST", v1, Some(json!({"action":"retry"})), &auth(&op))
+            .await
+            .status,
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+    assert_eq!(
+        f.call("POST", v2, None, &headers).await.status,
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+    let failed: i64 = sqlx::query_scalar("SELECT count(*) FROM processing_jobs WHERE id IN ('retry-v1','retry-v2') AND phase='failed' AND attempt=2")
+        .fetch_one(&f.app.db).await.unwrap();
+    assert_eq!(failed, 2);
+    sqlx::query("DELETE FROM processing_jobs WHERE id='capacity-001'")
+        .execute(&f.app.db)
+        .await
+        .unwrap();
+    assert_eq!(
+        f.call("POST", v1, Some(json!({"action":"retry"})), &auth(&op))
+            .await
+            .status,
+        StatusCode::OK
+    );
+    sqlx::query("DELETE FROM processing_jobs WHERE id='capacity-002'")
+        .execute(&f.app.db)
+        .await
+        .unwrap();
+    let accepted = f.call("POST", v2, None, &headers).await;
+    assert_eq!(accepted.status, StatusCode::OK, "{:?}", accepted.body);
+    assert_eq!(accepted.body["phase"], "queued");
+    let replay = f.call("POST", v2, None, &headers).await;
+    assert_eq!(replay.status, StatusCode::OK);
+    assert_eq!(replay.headers["idempotent-replayed"], "true");
+    assert_eq!(replay.body, accepted.body);
+    let count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM processing_jobs WHERE phase IN ('queued','running','cancelling')",
+    )
+    .fetch_one(&f.app.db)
+    .await
+    .unwrap();
+    assert_eq!(count, 100);
+
+    // Both callers compete for the last slot; only one may retry.
+    sqlx::query("UPDATE processing_jobs SET phase='failed' WHERE id IN ('retry-v1','retry-v2')")
+        .execute(&f.app.db)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO processing_jobs(id,source_file_id,source_revision,recipe,backend,idempotency_key,phase,created_at,updated_at) VALUES ('last-slot','file-a','rev-a','remux_mp4','software','last-slot','queued',0,0)")
+        .execute(&f.app.db).await.unwrap();
+    let reviewed = f
+        .call("GET", "/api/v2/jobs/retry-v2", None, &auth(&op))
+        .await;
+    let current = reviewed.headers["etag"].to_str().unwrap();
+    let new_headers = [
+        ("authorization", op.as_str()),
+        ("idempotency-key", "processing-retry-capacity-002"),
+        ("if-match", current),
+    ];
+    let legacy_headers = auth(&op);
+    // A separate runtime has a different in-process mutex, so the SQLite
+    // writer boundary must serialize the two admissions itself.
+    let mut independent = f.app.clone();
+    independent.jobs = Arc::new(Mutex::new(()));
+    let request = Request::builder()
+        .method("POST")
+        .uri(v2)
+        .header("host", "127.0.0.1:8787")
+        .header("authorization", new_headers[0].1)
+        .header("idempotency-key", new_headers[1].1)
+        .header("if-match", new_headers[2].1)
+        .body(Body::empty())
+        .unwrap();
+    let (legacy, modern) = tokio::join!(
+        f.call("POST", v1, Some(json!({"action":"retry"})), &legacy_headers),
+        api::router(independent, None).oneshot(request),
+    );
+    let statuses = [legacy.status, modern.unwrap().status()];
+    assert!(statuses.contains(&StatusCode::OK));
+    assert!(statuses.contains(&StatusCode::SERVICE_UNAVAILABLE));
+    let active: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM processing_jobs WHERE phase IN ('queued','running','cancelling')",
+    )
+    .fetch_one(&f.app.db)
+    .await
+    .unwrap();
+    assert_eq!(active, 100);
+}
+
+#[tokio::test]
+async fn metadata_generations_fence_legacy_and_withdraw_recreate_validators() {
+    let f = Fixture::new().await;
+    let op = bearer(OPERATOR);
+    let etag1 = metadata_etag(&f, "film-a", 1).await;
+    let etag2 = metadata_etag(&f, "film-a", 2).await;
+    let etag3 = metadata_etag(&f, "film-a", 3).await;
+    let etag4 = metadata_etag(&f, "film-a", 4).await;
+    let etag_a2_2 = metadata_etag(&f, "film-a2", 2).await;
+    let etag5 = metadata_etag(&f, "film-a", 5).await;
+    let path = "/api/v2/catalog/items/film-a/metadata";
+    let put = "/api/v2/catalog/items/film-a/metadata/contributions/local";
+    let input =
+        json!({"values":{"title":"Manual"},"tags":[],"excluded_tags":[],"locked_fields":[]});
+    let initial = f.call("GET", path, None, &auth(&op)).await;
+    assert_eq!(initial.headers["etag"], etag1.as_str());
+    let legacy = f
+        .call(
+            "PUT",
+            put,
+            Some(input.clone()),
+            &[("authorization", &op), ("if-match", "\"r-1\"")],
+        )
+        .await;
+    problem(
+        &legacy,
+        StatusCode::PRECONDITION_FAILED,
+        "precondition_failed",
+    );
+    let old = json!({"values":{"title":"Before"},"tags":[],"excluded_tags":[]}).to_string();
+    sqlx::query("INSERT INTO metadata_documents VALUES ('film-a','nfo',1,NULL,?,1)")
+        .bind(&old)
+        .execute(&f.app.db)
+        .await
+        .unwrap();
+    let before = f.call("GET", path, None, &auth(&op)).await;
+    assert_eq!(before.headers["etag"], etag2.as_str());
+    sqlx::query("DELETE FROM metadata_documents WHERE item_id='film-a' AND source='nfo'")
+        .execute(&f.app.db)
+        .await
+        .unwrap();
+    let removed = f.call("GET", path, None, &auth(&op)).await;
+    assert_eq!(removed.headers["etag"], etag3.as_str());
+    let new = json!({"values":{"title":"After"},"tags":[],"excluded_tags":[]}).to_string();
+    sqlx::query("INSERT INTO metadata_documents VALUES ('film-a','nfo',1,NULL,?,2)")
+        .bind(&new)
+        .execute(&f.app.db)
+        .await
+        .unwrap();
+    let recreated = f.call("GET", path, None, &auth(&op)).await;
+    assert_eq!(recreated.headers["etag"], etag4.as_str());
+    assert_eq!(recreated.body["values"]["title"], "After");
+    let stale = f
+        .call(
+            "PUT",
+            put,
+            Some(input),
+            &[
+                ("authorization", &op),
+                ("if-match", before.headers["etag"].to_str().unwrap()),
+            ],
+        )
+        .await;
+    problem(
+        &stale,
+        StatusCode::PRECONDITION_FAILED,
+        "precondition_failed",
+    );
+    let mut tx = f.app.db.begin().await.unwrap();
+    sqlx::query("UPDATE item_origins SET title='Rolled back' WHERE item_id='film-a'")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    tx.rollback().await.unwrap();
+    assert_eq!(
+        f.call("GET", path, None, &auth(&op)).await.headers["etag"],
+        etag4.as_str()
+    );
+    sqlx::query(
+        "UPDATE metadata_documents SET item_id='film-a2' WHERE item_id='film-a' AND source='nfo'",
+    )
+    .execute(&f.app.db)
+    .await
+    .unwrap();
+    assert_eq!(
+        f.call("GET", path, None, &auth(&op)).await.headers["etag"],
+        etag5.as_str()
+    );
+    assert_eq!(
+        f.call(
+            "GET",
+            "/api/v2/catalog/items/film-a2/metadata",
+            None,
+            &auth(&op)
+        )
+        .await
+        .headers["etag"],
+        etag_a2_2.as_str()
+    );
+    sqlx::query("UPDATE metadata_resource_generations SET generation=9223372036854775807 WHERE item_id='film-a'").execute(&f.app.db).await.unwrap();
+    assert!(
+        sqlx::query("UPDATE item_origins SET title='Must roll back' WHERE item_id='film-a'")
+            .execute(&f.app.db)
+            .await
+            .is_err()
+    );
+    let title: String = sqlx::query_scalar("SELECT title FROM item_origins WHERE item_id='film-a'")
+        .fetch_one(&f.app.db)
+        .await
+        .unwrap();
+    assert_eq!(title, "Film");
+    sqlx::query("INSERT INTO items(id,title,kind) VALUES ('recreated','Temp','video')")
+        .execute(&f.app.db)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO item_origins VALUES ('recreated','Temp')")
+        .execute(&f.app.db)
+        .await
+        .unwrap();
+    let first: i64 = sqlx::query_scalar(
+        "SELECT generation FROM metadata_resource_generations WHERE item_id='recreated'",
+    )
+    .fetch_one(&f.app.db)
+    .await
+    .unwrap();
+    sqlx::query("DELETE FROM item_origins WHERE item_id='recreated'")
+        .execute(&f.app.db)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM items WHERE id='recreated'")
+        .execute(&f.app.db)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO items(id,title,kind) VALUES ('recreated','Temp','video')")
+        .execute(&f.app.db)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO item_origins VALUES ('recreated','Temp')")
+        .execute(&f.app.db)
+        .await
+        .unwrap();
+    let next: i64 = sqlx::query_scalar(
+        "SELECT generation FROM metadata_resource_generations WHERE item_id='recreated'",
+    )
+    .fetch_one(&f.app.db)
+    .await
+    .unwrap();
+    assert!(next > first);
+}
+
+#[tokio::test]
+async fn metadata_validator_is_fenced_by_restore_history() {
+    let f = Fixture::new().await;
+    let op = bearer(OPERATOR);
+    let read = "/api/v2/catalog/items/film-a/metadata";
+    let write = "/api/v2/catalog/items/film-a/metadata/contributions/local";
+    let before = f.call("GET", read, None, &auth(&op)).await;
+    assert_eq!(before.status, StatusCode::OK);
+    let other = f
+        .call(
+            "GET",
+            "/api/v2/catalog/items/film-a2/metadata",
+            None,
+            &auth(&op),
+        )
+        .await;
+    assert_eq!(before.body["revision"], other.body["revision"]);
+    assert_ne!(before.headers["etag"], other.headers["etag"]);
+    let cross_item = f.call("PUT", "/api/v2/catalog/items/film-a2/metadata/contributions/local", Some(json!({"values":{"title":"Wrong item"},"tags":[],"excluded_tags":[],"locked_fields":[]})), &[("authorization", &op), ("if-match", before.headers["etag"].to_str().unwrap())]).await;
+    problem(
+        &cross_item,
+        StatusCode::PRECONDITION_FAILED,
+        "precondition_failed",
+    );
+    sqlx::query(
+        "UPDATE server_identity SET restore_epoch='metadata-restore-test' WHERE singleton=1",
+    )
+    .execute(&f.app.db)
+    .await
+    .unwrap();
+    let after = f.call("GET", read, None, &auth(&op)).await;
+    assert_eq!(after.status, StatusCode::OK);
+    assert_eq!(before.body["revision"], after.body["revision"]);
+    assert_ne!(before.headers["etag"], after.headers["etag"]);
+    let input = json!({"values":{"title":"Must not commit"},"tags":[],"excluded_tags":[],"locked_fields":[]});
+    let stale = f
+        .call(
+            "PUT",
+            write,
+            Some(input),
+            &[
+                ("authorization", &op),
+                ("if-match", before.headers["etag"].to_str().unwrap()),
+            ],
+        )
+        .await;
+    problem(
+        &stale,
+        StatusCode::PRECONDITION_FAILED,
+        "precondition_failed",
+    );
+    let count: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM metadata_documents WHERE item_id='film-a'")
+            .fetch_one(&f.app.db)
+            .await
+            .unwrap();
+    assert_eq!(count, 0);
 }

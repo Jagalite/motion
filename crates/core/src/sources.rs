@@ -146,6 +146,106 @@ pub fn overlapping<'a>(candidate: &str, registered: &[&'a str]) -> Option<&'a st
         .find(|r| *r != candidate && (inside(candidate, r) || inside(r, candidate)))
 }
 
+/// Existing durable ownership and filesystem identity for the exact root.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExistingRoot<'a> {
+    pub id: &'a str,
+    pub identity: &'a str,
+    pub managed: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OwnershipRequirement {
+    /// A source-only registration may reuse either existing ownership kind.
+    ExistingKind,
+    /// Legacy registration requires the existing ownership kind to agree.
+    Exact(bool),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Registration {
+    Create,
+    Reuse { id: Id },
+    RelocationRequired,
+    OwnershipConflict,
+}
+
+/// Decide exact-root registration from facts observed under the writer. Root
+/// overlap is independently validated by the source-only caller; legacy root
+/// registration retains its historical overlap behavior.
+pub fn registration(
+    proposed_identity: &str,
+    ownership: OwnershipRequirement,
+    existing: Option<ExistingRoot<'_>>,
+) -> Registration {
+    match existing {
+        None => Registration::Create,
+        Some(root) if root.identity != proposed_identity => Registration::RelocationRequired,
+        Some(root) if matches!(ownership, OwnershipRequirement::Exact(kind) if kind != root.managed) => {
+            Registration::OwnershipConflict
+        }
+        Some(root) => Registration::Reuse {
+            id: root.id.to_owned(),
+        },
+    }
+}
+
+#[cfg(test)]
+mod registration_tests {
+    use super::*;
+
+    #[test]
+    fn exact_root_reuse_preserves_identity_and_ownership_policy() {
+        for managed in [false, true] {
+            let existing = ExistingRoot {
+                id: "source",
+                identity: "device:1",
+                managed,
+            };
+            assert_eq!(
+                registration(
+                    "device:1",
+                    OwnershipRequirement::ExistingKind,
+                    Some(existing.clone())
+                ),
+                Registration::Reuse {
+                    id: "source".into()
+                }
+            );
+            assert_eq!(
+                registration(
+                    "device:1",
+                    OwnershipRequirement::Exact(managed),
+                    Some(existing.clone())
+                ),
+                Registration::Reuse {
+                    id: "source".into()
+                }
+            );
+            assert_eq!(
+                registration(
+                    "device:1",
+                    OwnershipRequirement::Exact(!managed),
+                    Some(existing.clone())
+                ),
+                Registration::OwnershipConflict
+            );
+            assert_eq!(
+                registration(
+                    "device:2",
+                    OwnershipRequirement::Exact(!managed),
+                    Some(existing)
+                ),
+                Registration::RelocationRequired
+            );
+        }
+        assert_eq!(
+            registration("device:1", OwnershipRequirement::Exact(false), None),
+            Registration::Create
+        );
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Availability {

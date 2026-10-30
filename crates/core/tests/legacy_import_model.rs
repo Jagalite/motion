@@ -13,6 +13,7 @@ struct State {
     view: Option<View>,
     changed: bool,
     session: bool,
+    timestamp_changed: bool,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 enum Input {
@@ -20,6 +21,7 @@ enum Input {
     RollbackRepair,
     Manual,
     Session,
+    TimestampOnly,
 }
 struct Repair {
     exact: bool,
@@ -44,7 +46,14 @@ impl Repair {
     fn repair(&self, s: &State) -> State {
         let mut next = s.clone();
         if let Some(view) = &s.view
-            && core::retract_unattributed_legacy(&self.attribution(), view, &legacy(), s.session)
+            && core::retract_unattributed_legacy(
+                &self.attribution(),
+                view,
+                &legacy(),
+                s.session,
+                i64::from(s.timestamp_changed),
+                0,
+            )
         {
             next.view = None;
         }
@@ -63,9 +72,9 @@ impl Model for Repair {
     fn metadata(&self) -> ModelMetadata {
         ModelMetadata {
             name: "motion.legacy-import".into(),
-            model_version: 1,
-            properties_version: 1,
-            codec_version: 1,
+            model_version: 2,
+            properties_version: 2,
+            codec_version: 2,
             build: include_str!("../src/timeline_viewing.rs").into(),
         }
     }
@@ -74,6 +83,7 @@ impl Model for Repair {
             view: self.backfill.then(legacy),
             changed: false,
             session: false,
+            timestamp_changed: false,
         })
     }
     fn step(&self, s: &State, i: &Input) -> Result<Transition<State, bool>, ModelError> {
@@ -101,6 +111,7 @@ impl Model for Repair {
                 n.changed = true;
                 n.session = true;
             }
+            Input::TimestampOnly => n.timestamp_changed = true,
         }
         Ok(Transition::accepted(n, vec![true]))
     }
@@ -124,7 +135,7 @@ impl Model for Repair {
         let ok = match i {
             Input::RollbackRepair => t.state == s,
             Input::Repair => {
-                if s.changed {
+                if s.changed || (s.timestamp_changed && s.view.is_some()) {
                     t.state == s
                 } else if self.exact {
                     t.state.view == Some(legacy())
@@ -149,6 +160,9 @@ impl Enumerate for Repair {
         let mut v = vec![Input::Repair, Input::RollbackRepair];
         if !s.changed {
             v.extend([Input::Manual, Input::Session]);
+        }
+        if s.view.is_some() && !s.timestamp_changed {
+            v.push(Input::TimestampOnly);
         }
         Ok(v)
     }
@@ -256,7 +270,24 @@ mod preparation {
                     requester_authorized: true,
                     source_enabled: true,
                     source_in_scope: true,
-                    exact_whole_timeline_binding: true,
+                    binding: processing::BindingEvidence {
+                        timeline: "timeline".into(),
+                        file: "file".into(),
+                        revision: "source".into(),
+                        candidates: vec![processing::WholeBinding {
+                            version: "version".into(),
+                            timeline: "timeline".into(),
+                            file: "file".into(),
+                            file_revision: "source".into(),
+                            origin: "original".into(),
+                            file_edition: "edition".into(),
+                            timeline_edition: "edition".into(),
+                            part: 1,
+                            start_ms: None,
+                            end_ms: None,
+                            part_count: 1,
+                        }],
+                    },
                     recipe_unchanged: true,
                 },
                 source_current: true,
@@ -269,7 +300,7 @@ mod preparation {
                 Input::Revoke => n.facts.requester_authorized = false,
                 Input::Disable => n.facts.source_enabled = false,
                 Input::Hide => n.facts.source_in_scope = false,
-                Input::Rebind => n.facts.exact_whole_timeline_binding = false,
+                Input::Rebind => n.facts.binding.candidates.clear(),
                 Input::RecipeChanged => n.facts.recipe_unchanged = false,
                 Input::SourceChanged => n.source_current = false,
                 Input::Start | Input::Cancel | Input::Retry | Input::Recover => {
@@ -329,7 +360,7 @@ mod preparation {
                 && s.facts.requester_authorized
                 && s.facts.source_enabled
                 && s.facts.source_in_scope
-                && s.facts.exact_whole_timeline_binding
+                && s.facts.binding.is_current()
                 && s.facts.recipe_unchanged;
             let atomic = !matches!(i, Input::RollbackFinish) || t.state == s;
             let ok = t.outputs == [u8::from(expected)] && atomic;

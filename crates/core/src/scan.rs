@@ -3,6 +3,79 @@
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
+/// Probe facts recorded by the current scanner. Older video and attachment
+/// streams lack facts required by downstream policies.
+pub const PROBE_VERSION: u32 = 2;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProbeDecision {
+    InspectFully,
+    ProbeChapters,
+    Reuse,
+}
+
+pub fn incremental_cache_enabled(
+    enabled: bool,
+    fingerprints_supported: bool,
+    full_scan: bool,
+) -> bool {
+    enabled && fingerprints_supported && !full_scan
+}
+
+/// Decide how to inspect an unchanged cached file from observed fingerprint,
+/// stream probe versions and whether valid chapter evidence was recorded.
+pub fn probe_decision(
+    cached_fingerprint: &str,
+    observed_fingerprint: &str,
+    tracks: impl IntoIterator<Item = (impl AsRef<str>, u32)>,
+    chapters_available: bool,
+) -> ProbeDecision {
+    if cached_fingerprint != observed_fingerprint
+        || tracks.into_iter().any(|(kind, version)| {
+            version < PROBE_VERSION && matches!(kind.as_ref(), "video" | "attachment")
+        })
+    {
+        ProbeDecision::InspectFully
+    } else if chapters_available {
+        ProbeDecision::Reuse
+    } else {
+        ProbeDecision::ProbeChapters
+    }
+}
+
+/// Default catalog kind for a newly observed work. Video wins over audio;
+/// unknown or absent streams retain the historical video default.
+pub fn initial_item_kind<'a>(kinds: impl IntoIterator<Item = &'a str>) -> &'static str {
+    let mut audio = false;
+    for kind in kinds {
+        if kind == "video" {
+            return "video";
+        }
+        audio |= kind == "audio";
+    }
+    if audio { "audio" } else { "video" }
+}
+
+/// Chapter evidence is retained only when it still describes the same file
+/// revision. A present observation, including an empty list, replaces it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ChapterEffect {
+    Retain,
+    Set(Option<String>),
+}
+
+pub fn chapter_evidence(
+    previous_revision: Option<&str>,
+    observed_revision: &str,
+    observed_chapters: Option<&str>,
+) -> ChapterEffect {
+    match observed_chapters {
+        Some(chapters) => ChapterEffect::Set(Some(chapters.to_owned())),
+        None if previous_revision == Some(observed_revision) => ChapterEffect::Retain,
+        None => ChapterEffect::Set(None),
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Existing {
     pub id: String,
@@ -270,4 +343,84 @@ pub fn finish(
                     .is_some_and(|(start, end)| start == &observed.current_root && end == start),
         },
     )
+}
+
+#[cfg(test)]
+mod chapter_evidence_tests {
+    use super::*;
+    #[test]
+    fn missing_chapters_are_retained_only_for_the_same_revision() {
+        assert_eq!(
+            chapter_evidence(Some("a"), "a", None),
+            ChapterEffect::Retain
+        );
+        assert_eq!(
+            chapter_evidence(Some("a"), "b", None),
+            ChapterEffect::Set(None)
+        );
+        assert_eq!(chapter_evidence(None, "a", None), ChapterEffect::Set(None));
+        assert_eq!(
+            chapter_evidence(Some("a"), "a", Some("[]")),
+            ChapterEffect::Set(Some("[]".into()))
+        );
+        assert_eq!(
+            chapter_evidence(Some("a"), "b", Some("new")),
+            ChapterEffect::Set(Some("new".into()))
+        );
+    }
+}
+
+#[cfg(test)]
+mod probe_decision_tests {
+    use super::*;
+
+    #[test]
+    fn initial_kind_uses_video_precedence_and_default() {
+        assert_eq!(initial_item_kind(["audio", "video"]), "video");
+        assert_eq!(initial_item_kind(["subtitle", "audio"]), "audio");
+        assert_eq!(initial_item_kind(["subtitle"]), "video");
+        assert_eq!(initial_item_kind([]), "video");
+    }
+
+    #[test]
+    fn incremental_probe_decisions_respect_fingerprint_versions_and_chapters() {
+        for enabled in [false, true] {
+            for supported in [false, true] {
+                for full in [false, true] {
+                    assert_eq!(
+                        incremental_cache_enabled(enabled, supported, full),
+                        enabled && supported && !full
+                    );
+                }
+            }
+        }
+        for kind in ["video", "attachment", "audio", "subtitle"] {
+            for version in [0, 1, PROBE_VERSION, PROBE_VERSION + 1] {
+                for chapters in [false, true] {
+                    let decision = probe_decision("a", "a", [(kind, version)], chapters);
+                    let expected =
+                        if version < PROBE_VERSION && matches!(kind, "video" | "attachment") {
+                            ProbeDecision::InspectFully
+                        } else if chapters {
+                            ProbeDecision::Reuse
+                        } else {
+                            ProbeDecision::ProbeChapters
+                        };
+                    assert_eq!(decision, expected, "{kind} {version} {chapters}");
+                    assert_eq!(
+                        probe_decision("a", "b", [(kind, version)], chapters),
+                        ProbeDecision::InspectFully
+                    );
+                }
+            }
+        }
+        assert_eq!(
+            probe_decision("a", "a", [("audio", 0), ("attachment", 1)], true),
+            ProbeDecision::InspectFully
+        );
+        assert_eq!(
+            probe_decision("a", "a", std::iter::empty::<(&str, u32)>(), false),
+            ProbeDecision::ProbeChapters
+        );
+    }
 }

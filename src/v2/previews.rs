@@ -15,7 +15,7 @@ use axum::{
 use playscale_core::{
     access::{self, Idempotent, Permission, Principal},
     jobs::{self, Effect, Input, Job},
-    previews::{self as core, Layout, PublicationFacts, Sheet},
+    previews::{self as core, Layout, Sheet},
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -740,7 +740,7 @@ async fn render(
 }
 
 /// Publish a valid attempt's sheets, or discard them (core
-/// `PublicationFacts`), and finish the job (core `jobs::transition`), under
+/// the core publication plan), and finish the job under
 /// the jobs lock in one write transaction with the attempt checked.
 async fn finish(
     app: &App,
@@ -770,10 +770,7 @@ async fn finish(
             .bind(&job.id)
             .fetch_one(&mut *tx)
             .await?;
-    let source_current = layout_identity(&mut tx, &job.file, &job.revision)
-        .await?
-        .as_deref()
-        == Some(identity.as_str());
+    let current_layout_identity = layout_identity(&mut tx, &job.file, &job.revision).await?;
     let requester_authorized = match crate::metadata_jobs::principal(
         &mut tx,
         &requester,
@@ -792,94 +789,102 @@ async fn finish(
         ),
         Err(_) => false,
     };
-    let (layout, sheets_valid) = match &rendered {
-        Ok((layout, sheets, unchanged)) => (
-            Some(*layout),
-            *unchanged && core::valid_sheets(layout, sheets),
-        ),
-        Err(_) => (None, false),
-    };
-    let facts = PublicationFacts {
-        attempt_current: phase == "running" && attempt == job.attempt,
-        source_current,
-        sheets_valid,
-        requester_authorized,
-    };
     let current = Job {
         phase: serde_json::from_value(json!(phase))?,
         attempt: attempt.try_into()?,
     };
-    let (next, effects) = jobs::transition(
+    let artifact = core::ArtifactIdentity {
+        file: job.file.clone(),
+        revision: job.revision.clone(),
+        layout_identity: identity.clone(),
+    };
+    let previous = sqlx::query_scalar::<_, String>(
+        "SELECT layout_identity FROM previews WHERE file_id=? AND file_revision=?",
+    )
+    .bind(&job.file)
+    .bind(&job.revision)
+    .fetch_optional(&mut *tx)
+    .await?
+    .map(|layout_identity| core::ArtifactIdentity {
+        file: job.file.clone(),
+        revision: job.revision.clone(),
+        layout_identity,
+    });
+    let rendered_facts = rendered
+        .as_ref()
+        .ok()
+        .map(|(layout, sheets, unchanged)| (layout, sheets.as_slice(), *unchanged));
+    let plan = core::plan_publication(
         &current,
-        Input::Finished {
-            attempt: job.attempt.try_into()?,
-            success: facts.publishable(),
-        },
+        job.attempt.try_into()?,
+        &job.id,
+        &artifact,
+        current_layout_identity.as_deref(),
+        rendered_facts,
+        requester_authorized,
+        previous.as_ref(),
+        stuck,
     );
     let staging = staging_dir(app, &job.id, job.attempt);
-    if effects.iter().any(|e| matches!(e, Effect::Publish { .. }))
-        && let Some(layout) = layout
+    if let Some(core::PublicationAction::Publish {
+        job: planned_job,
+        attempt: planned_attempt,
+        artifact,
+        layout,
+    }) = plan.action.as_ref()
     {
-        let target = published_dir(app, &job.file, &job.revision);
-        let published = sqlx::query_scalar::<_, i64>(
-            "SELECT 1 FROM previews WHERE file_id=? AND file_revision=? AND layout_identity=?",
-        )
-        .bind(&job.file)
-        .bind(&job.revision)
-        .bind(&identity)
-        .fetch_optional(&mut *tx)
-        .await?
-        .is_some();
-        if !published {
-            // Durable sheets and their directory entries, then the immutable
-            // directory under durable ancestors, then the row: a committed
-            // row never names sheets a power loss could take away.
-            let (from, to, root) = (staging.clone(), target.clone(), previews_root(app));
-            tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
-                let sync = |dir: &std::path::Path| -> anyhow::Result<()> {
-                    #[cfg(unix)]
-                    std::fs::File::open(dir)?.sync_all()?;
-                    Ok(())
-                };
-                let _ = std::fs::remove_file(from.join(".owner"));
-                for entry in std::fs::read_dir(&from)? {
-                    std::fs::File::open(entry?.path())?.sync_all()?;
-                }
-                sync(&from)?;
-                if let Some(parent) = root.parent() {
-                    sync(parent)?;
-                }
-                if to.exists() {
-                    std::fs::remove_dir_all(&to)?;
-                }
-                let parent = to.parent().unwrap_or(&to).to_path_buf();
-                let created = !parent.exists();
-                std::fs::create_dir_all(&parent)?;
-                if created {
-                    sync(&root)?;
-                }
-                std::fs::rename(&from, &to)?;
-                sync(&to)?;
-                sync(&parent)?;
+        let target = published_dir(app, &artifact.file, &artifact.revision);
+        let planned_staging = staging_dir(app, planned_job, i64::from(*planned_attempt));
+        // Durable sheets and their directory entries, then the immutable
+        // directory under durable ancestors, then the row: a committed
+        // row never names sheets a power loss could take away.
+        let (from, to, root) = (planned_staging, target.clone(), previews_root(app));
+        tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+            let sync = |dir: &std::path::Path| -> anyhow::Result<()> {
+                #[cfg(unix)]
+                std::fs::File::open(dir)?.sync_all()?;
                 Ok(())
-            })
-            .await??;
-            sqlx::query("INSERT INTO previews(file_id,file_revision,job_id,interval_ms,tile_width,tile_height,columns,rows,tiles,sheets,created_at,layout_identity) VALUES (?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(file_id,file_revision) DO UPDATE SET job_id=excluded.job_id,interval_ms=excluded.interval_ms,tile_width=excluded.tile_width,tile_height=excluded.tile_height,columns=excluded.columns,rows=excluded.rows,tiles=excluded.tiles,sheets=excluded.sheets,created_at=excluded.created_at,layout_identity=excluded.layout_identity")
-                .bind(&job.file).bind(&job.revision).bind(&job.id)
+            };
+            let _ = std::fs::remove_file(from.join(".owner"));
+            for entry in std::fs::read_dir(&from)? {
+                std::fs::File::open(entry?.path())?.sync_all()?;
+            }
+            sync(&from)?;
+            if let Some(parent) = root.parent() {
+                sync(parent)?;
+            }
+            if to.exists() {
+                std::fs::remove_dir_all(&to)?;
+            }
+            let parent = to.parent().unwrap_or(&to).to_path_buf();
+            let created = !parent.exists();
+            std::fs::create_dir_all(&parent)?;
+            if created {
+                sync(&root)?;
+            }
+            std::fs::rename(&from, &to)?;
+            sync(&to)?;
+            sync(&parent)?;
+            Ok(())
+        })
+        .await??;
+        sqlx::query("INSERT INTO previews(file_id,file_revision,job_id,interval_ms,tile_width,tile_height,columns,rows,tiles,sheets,created_at,layout_identity) VALUES (?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(file_id,file_revision) DO UPDATE SET job_id=excluded.job_id,interval_ms=excluded.interval_ms,tile_width=excluded.tile_width,tile_height=excluded.tile_height,columns=excluded.columns,rows=excluded.rows,tiles=excluded.tiles,sheets=excluded.sheets,created_at=excluded.created_at,layout_identity=excluded.layout_identity")
+                .bind(&artifact.file).bind(&artifact.revision).bind(planned_job)
                 .bind(layout.interval_ms as i64).bind(layout.tile_width).bind(layout.tile_height)
                 .bind(layout.columns).bind(layout.rows).bind(layout.tiles).bind(layout.sheets)
-                .bind(crate::now()).bind(&identity).execute(&mut *tx).await?;
-        }
+                .bind(crate::now()).bind(&artifact.layout_identity).execute(&mut *tx).await?;
     }
-    sqlx::query("UPDATE preview_jobs SET phase=?,error=? WHERE id=?")
-        .bind(crate::db::phase_name(next.phase))
-        .bind((next.phase == jobs::Phase::Failed).then_some("preview_failed"))
-        .bind(&job.id)
-        .execute(&mut *tx)
-        .await?;
+    if let Some(next) = &plan.job {
+        sqlx::query("UPDATE preview_jobs SET phase=?,error=? WHERE id=?")
+            .bind(crate::db::phase_name(next.phase))
+            .bind(plan.error.as_deref())
+            .bind(&job.id)
+            .execute(&mut *tx)
+            .await?;
+    }
     tx.commit().await?;
     drop(_guard);
-    if !stuck {
+    if plan.remove_staging {
         let _ = tokio::fs::remove_dir_all(&staging).await;
     }
     Ok(())
@@ -983,11 +988,30 @@ pub async fn retain(app: &App) -> anyhow::Result<()> {
     {
         let _guard = app.jobs.lock().await;
         let mut tx = begin_write(&app.db).await?;
-        let mut stale: Vec<(String, String)> = sqlx::query_as(
-            "SELECT file_id,file_revision FROM previews p WHERE NOT EXISTS(SELECT 1 FROM media_files f WHERE f.id=p.file_id AND f.revision=p.file_revision AND f.available=1) LIMIT 100",
-        )
-        .fetch_all(&mut *tx)
-        .await?;
+        // The query prioritizes obviously stale candidates; core still decides
+        // withdrawal from current observations inside this transaction.
+        let candidates: Vec<(String, String, i64, String)> = sqlx::query_as(
+            "SELECT file_id,file_revision,sheets,layout_identity FROM previews p WHERE NOT EXISTS(SELECT 1 FROM media_files f WHERE f.id=p.file_id AND f.revision=p.file_revision AND f.available=1) LIMIT 100",
+        ).fetch_all(&mut *tx).await?;
+        let mut stale: Vec<(String, String)> = Vec::new();
+        for (file, revision, sheets, identity) in candidates {
+            let current = layout_identity(&mut tx, &file, &revision).await?;
+            let observed = core::RetentionObservation {
+                artifact: core::ArtifactIdentity {
+                    file,
+                    revision,
+                    layout_identity: identity,
+                },
+                current_layout_identity: current,
+                sheet_count: sheets,
+                sheets_present: vec![],
+            };
+            if let core::RetentionAction::Withdraw { artifact } =
+                core::retain_publication(&observed)
+            {
+                stale.push((artifact.file, artifact.revision));
+            }
+        }
         // Published rows whose sheets are not all on disk (a database
         // restored without them): withdrawn, so a request renders again.
         let cursor: String =
@@ -1010,12 +1034,29 @@ pub async fn retain(app: &App) -> anyhow::Result<()> {
             .await?;
         for (file, revision, sheets, identity) in published {
             let dir = published_dir(app, &file, &revision);
-            if layout_identity(&mut tx, &file, &revision).await?.as_deref()
-                != Some(identity.as_str())
-                || !(1..=20).contains(&sheets)
-                || (1..=sheets).any(|n| !dir.join(format!("sheet-{n}.jpg")).is_file())
+            // Bound filesystem observations; core owns the validity decision.
+            let present = if (1..=20).contains(&sheets) {
+                (1..=sheets)
+                    .map(|n| dir.join(format!("sheet-{n}.jpg")).is_file())
+                    .collect()
+            } else {
+                vec![]
+            };
+            let current = layout_identity(&mut tx, &file, &revision).await?;
+            let observed = core::RetentionObservation {
+                artifact: core::ArtifactIdentity {
+                    file,
+                    revision,
+                    layout_identity: identity,
+                },
+                current_layout_identity: current,
+                sheet_count: sheets,
+                sheets_present: present,
+            };
+            if let core::RetentionAction::Withdraw { artifact } =
+                core::retain_publication(&observed)
             {
-                stale.push((file, revision));
+                stale.push((artifact.file, artifact.revision));
             }
         }
         for (file, revision) in &stale {
@@ -1037,7 +1078,9 @@ pub async fn retain(app: &App) -> anyhow::Result<()> {
                     .bind(&revision_name)
                     .fetch_optional(&app.db)
                     .await?;
-            if row.is_none() {
+            if let core::CleanupAction::RemoveOrphan { .. } =
+                core::orphan_cleanup(&file_name, &revision_name, row.is_some())
+            {
                 orphans.push(path);
             }
         }
@@ -1057,13 +1100,18 @@ pub async fn retain(app: &App) -> anyhow::Result<()> {
             let Some((id, attempt)) = name.rsplit_once('-') else {
                 continue;
             };
-            let live: Option<i64> = sqlx::query_scalar(
-                "SELECT 1 FROM preview_jobs WHERE id=? AND attempt=? AND phase IN ('running','cancelling')",
-            )
-            .bind(id)
-            .bind(attempt.parse::<i64>().unwrap_or(-1))
-            .fetch_optional(&app.db)
-            .await?;
+            let job: Option<(String, i64)> =
+                sqlx::query_as("SELECT phase,attempt FROM preview_jobs WHERE id=?")
+                    .bind(id)
+                    .fetch_optional(&app.db)
+                    .await?;
+            let job = job
+                .map(|(phase, attempt)| {
+                    serde_json::from_value::<jobs::Phase>(json!(phase))
+                        .map(|phase| (phase, attempt))
+                })
+                .transpose()?;
+            let directory_attempt = attempt.parse::<i64>().unwrap_or(-1);
             // A renderer still holding its witness (of this or a previous
             // process) keeps its staging until it is gone.
             let owner = entry.path().join(".owner");
@@ -1071,10 +1119,200 @@ pub async fn retain(app: &App) -> anyhow::Result<()> {
                 crate::execution::Witness::open(&owner).is_ok_and(|w| !w.released())
             })
             .await?;
-            if live.is_none() && !held {
+            if let core::CleanupAction::RemoveStaging { .. } =
+                core::staging_cleanup(id, job, directory_attempt, held)
+            {
                 let _ = tokio::fs::remove_dir_all(entry.path()).await;
             }
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod publication_adapter_tests {
+    use super::*;
+    use std::sync::Arc;
+    use tokio::sync::{Mutex, Semaphore};
+
+    #[tokio::test]
+    async fn publication_reuses_equivalent_artifact_and_fences_obsolete_worker() {
+        let dir = tempfile::tempdir().unwrap();
+        let media = dir.path().join("media");
+        std::fs::create_dir(&media).unwrap();
+        let pool = crate::db::connect(&dir.path().join("db.sqlite"))
+            .await
+            .unwrap();
+        let library = crate::db::add_library(&pool, "Media", &media)
+            .await
+            .unwrap()
+            .id;
+        sqlx::query("INSERT INTO items(id,title,kind) VALUES ('item','Film','video')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO editions(id,item_id,label) VALUES ('edition','item','Original')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO media_files(id,edition_id,library_id,relative_path,revision,fingerprint,bytes,duration_seconds,tracks_json) VALUES ('file','edition',?,'film.mkv','rev','fp',1,10,'[]')").bind(&library).execute(&pool).await.unwrap();
+        let app = App {
+            health: Arc::new(crate::operations::Health::new(false)),
+            db: pool,
+            admin_token: Arc::new("test-secret".into()),
+            origin: Arc::new("http://127.0.0.1:8787".into()),
+            authority: Arc::new("127.0.0.1:8787".into()),
+            ffprobe: Arc::new("ffprobe".into()),
+            jobs: Arc::new(Mutex::new(())),
+            streams: Arc::new(Semaphore::new(2)),
+            event_streams: Arc::new(Semaphore::new(2)),
+            storage: Arc::new(crate::storage::Runtime::new(
+                dir.path().join("state"),
+                Default::default(),
+            )),
+            processing: Arc::new(crate::processing::Runtime::new(
+                dir.path().join("cache"),
+                Default::default(),
+            )),
+            access: Arc::new(crate::v2::Runtime::new(
+                playscale_core::access::AccessMode::Restricted,
+                crate::v2::auth::random_key(),
+            )),
+        };
+        let mut conn = app.db.acquire().await.unwrap();
+        let identity = layout_identity(&mut conn, "file", "rev")
+            .await
+            .unwrap()
+            .unwrap();
+        drop(conn);
+        async fn job(app: &App, id: &str, attempt: i64, identity: &str) {
+            sqlx::query("INSERT INTO preview_jobs(id,phase,attempt,file_id,file_revision,requester_id,created_at,layout_identity) VALUES (?,'running',?,'file','rev','operator',1,?)")
+                .bind(id).bind(attempt).bind(identity).execute(&app.db).await.unwrap();
+        }
+        let layout = core::layout(10_000, 160, 90).unwrap();
+        let sheet = Sheet {
+            width: layout.tile_width * layout.columns,
+            height: layout.tile_height * layout.rows,
+            bytes: 3,
+        };
+        job(&app, "one", 1, &identity).await;
+        let staging = staging_dir(&app, "one", 1);
+        std::fs::create_dir_all(&staging).unwrap();
+        std::fs::write(staging.join("sheet-1.jpg"), b"one").unwrap();
+        let started = Started {
+            id: "one".into(),
+            attempt: 1,
+            file: "file".into(),
+            revision: "rev".into(),
+        };
+        finish(&app, &started, Ok((layout, vec![sheet], true)), false)
+            .await
+            .unwrap();
+        let target = published_dir(&app, "file", "rev");
+        assert_eq!(std::fs::read(target.join("sheet-1.jpg")).unwrap(), b"one");
+        let row: (String, String) = sqlx::query_as("SELECT job_id,layout_identity FROM previews WHERE file_id='file' AND file_revision='rev'").fetch_one(&app.db).await.unwrap();
+        assert_eq!(row, ("one".into(), identity.clone()));
+        job(&app, "two", 1, &identity).await;
+        let staging = staging_dir(&app, "two", 1);
+        std::fs::create_dir_all(&staging).unwrap();
+        std::fs::write(staging.join("sheet-1.jpg"), b"two").unwrap();
+        let second = Started {
+            id: "two".into(),
+            ..started
+        };
+        finish(&app, &second, Ok((layout, vec![sheet], true)), false)
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read(target.join("sheet-1.jpg")).unwrap(), b"one");
+        assert!(!staging.exists());
+        let owner: String = sqlx::query_scalar(
+            "SELECT job_id FROM previews WHERE file_id='file' AND file_revision='rev'",
+        )
+        .fetch_one(&app.db)
+        .await
+        .unwrap();
+        assert_eq!(owner, "one");
+        sqlx::query(
+            "UPDATE preview_jobs SET phase='running',attempt=2,error='current' WHERE id='two'",
+        )
+        .execute(&app.db)
+        .await
+        .unwrap();
+        let before: (String, Option<String>, i64) =
+            sqlx::query_as("SELECT phase,error,revision FROM preview_jobs WHERE id='two'")
+                .fetch_one(&app.db)
+                .await
+                .unwrap();
+        finish(&app, &second, Ok((layout, vec![sheet], true)), false)
+            .await
+            .unwrap();
+        let after: (String, Option<String>, i64) =
+            sqlx::query_as("SELECT phase,error,revision FROM preview_jobs WHERE id='two'")
+                .fetch_one(&app.db)
+                .await
+                .unwrap();
+        assert_eq!(after, before);
+        // A changed layout withdraws its row before deleting the old sheets;
+        // orphan and obsolete staging cleanup must not touch the live attempt.
+        sqlx::query("UPDATE media_files SET duration_seconds=20 WHERE id='file'")
+            .execute(&app.db)
+            .await
+            .unwrap();
+        let orphan = published_dir(&app, "orphan", "rev");
+        std::fs::create_dir_all(&orphan).unwrap();
+        let old_staging = staging_dir(&app, "two", 1);
+        let live_staging = staging_dir(&app, "two", 2);
+        std::fs::create_dir_all(&old_staging).unwrap();
+        std::fs::create_dir_all(&live_staging).unwrap();
+        retain(&app).await.unwrap();
+        let remaining: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM previews WHERE file_id='file'")
+                .fetch_one(&app.db)
+                .await
+                .unwrap();
+        assert_eq!(remaining, 0);
+        assert!(!target.exists());
+        assert!(!orphan.exists());
+        assert!(!old_staging.exists());
+        assert!(live_staging.exists());
+
+        // A crash-like database failure after rename leaves no committed row.
+        // The next sweep recognizes the directory as an orphan and removes it.
+        sqlx::query("INSERT INTO media_files(id,edition_id,library_id,relative_path,revision,fingerprint,bytes,duration_seconds,tracks_json) VALUES ('file2','edition',?,'other.mkv','rev2','fp',1,10,'[]')").bind(&library).execute(&app.db).await.unwrap();
+        let mut conn = app.db.acquire().await.unwrap();
+        let second_identity = layout_identity(&mut conn, "file2", "rev2")
+            .await
+            .unwrap()
+            .unwrap();
+        drop(conn);
+        sqlx::query("INSERT INTO preview_jobs(id,phase,attempt,file_id,file_revision,requester_id,created_at,layout_identity) VALUES ('three','running',1,'file2','rev2','operator',1,?)").bind(&second_identity).execute(&app.db).await.unwrap();
+        sqlx::query("CREATE TRIGGER reject_preview BEFORE INSERT ON previews WHEN NEW.file_id='file2' BEGIN SELECT RAISE(ABORT,'injected commit failure'); END").execute(&app.db).await.unwrap();
+        let staging = staging_dir(&app, "three", 1);
+        std::fs::create_dir_all(&staging).unwrap();
+        std::fs::write(staging.join("sheet-1.jpg"), b"new").unwrap();
+        let third = Started {
+            id: "three".into(),
+            attempt: 1,
+            file: "file2".into(),
+            revision: "rev2".into(),
+        };
+        assert!(
+            finish(&app, &third, Ok((layout, vec![sheet], true)), false)
+                .await
+                .is_err()
+        );
+        let orphaned = published_dir(&app, "file2", "rev2");
+        assert!(orphaned.exists());
+        let count: i64 = sqlx::query_scalar("SELECT count(*) FROM previews WHERE file_id='file2'")
+            .fetch_one(&app.db)
+            .await
+            .unwrap();
+        assert_eq!(count, 0);
+        sqlx::query("DROP TRIGGER reject_preview")
+            .execute(&app.db)
+            .await
+            .unwrap();
+        retain(&app).await.unwrap();
+        assert!(!orphaned.exists());
+    }
 }

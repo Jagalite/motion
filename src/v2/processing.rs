@@ -246,8 +246,57 @@ pub(crate) async fn exact_binding(
     timeline: &str,
     file: &str,
     revision: &str,
-) -> Result<bool, sqlx::Error> {
-    sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM version_files b JOIN media_versions v ON v.id=b.version_id JOIN timelines t ON t.id=v.timeline_id JOIN media_files f ON f.id=b.file_id WHERE v.timeline_id=? AND b.file_id=? AND b.file_revision=? AND v.origin='original' AND f.edition_id=t.edition_id AND b.start_ms IS NULL AND b.end_ms IS NULL AND (SELECT count(*) FROM version_files p WHERE p.version_id=v.id)=1)").bind(timeline).bind(file).bind(revision).fetch_one(conn).await
+) -> Result<playscale_core::processing::BindingEvidence, sqlx::Error> {
+    type Row = (
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+        i64,
+        Option<i64>,
+        Option<i64>,
+        i64,
+    );
+    let rows: Vec<Row> = sqlx::query_as("SELECT v.id,v.timeline_id,b.file_id,b.file_revision,v.origin,f.edition_id,t.edition_id,b.part,b.start_ms,b.end_ms,(SELECT count(*) FROM version_files p WHERE p.version_id=v.id) FROM version_files b JOIN media_versions v ON v.id=b.version_id JOIN timelines t ON t.id=v.timeline_id JOIN media_files f ON f.id=b.file_id WHERE b.file_id=?")
+        .bind(file).fetch_all(conn).await?;
+    Ok(playscale_core::processing::BindingEvidence {
+        timeline: timeline.to_owned(),
+        file: file.to_owned(),
+        revision: revision.to_owned(),
+        candidates: rows
+            .into_iter()
+            .map(
+                |(
+                    version,
+                    timeline,
+                    file,
+                    file_revision,
+                    origin,
+                    file_edition,
+                    timeline_edition,
+                    part,
+                    start_ms,
+                    end_ms,
+                    part_count,
+                )| playscale_core::processing::WholeBinding {
+                    version,
+                    timeline,
+                    file,
+                    file_revision,
+                    origin,
+                    file_edition,
+                    timeline_edition,
+                    part,
+                    start_ms,
+                    end_ms,
+                    part_count,
+                },
+            )
+            .collect(),
+    })
 }
 
 pub(crate) async fn publication_facts(
@@ -295,7 +344,7 @@ pub(crate) async fn publication_facts(
             requester_authorized: principal.is_some(),
             source_enabled: enabled,
             source_in_scope,
-            exact_whole_timeline_binding: binding,
+            binding,
             recipe_unchanged: recipe_digest(
                 &job.recipe,
                 &job.backend,
@@ -361,7 +410,7 @@ pub(crate) async fn output_rendition_status(
             expired,
             phase: serde_json::from_value(json!(phase)).map_err(Problem::internal)?,
             source_current: source_available && current == revision,
-            binding_current: binding,
+            binding,
             output_current: available,
         },
     )))
@@ -602,6 +651,7 @@ async fn prepare(
         &input.source.file_revision,
     )
     .await?
+    .is_current()
     {
         return Err(Problem::new(
             StatusCode::CONFLICT,
@@ -767,7 +817,7 @@ async fn renditions(
                 expired,
                 phase: serde_json::from_value(json!(phase)).map_err(Problem::internal)?,
                 source_current: source_available && current.as_deref() == Some(&revision),
-                binding_current: binding,
+                binding,
                 output_current: available,
             },
         );
@@ -831,5 +881,104 @@ mod recipe_identity_tests {
             recipe_digest("remux_mp4", "software", None, false).unwrap()
         );
         assert!(recipe_digest("video_profile", "software", None, false).is_none());
+    }
+}
+
+#[cfg(test)]
+mod binding_adapter_tests {
+    use super::*;
+    use sqlx::SqlitePool;
+
+    #[tokio::test]
+    async fn gathered_binding_facts_match_the_prior_sql_contract() {
+        let pool = SqlitePool::connect("sqlite::memory:").await.unwrap();
+        for sql in [
+            "CREATE TABLE timelines (id TEXT PRIMARY KEY, edition_id TEXT)",
+            "CREATE TABLE media_versions (id TEXT PRIMARY KEY, timeline_id TEXT, origin TEXT)",
+            "CREATE TABLE media_files (id TEXT PRIMARY KEY, edition_id TEXT)",
+            "CREATE TABLE version_files (version_id TEXT, part INTEGER, file_id TEXT, file_revision TEXT, start_ms INTEGER, end_ms INTEGER)",
+            "INSERT INTO timelines VALUES ('t','e'),('other','e')",
+            "INSERT INTO media_versions VALUES ('v','t','original')",
+            "INSERT INTO media_files VALUES ('f','e'),('second','e')",
+            "INSERT INTO version_files VALUES ('v',1,'f','r',NULL,NULL)",
+        ] {
+            sqlx::query(sql).execute(&pool).await.unwrap();
+        }
+        let mut conn = pool.acquire().await.unwrap();
+        async fn compare(conn: &mut sqlx::SqliteConnection, expected: bool) {
+            let old: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM version_files b JOIN media_versions v ON v.id=b.version_id JOIN timelines t ON t.id=v.timeline_id JOIN media_files f ON f.id=b.file_id WHERE v.timeline_id=? AND b.file_id=? AND b.file_revision=? AND v.origin='original' AND f.edition_id=t.edition_id AND b.start_ms IS NULL AND b.end_ms IS NULL AND (SELECT count(*) FROM version_files p WHERE p.version_id=v.id)=1)")
+                .bind("t").bind("f").bind("r").fetch_one(&mut *conn).await.unwrap();
+            let evidence = exact_binding(conn, "t", "f", "r").await.unwrap();
+            assert_eq!(old, expected);
+            assert_eq!(evidence.is_current(), old);
+            let old_download: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM media_versions v JOIN version_files b ON b.version_id=v.id AND b.part=1 WHERE v.id=? AND v.timeline_id=? AND b.file_id=? AND b.file_revision=? AND b.start_ms IS NULL AND b.end_ms IS NULL AND NOT EXISTS(SELECT 1 FROM version_files o WHERE o.version_id=v.id AND o.part<>1))")
+                .bind("v").bind("t").bind("f").bind("r").fetch_one(&mut *conn).await.unwrap();
+            assert_eq!(evidence.matches_download("v"), old_download);
+        }
+        compare(&mut conn, true).await;
+        for (change, restore) in [
+            (
+                "UPDATE media_versions SET timeline_id='other'",
+                "UPDATE media_versions SET timeline_id='t'",
+            ),
+            (
+                "UPDATE version_files SET file_revision='old'",
+                "UPDATE version_files SET file_revision='r'",
+            ),
+            (
+                "UPDATE media_versions SET origin='generated'",
+                "UPDATE media_versions SET origin='original'",
+            ),
+            (
+                "UPDATE media_files SET edition_id='other' WHERE id='f'",
+                "UPDATE media_files SET edition_id='e' WHERE id='f'",
+            ),
+            (
+                "UPDATE version_files SET start_ms=0",
+                "UPDATE version_files SET start_ms=NULL",
+            ),
+            (
+                "UPDATE version_files SET end_ms=10",
+                "UPDATE version_files SET end_ms=NULL",
+            ),
+            (
+                "INSERT INTO version_files VALUES ('v',2,'second','r',NULL,NULL)",
+                "DELETE FROM version_files WHERE part=2",
+            ),
+        ] {
+            sqlx::query(change).execute(&mut *conn).await.unwrap();
+            compare(&mut conn, false).await;
+            sqlx::query(restore).execute(&mut *conn).await.unwrap();
+            compare(&mut conn, true).await;
+        }
+        sqlx::query("UPDATE version_files SET part=2")
+            .execute(&mut *conn)
+            .await
+            .unwrap();
+        compare(&mut conn, true).await; // Preparation allows one part numbered 2; downloads require part 1.
+        sqlx::query("UPDATE version_files SET part=1")
+            .execute(&mut *conn)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO media_versions VALUES ('v2','t','original')")
+            .execute(&mut *conn)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO version_files VALUES ('v2',1,'f','r',NULL,NULL)")
+            .execute(&mut *conn)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE media_versions SET origin='generated' WHERE id='v'")
+            .execute(&mut *conn)
+            .await
+            .unwrap();
+        compare(&mut conn, true).await;
+        assert!(
+            exact_binding(&mut conn, "t", "missing", "r")
+                .await
+                .unwrap()
+                .candidates
+                .is_empty()
+        );
     }
 }

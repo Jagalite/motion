@@ -208,8 +208,17 @@ pub enum Decision {
     Attempt(Message),
     /// Persist a terminal state and erase the payload.
     Finish(Message),
+    /// The sealed payload cannot be opened; persist this terminal state and
+    /// erase the payload without reserving a new attempt.
+    PayloadUnavailable(Message),
     /// Nothing to do yet.
     Wait,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PayloadAvailability {
+    Available,
+    Unavailable,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -306,6 +315,25 @@ pub fn claim(m: &Message, c: &Current<'_>, token: &str) -> Decision {
         }),
         ..next
     })
+}
+
+/// Include the observed sealed-payload availability in the complete claim
+/// decision. A failed load never creates a durable attempt; recovery facts
+/// from an expired lease still determine whether the outcome is uncertain.
+pub fn claim_with_payload(
+    m: &Message,
+    c: &Current<'_>,
+    token: &str,
+    payload: PayloadAvailability,
+) -> Decision {
+    match claim(m, c, token) {
+        Decision::Attempt(mut next) if payload == PayloadAvailability::Unavailable => {
+            next.attempts = m.attempts;
+            let phase = exhausted(&next);
+            Decision::PayloadUnavailable(finish(&next, phase))
+        }
+        decision => decision,
+    }
 }
 
 /// Recheck immediately before transmitting secret content (the DATA command).
@@ -505,5 +533,57 @@ mod tests {
             observe(&retry, token, Observation::Accepted, &current(1)),
             Err(Error::StaleAttempt)
         );
+    }
+
+    #[test]
+    fn unavailable_payload_preserves_interrupted_delivery_uncertainty() {
+        let original = message();
+        let Decision::PayloadUnavailable(failed) = claim_with_payload(
+            &original,
+            &current(0),
+            "a",
+            PayloadAvailability::Unavailable,
+        ) else {
+            panic!()
+        };
+        assert_eq!(
+            (
+                failed.phase,
+                failed.attempts,
+                failed.ambiguous,
+                failed.lease
+            ),
+            (Phase::Failed, 0, false, None)
+        );
+        let Decision::Attempt(sending) = claim(&original, &current(0), "a") else {
+            panic!()
+        };
+        assert_eq!(
+            claim_with_payload(
+                &sending,
+                &current(10),
+                "b",
+                PayloadAvailability::Unavailable
+            ),
+            Decision::Wait
+        );
+        let Decision::PayloadUnavailable(unknown) = claim_with_payload(
+            &sending,
+            &current(LEASE_SECONDS),
+            "b",
+            PayloadAvailability::Unavailable,
+        ) else {
+            panic!()
+        };
+        assert_eq!(
+            (
+                unknown.phase,
+                unknown.attempts,
+                unknown.ambiguous,
+                unknown.lease
+            ),
+            (Phase::Unknown, 1, true, None)
+        );
+        assert_eq!(unknown.id, sending.id);
     }
 }

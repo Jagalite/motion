@@ -94,89 +94,103 @@ pub(crate) async fn publish(
     .bind(file)
     .fetch_one(&mut *conn)
     .await?;
-    match sidecar {
-        Sidecar::Unusable => Ok(()),
-        Sidecar::Absent => {
-            // Every work this file's sidecar supplied loses that contribution,
-            // each subject to its own manual pin.
-            withdraw(conn, file, None).await
-        }
-        Sidecar::Parsed(parsed) => {
-            let document = serde_json::to_string(&parsed.contribution)?;
-            let external = parsed.external_ids.first().map(|(p, v)| format!("{p}:{v}"));
-            if !crate::matching::provider_identity_allowed(conn, &item, SOURCE, external.as_deref())
-                .await?
-            {
-                return Ok(());
-            }
-            // A file supplies one work: contributions it left on works it no
-            // longer belongs to (after a split) are withdrawn first, so this
-            // work can claim the identity they held.
-            withdraw(conn, file, Some(&item)).await?;
-            let upsert = "INSERT INTO metadata_documents VALUES (?,?,1,?,?,?) ON CONFLICT(item_id,source) DO UPDATE SET revision=metadata_documents.revision+1,external_id=excluded.external_id,document_json=excluded.document_json,updated_at=excluded.updated_at WHERE metadata_documents.document_json IS NOT excluded.document_json OR metadata_documents.external_id IS NOT excluded.external_id";
-            let result = sqlx::query(upsert)
-                .bind(&item)
-                .bind(SOURCE)
-                .bind(&external)
-                .bind(&document)
-                .bind(crate::now())
-                .execute(&mut *conn)
-                .await;
-            match result {
-                // Another work already claims this NFO identity: keep the
-                // values as evidence without the conflicting identity.
-                Err(sqlx::Error::Database(e)) if e.is_unique_violation() => {
-                    sqlx::query(upsert)
-                        .bind(&item)
-                        .bind(SOURCE)
-                        .bind(None::<String>)
-                        .bind(&document)
-                        .bind(crate::now())
-                        .execute(&mut *conn)
-                        .await?;
-                }
-                other => {
-                    other?;
-                }
-            }
-            sqlx::query("INSERT INTO nfo_origins VALUES (?,?) ON CONFLICT(item_id) DO UPDATE SET file_id=excluded.file_id")
-                .bind(&item)
-                .bind(file)
-                .execute(&mut *conn)
-                .await?;
-            crate::metadata::project_title(conn, &item).await?;
-            Ok(())
-        }
+    let observation = match sidecar {
+        Sidecar::Unusable => nfo::SidecarObservation::Unusable,
+        Sidecar::Absent => nfo::SidecarObservation::Absent,
+        Sidecar::Parsed(parsed) => nfo::SidecarObservation::Parsed {
+            document: serde_json::to_string(&parsed.contribution)?,
+            external_id: parsed
+                .external_ids
+                .first()
+                .map(|(provider, value)| format!("{provider}:{value}")),
+        },
+    };
+    let target = if matches!(observation, nfo::SidecarObservation::Parsed { .. }) {
+        Some(work_facts(conn, &item).await?)
+    } else {
+        None
+    };
+    let owners: Vec<String> = if matches!(observation, nfo::SidecarObservation::Unusable) {
+        Vec::new()
+    } else {
+        sqlx::query_scalar("SELECT item_id FROM nfo_origins WHERE file_id=? ORDER BY item_id")
+            .bind(file)
+            .fetch_all(&mut *conn)
+            .await?
+    };
+    let mut owner_facts = Vec::with_capacity(owners.len());
+    for owner in owners {
+        owner_facts.push(work_facts(conn, &owner).await?);
     }
-}
-
-/// Withdraw the `nfo` contribution from every work whose origin is `file`,
-/// except `keep`, unless a manual identification pins that work's identity.
-async fn withdraw(
-    conn: &mut SqliteConnection,
-    file: &str,
-    keep: Option<&str>,
-) -> anyhow::Result<()> {
-    let owners: Vec<String> = sqlx::query_scalar("SELECT item_id FROM nfo_origins WHERE file_id=?")
-        .bind(file)
-        .fetch_all(&mut *conn)
-        .await?;
-    for owner in owners.into_iter().filter(|o| Some(o.as_str()) != keep) {
-        if !crate::matching::provider_identity_allowed(conn, &owner, SOURCE, None).await? {
-            continue;
+    let conflict: Option<String> = match &observation {
+        nfo::SidecarObservation::Parsed {
+            external_id: Some(id),
+            ..
+        } => {
+            sqlx::query_scalar(
+                "SELECT item_id FROM metadata_documents WHERE source='nfo' AND external_id=?",
+            )
+            .bind(id)
+            .fetch_optional(&mut *conn)
+            .await?
         }
-        sqlx::query("DELETE FROM metadata_documents WHERE item_id=? AND source=?")
-            .bind(&owner)
-            .bind(SOURCE)
-            .execute(&mut *conn)
-            .await?;
-        sqlx::query("DELETE FROM nfo_origins WHERE item_id=?")
-            .bind(&owner)
-            .execute(&mut *conn)
-            .await?;
-        crate::metadata::project_title(conn, &owner).await?;
+        _ => None,
+    };
+    for effect in nfo::publication(
+        file,
+        target.as_ref(),
+        &owner_facts,
+        conflict.as_deref(),
+        &observation,
+    )
+    .map_err(|error| anyhow::anyhow!("invalid NFO publication facts: {error:?}"))?
+    {
+        match effect {
+            nfo::PublicationEffect::DeleteContribution { item } => {
+                sqlx::query("DELETE FROM metadata_documents WHERE item_id=? AND source=?")
+                    .bind(item)
+                    .bind(SOURCE)
+                    .execute(&mut *conn)
+                    .await?;
+            }
+            nfo::PublicationEffect::ClearOrigin { item } => {
+                sqlx::query("DELETE FROM nfo_origins WHERE item_id=?")
+                    .bind(item)
+                    .execute(&mut *conn)
+                    .await?;
+            }
+            nfo::PublicationEffect::PutContribution {
+                item,
+                document,
+                external_id,
+                revision,
+            } => {
+                sqlx::query("INSERT INTO metadata_documents VALUES (?,?,?,?,?,?) ON CONFLICT(item_id,source) DO UPDATE SET revision=excluded.revision,external_id=excluded.external_id,document_json=excluded.document_json,updated_at=excluded.updated_at")
+                    .bind(item).bind(SOURCE).bind(revision).bind(external_id).bind(document).bind(crate::now()).execute(&mut *conn).await?;
+            }
+            nfo::PublicationEffect::SetOrigin { item, file } => {
+                sqlx::query("INSERT INTO nfo_origins VALUES (?,?) ON CONFLICT(item_id) DO UPDATE SET file_id=excluded.file_id")
+                    .bind(item).bind(file).execute(&mut *conn).await?;
+            }
+            nfo::PublicationEffect::ProjectTitle { item } => {
+                crate::metadata::project_title(conn, &item).await?
+            }
+        }
     }
     Ok(())
+}
+
+async fn work_facts(conn: &mut SqliteConnection, item: &str) -> anyhow::Result<nfo::WorkFacts> {
+    let (state, external_id, document, revision): (String, Option<String>, Option<String>, Option<i64>) = sqlx::query_as(
+        "SELECT i.match_state,d.external_id,d.document_json,d.revision FROM items i LEFT JOIN metadata_documents d ON d.item_id=i.id AND d.source='nfo' WHERE i.id=?")
+        .bind(item).fetch_one(&mut *conn).await?;
+    Ok(nfo::WorkFacts {
+        item: item.to_owned(),
+        match_state: serde_json::from_value(serde_json::Value::String(state))?,
+        external_id,
+        document,
+        revision,
+    })
 }
 
 /// On-demand metadata refresh for one work without a full scan: re-observe
@@ -189,9 +203,9 @@ pub async fn refresh_item(app: &crate::App, item: &str) -> anyhow::Result<usize>
     let observed = observe_item(app, item).await?;
     let _guard = app.jobs.lock().await;
     let mut tx = crate::db::begin_write(&app.db).await?;
-    let count = publish_refresh_in(&mut tx, item, &observed).await?;
+    let published = publish_refresh_in(&mut tx, item, &observed).await?;
     tx.commit().await?;
-    Ok(count)
+    Ok(published.len())
 }
 
 pub(crate) type RefreshRow = (String, String, String, String, i64, String);
@@ -217,10 +231,16 @@ pub(crate) async fn observe_item(
             .map(|row| {
                 let (_, relative, root, expected, _, _) = &row;
                 let before = identity(root);
-                let sidecar = if before.as_deref() == Some(expected.as_str()) {
+                let sidecar = if playscale_core::metadata::refresh_root_matches(
+                    expected,
+                    before.as_deref(),
+                ) {
                     let sidecar = read(Path::new(root), relative, &mut budget);
                     // A root replaced during the read proves nothing.
-                    if identity(root).as_deref() == Some(expected.as_str()) {
+                    if playscale_core::metadata::refresh_root_matches(
+                        expected,
+                        identity(root).as_deref(),
+                    ) {
                         sidecar
                     } else {
                         Sidecar::Unusable
@@ -240,33 +260,63 @@ pub(crate) async fn publish_refresh_in(
     tx: &mut SqliteConnection,
     item: &str,
     observed: &[(RefreshRow, Sidecar)],
-) -> anyhow::Result<usize> {
-    let mut published = 0;
+) -> anyhow::Result<Vec<String>> {
+    let mut published = Vec::new();
     for ((file, relative, root, identity, binding, revision), sidecar) in observed {
         if matches!(sidecar, Sidecar::Unusable) {
             continue;
         }
         // The observation must still describe this file at this binding.
-        let current: Option<(String, String, String, i64, String, bool)> = sqlx::query_as(
-            "SELECT f.relative_path,l.root,l.root_identity,l.binding_revision,f.revision,f.available FROM media_files f JOIN libraries l ON l.id=f.library_id WHERE l.enabled=1 AND f.id=? AND f.edition_id IN (SELECT id FROM editions WHERE item_id=?)",
+        let current: Option<(String, String, String, String, i64, String, bool, bool)> = sqlx::query_as(
+            "SELECT e.item_id,f.relative_path,l.root,l.root_identity,l.binding_revision,f.revision,l.enabled,f.available FROM media_files f JOIN libraries l ON l.id=f.library_id JOIN editions e ON e.id=f.edition_id WHERE f.id=?",
         )
         .bind(file)
-        .bind(item)
         .fetch_optional(&mut *tx)
         .await?;
-        let unchanged = current.is_some_and(|(p, r, i, b, v, available)| {
-            available
-                && &p == relative
-                && &r == root
-                && &i == identity
-                && b == *binding
-                && &v == revision
-        });
-        if !unchanged {
+        let observed_binding = playscale_core::metadata::RefreshBinding {
+            work: item.to_owned(),
+            file: file.clone(),
+            relative: relative.clone(),
+            root: root.clone(),
+            root_identity: identity.clone(),
+            binding_revision: *binding,
+            file_revision: revision.clone(),
+        };
+        let current = current.map(
+            |(
+                work,
+                relative,
+                root,
+                root_identity,
+                binding_revision,
+                file_revision,
+                enabled,
+                available,
+            )| {
+                playscale_core::metadata::CurrentRefreshBinding {
+                    binding: playscale_core::metadata::RefreshBinding {
+                        work,
+                        file: file.clone(),
+                        relative,
+                        root,
+                        root_identity,
+                        binding_revision,
+                        file_revision,
+                    },
+                    enabled,
+                    available,
+                }
+            },
+        );
+        if !playscale_core::metadata::refresh_observation_current(
+            &observed_binding,
+            current.as_ref(),
+            true,
+        ) {
             continue;
         }
         publish(tx, file, sidecar).await?;
-        published += 1;
+        published.push(file.clone());
     }
     crate::search::refresh(tx, 100).await?;
     Ok(published)

@@ -278,6 +278,7 @@ pub enum State {
 /// What the download pinned when it was authorized.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Pin {
+    pub timeline_id: String,
     pub timeline_revision: u64,
     pub version_id: String,
     pub file_id: String,
@@ -289,8 +290,10 @@ pub struct Pin {
 pub struct Current {
     /// None when the timeline no longer exists.
     pub timeline_revision: Option<u64>,
-    /// The version still binds the pinned file as its only, whole part.
-    pub bound: bool,
+    /// Current candidate version bindings, with exact identities and intervals.
+    pub binding: crate::processing::BindingEvidence,
+    /// Whether a generated rendition, if any, remains publishable.
+    pub rendition_current: bool,
     /// None when the file is unavailable.
     pub file_revision: Option<String>,
     /// The principal may still read the timeline and the file's bytes.
@@ -303,7 +306,11 @@ pub fn state(stored: Stored, pin: &Pin, current: &Current) -> State {
         Stored::Ready
             if current.readable
                 && current.timeline_revision == Some(pin.timeline_revision)
-                && current.bound
+                && current.rendition_current
+                && current.binding.timeline == pin.timeline_id
+                && current.binding.file == pin.file_id
+                && current.binding.revision == pin.file_revision
+                && current.binding.matches_download(&pin.version_id)
                 && current.file_revision.as_deref() == Some(pin.file_revision.as_str()) =>
         {
             State::Ready
@@ -1006,6 +1013,7 @@ mod tests {
     #[test]
     fn expiry_is_derived_from_current_revisions() {
         let pin = Pin {
+            timeline_id: "t".into(),
             timeline_revision: 2,
             version_id: "v".into(),
             file_id: "f".into(),
@@ -1013,7 +1021,25 @@ mod tests {
         };
         let mut current = Current {
             timeline_revision: Some(2),
-            bound: true,
+            binding: crate::processing::BindingEvidence {
+                timeline: "t".into(),
+                file: "f".into(),
+                revision: "r".into(),
+                candidates: vec![crate::processing::WholeBinding {
+                    version: "v".into(),
+                    timeline: "t".into(),
+                    file: "f".into(),
+                    file_revision: "r".into(),
+                    origin: "original".into(),
+                    file_edition: "e".into(),
+                    timeline_edition: "e".into(),
+                    part: 1,
+                    start_ms: None,
+                    end_ms: None,
+                    part_count: 1,
+                }],
+            },
+            rendition_current: true,
             file_revision: Some("r".into()),
             readable: true,
         };

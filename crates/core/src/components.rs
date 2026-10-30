@@ -512,6 +512,53 @@ pub fn sidecar_subtitle(media_stem: &str, file_name: &str) -> Option<SidecarSubt
     Some(out)
 }
 
+/// Ordered persistence effects for sidecar evidence observed for one file.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SidecarEffect {
+    Clear {
+        file: Id,
+    },
+    Upsert {
+        file: Id,
+        name: String,
+        fingerprint: String,
+        subtitle: SidecarSubtitle,
+    },
+}
+
+/// Incomplete directory coverage never withdraws unseen sidecars, but every
+/// recognized observation may still update or add its own evidence. Apply all
+/// effects atomically with the scan publication.
+pub fn sidecar_plan(
+    file: &str,
+    relative: &str,
+    observed: &BTreeMap<String, Vec<(String, String)>>,
+    complete: &BTreeSet<String>,
+) -> Vec<SidecarEffect> {
+    let directory = crate::scan::parent(relative);
+    let stem = std::path::Path::new(relative)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or_default();
+    let mut effects = Vec::new();
+    if complete.contains(directory) {
+        effects.push(SidecarEffect::Clear {
+            file: file.to_owned(),
+        });
+    }
+    for (name, fingerprint) in observed.get(directory).into_iter().flatten() {
+        if let Some(subtitle) = sidecar_subtitle(stem, name) {
+            effects.push(SidecarEffect::Upsert {
+                file: file.to_owned(),
+                name: name.clone(),
+                fingerprint: fingerprint.clone(),
+                subtitle,
+            });
+        }
+    }
+    effects
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -862,5 +909,35 @@ mod tests {
             component_of(&components, Kind::Audio, "v", "p1", "r-p1", 9),
             None
         );
+    }
+}
+
+#[cfg(test)]
+mod sidecar_plan_tests {
+    use super::*;
+    #[test]
+    fn complete_coverage_clears_then_applies_only_recognized_observations() {
+        let observations = BTreeMap::from([(
+            "dir".into(),
+            vec![
+                ("film.en.srt".into(), "fingerprint".into()),
+                ("other.fr.srt".into(), "ignored".into()),
+            ],
+        )]);
+        let complete = BTreeSet::from(["dir".into()]);
+        let planned = sidecar_plan("file", "dir/film.mkv", &observations, &complete);
+        assert_eq!(planned.len(), 2);
+        assert_eq!(
+            planned[0],
+            SidecarEffect::Clear {
+                file: "file".into()
+            }
+        );
+        assert!(
+            matches!(&planned[1], SidecarEffect::Upsert { file, name, fingerprint, subtitle } if file == "file" && name == "film.en.srt" && fingerprint == "fingerprint" && subtitle.language.as_deref() == Some("en"))
+        );
+        let partial = sidecar_plan("file", "dir/film.mkv", &observations, &BTreeSet::new());
+        assert_eq!(partial, planned[1..]);
+        assert!(sidecar_plan("file", "other/film.mkv", &observations, &BTreeSet::new()).is_empty());
     }
 }

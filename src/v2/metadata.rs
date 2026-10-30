@@ -27,6 +27,7 @@ use axum::{
 use playscale_core::{
     access::{self as core, AccessError, CatalogScope, Idempotent, Permission, Revised},
     matching::{Decision, MatchError, Proposal, Status},
+    metadata::ResourceRevision,
     ranges::{RangeDecision, select_range},
 };
 use serde::{Deserialize, Deserializer, Serialize};
@@ -68,6 +69,54 @@ fn tagged<T: Serialize>(status: StatusCode, body: &T, revision: u64) -> Response
     let mut response = (status, Json(body)).into_response();
     response.headers_mut().insert(header::ETAG, etag(revision));
     response
+}
+
+// The metadata namespace deliberately differs from historical sum-based ETags:
+// no pre-migration validator can authorize a mutation of the new resource.
+fn tagged_metadata<T: Serialize>(
+    status: StatusCode,
+    body: &T,
+    revision: &ResourceRevision,
+) -> Response {
+    let mut response = (status, Json(body)).into_response();
+    response.headers_mut().insert(
+        header::ETAG,
+        HeaderValue::from_str(&format!(
+            "\"m2-{}-{}\"",
+            revision.binding, revision.generation
+        ))
+        .expect("validated metadata ETag"),
+    );
+    response
+}
+
+fn metadata_if_match(headers: &HeaderMap) -> Result<ResourceRevision, Problem> {
+    let value = headers.get(header::IF_MATCH).ok_or_else(|| {
+        Problem::new(
+            StatusCode::PRECONDITION_REQUIRED,
+            "precondition_required",
+            "Send If-Match with the ETag from the current resource",
+        )
+    })?;
+    let value = value.to_str().unwrap_or_default().trim();
+    if value == "*" {
+        return Err(Problem::bad(
+            "wildcard_precondition",
+            "Wildcard If-Match is not accepted",
+        ));
+    }
+    let (history, generation) = value
+        .strip_prefix("\"m2-")
+        .and_then(|v| v.strip_suffix('"'))
+        .and_then(|v| v.rsplit_once('-'))
+        .ok_or(AccessError::StaleRevision)?;
+    if history.len() != 64 || !history.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(AccessError::StaleRevision.into());
+    }
+    Ok(ResourceRevision {
+        binding: history.into(),
+        generation: generation.parse().map_err(|_| AccessError::StaleRevision)?,
+    })
 }
 
 fn replayed(stored: Stored) -> Response {
@@ -151,21 +200,26 @@ struct MetadataBody {
 async fn read_metadata(
     conn: &mut sqlx::SqliteConnection,
     item_id: &str,
-) -> Result<(metadata_service::Documents, MetadataBody, u64), Problem> {
+) -> Result<(metadata_service::Documents, MetadataBody, ResourceRevision), Problem> {
     let documents = metadata_service::documents(conn, item_id)
         .await
         .map_err(|e| match e.downcast_ref::<sqlx::Error>() {
             Some(sqlx::Error::RowNotFound) => Problem::not_found(),
             _ => Problem::internal(e),
         })?;
-    let revision = playscale_core::metadata::item_revision(
-        documents.sources.iter().map(|s| s.revision.max(0) as u64),
-    )
-    .ok_or_else(|| Problem::internal("metadata revision overflow"))?;
+    let (stored, server, epoch): (i64, String, String) =
+        sqlx::query_as("SELECT g.generation,s.server_id,s.restore_epoch FROM metadata_resource_generations g CROSS JOIN server_identity s WHERE g.item_id=? AND s.singleton=1")
+            .bind(item_id)
+            .fetch_one(&mut *conn)
+            .await?;
+    let generation = u64::try_from(stored).map_err(Problem::internal)?;
+    let revision =
+        playscale_core::metadata::resource_revision(&server, &epoch, item_id, generation)
+            .ok_or_else(|| Problem::internal("invalid metadata revision"))?;
     let resolved = playscale_core::metadata::resolve(&documents.docs);
     let body = MetadataBody {
         item_id: item_id.into(),
-        revision: revision.to_string(),
+        revision: revision.generation.to_string(),
         values: resolved.values,
         field_sources: resolved.field_sources,
         contributions: documents
@@ -197,7 +251,7 @@ async fn get_metadata(
     }
     let (_, body, revision) = read_metadata(&mut tx, &item_id).await?;
     tx.commit().await?;
-    Ok(tagged(StatusCode::OK, &body, revision))
+    Ok(tagged_metadata(StatusCode::OK, &body, &revision))
 }
 
 #[derive(Deserialize)]
@@ -219,7 +273,7 @@ async fn replace_contribution(
     body: Body<MetadataInput>,
 ) -> Result<Response, Problem> {
     caller.require(Permission::CatalogWrite)?;
-    let expected = if_match(&headers)?;
+    let expected = metadata_if_match(&headers)?;
     let input = body.value;
     if !metadata_service::valid_source(&source) {
         return Err(Problem::invalid(
@@ -269,11 +323,16 @@ async fn replace_contribution(
         ));
     }
     let (documents, current, revision) = read_metadata(&mut tx, &item_id).await?;
+    if !playscale_core::metadata::reviewed_item_revision(&revision, &expected) {
+        return Err(AccessError::StaleRevision.into());
+    }
     let stored = documents.sources.iter().find(|s| s.source == source);
     let changed = documents.docs.get(&source) != Some(&contribution);
-    let (body, revision) = match core::revise(revision, expected, changed)? {
+    let (body, revision) = match core::revise(revision.generation, expected.generation, changed)? {
         Revised::Unchanged => (current, revision),
         Revised::Next(_) => {
+            let planned = playscale_core::metadata::item_revision(revision.generation, true)
+                .ok_or_else(|| Problem::internal("metadata revision overflow"))?;
             metadata_service::replace(
                 &mut tx,
                 &item_id,
@@ -298,11 +357,16 @@ async fn replace_contribution(
                 ContributionError::Storage(e) => Problem::internal(e),
             })?;
             let (_, body, revision) = read_metadata(&mut tx, &item_id).await?;
+            if revision.generation != planned || revision.binding != expected.binding {
+                return Err(Problem::internal(
+                    "metadata generation did not advance as planned",
+                ));
+            }
             (body, revision)
         }
     };
     tx.commit().await?;
-    Ok(tagged(StatusCode::OK, &body, revision))
+    Ok(tagged_metadata(StatusCode::OK, &body, &revision))
 }
 
 // ----------------------------------------------------------------- matches

@@ -137,6 +137,7 @@ impl Row {
     }
     fn pin(&self) -> Pin {
         Pin {
+            timeline_id: self.timeline_id.clone(),
             timeline_revision: self.timeline_revision as u64,
             version_id: self.version_id.clone(),
             file_id: self.file_id.clone(),
@@ -180,18 +181,9 @@ async fn observe(
             .bind(&row.timeline_id)
             .fetch_optional(&mut *conn)
             .await?;
-    let bound: Option<i64> = sqlx::query_scalar(
-        "SELECT 1 FROM media_versions v JOIN version_files b ON b.version_id=v.id AND b.part=1 \
-         WHERE v.id=? AND v.timeline_id=? AND b.file_id=? AND b.file_revision=? \
-         AND b.start_ms IS NULL AND b.end_ms IS NULL \
-         AND NOT EXISTS(SELECT 1 FROM version_files o WHERE o.version_id=v.id AND o.part<>1)",
-    )
-    .bind(&row.version_id)
-    .bind(&row.timeline_id)
-    .bind(&row.file_id)
-    .bind(&row.file_revision)
-    .fetch_optional(&mut *conn)
-    .await?;
+    let binding =
+        super::processing::exact_binding(conn, &row.timeline_id, &row.file_id, &row.file_revision)
+            .await?;
     // A prepared rendition is bound only while it is current for its source
     // (`renditions::available`); an original has no rendition record.
     let rendition: Option<(bool, String, String, String, String)> = sqlx::query_as(
@@ -203,19 +195,17 @@ async fn observe(
     .fetch_optional(&mut *conn)
     .await?;
     let ready = super::processing::output_rendition_status(conn, &row.file_id).await?;
-    let bound = bound.filter(|_| {
-        rendition.as_ref().is_none_or(
-            |(available, revision, registered, source, registered_source)| {
-                playscale_core::renditions::available(
-                    *available,
-                    revision,
-                    registered,
-                    source,
-                    registered_source,
-                ) && ready.is_none_or(|status| status == "ready")
-            },
-        )
-    });
+    let rendition_current = rendition.as_ref().is_none_or(
+        |(available, revision, registered, source, registered_source)| {
+            playscale_core::renditions::available(
+                *available,
+                revision,
+                registered,
+                source,
+                registered_source,
+            ) && ready.is_none_or(|status| status == "ready")
+        },
+    );
     let facts = file_facts(conn, &row.file_id).await?;
     let readable = match readable_timeline(conn, principal, &row.timeline_id).await {
         Ok(_) => access::admit_file_bytes(principal, facts.as_ref()).is_ok(),
@@ -224,7 +214,8 @@ async fn observe(
     };
     Ok(Current {
         timeline_revision: timeline_revision.map(|r| r as u64),
-        bound: bound.is_some(),
+        binding,
+        rendition_current,
         file_revision: facts.map(|f| f.revision),
         readable,
     })

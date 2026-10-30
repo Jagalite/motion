@@ -163,12 +163,7 @@ pub async fn put(
 
 /// Source names are lowercase slugs; `scan` is reserved for the scanned origin.
 pub fn valid_source(source: &str) -> bool {
-    source != "scan"
-        && !source.is_empty()
-        && source.len() <= 64
-        && source
-            .bytes()
-            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+    playscale_core::metadata::valid_source(source)
 }
 
 /// Validate and normalize one source's contribution. Err carries the reason.
@@ -178,46 +173,13 @@ pub fn validate(
     tags: BTreeSet<String>,
     excluded_tags: BTreeSet<String>,
 ) -> Result<Contribution, &'static str> {
-    if values.len() > 100
-        || tags.len() > 100
-        || excluded_tags.len() > 100
-        || (source != "local" && !excluded_tags.is_empty())
-    {
-        return Err("Invalid contribution bounds or local tag exclusions");
-    }
-    for (key, value) in &values {
-        if key.is_empty() || key.len() > 100 || value.is_null() {
-            return Err(
-                "Fields require names and non-null values; omit a field to remove this source's contribution",
-            );
-        }
-        if !playscale_core::metadata::valid_field(key, value) {
-            return Err(
-                "Invalid conventional metadata field: title, description, release_year, release_date or cast",
-            );
-        }
-    }
-    fn normalize(values: BTreeSet<String>) -> Result<BTreeSet<String>, &'static str> {
-        values
-            .into_iter()
-            .map(|tag| {
-                let tag = tag
-                    .split_whitespace()
-                    .collect::<Vec<_>>()
-                    .join(" ")
-                    .to_lowercase();
-                if tag.is_empty() || tag.len() > 100 {
-                    Err("Tags must contain 1–100 bytes")
-                } else {
-                    Ok(tag)
-                }
-            })
-            .collect()
-    }
-    Ok(Contribution {
-        values,
-        tags: normalize(tags)?,
-        excluded_tags: normalize(excluded_tags)?,
+    use playscale_core::metadata::ContributionValidationError as Error;
+    playscale_core::metadata::normalize_source_contribution(source, &Contribution { values, tags, excluded_tags }).map_err(|error| match error {
+        Error::InvalidSource => "Invalid metadata source; scan is reserved",
+        Error::BoundsOrExclusions => "Invalid contribution bounds or local tag exclusions",
+        Error::FieldNameOrNull => "Fields require names and non-null values; omit a field to remove this source's contribution",
+        Error::ConventionalField => "Invalid conventional metadata field: title, description, release_year, release_date or cast",
+        Error::Tag => "Tags must contain 1–100 bytes",
     })
 }
 

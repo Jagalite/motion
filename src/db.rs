@@ -51,7 +51,7 @@ pub struct Track {
     /// (completion item 3) records colour facts beyond the transfer and
     /// attachment MIME types and sizes; streams recorded by an older probe
     /// that later policies need facts from are probed again by the next scan
-    /// (`lacks_probe_facts`).
+    /// (see `playscale_core::scan::probe_decision`).
     #[serde(default, skip_serializing_if = "is_zero")]
     pub probe_version: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -76,7 +76,7 @@ pub struct Track {
 }
 
 /// The scanner's current stream probe version (`Track::probe_version`).
-pub const PROBE_VERSION: u32 = 2;
+pub const PROBE_VERSION: u32 = playscale_core::scan::PROBE_VERSION;
 
 fn is_zero(v: &u32) -> bool {
     *v == 0
@@ -103,13 +103,6 @@ impl Track {
             max_cll_nits: self.max_cll_nits,
             dolby_vision: self.dolby_vision,
         }
-    }
-
-    /// A stream probed before the facts later policies need were recorded:
-    /// an HDR video stream's colour facts, or an attachment's MIME type and
-    /// size (which bound burned-subtitle fonts). The next scan probes it again.
-    pub fn lacks_probe_facts(&self) -> bool {
-        self.probe_version < PROBE_VERSION && matches!(self.kind.as_str(), "video" | "attachment")
     }
 }
 #[derive(Debug, Serialize, ToSchema)]
@@ -435,23 +428,40 @@ async fn add_verified_library_kind(
         "invalid library name"
     );
     let mut tx = begin_write(db).await?;
-    let existing: Option<(String, bool)> =
-        sqlx::query_as("SELECT root_identity,managed FROM libraries WHERE root=?")
+    let existing: Option<(String, String, bool)> =
+        sqlx::query_as("SELECT id,root_identity,managed FROM libraries WHERE root=?")
             .bind(root)
             .fetch_optional(&mut *tx)
             .await?;
-    anyhow::ensure!(
-        existing.as_ref().is_none_or(|(v, _)| v == identity),
-        "library root identity changed"
-    );
-    anyhow::ensure!(
-        existing.as_ref().is_none_or(|(_, kind)| *kind == managed),
-        "library storage ownership changed"
-    );
-    sqlx::query("INSERT INTO libraries (id,name,root,root_identity,managed) VALUES (?,?,?,?,?) ON CONFLICT(root) DO NOTHING")
-        .bind(new_id()).bind(name.trim()).bind(root).bind(identity).bind(managed).execute(&mut *tx).await?;
-    let library: Library = sqlx::query_as("SELECT id,name FROM libraries WHERE root=?")
-        .bind(root)
+    use playscale_core::sources::{self, ExistingRoot, OwnershipRequirement, Registration};
+    let observed = existing
+        .as_ref()
+        .map(|(id, identity, managed)| ExistingRoot {
+            id,
+            identity,
+            managed: *managed,
+        });
+    let id = match sources::registration(identity, OwnershipRequirement::Exact(managed), observed) {
+        Registration::RelocationRequired => anyhow::bail!("library root identity changed"),
+        Registration::OwnershipConflict => anyhow::bail!("library storage ownership changed"),
+        Registration::Reuse { id } => id,
+        Registration::Create => {
+            let id = new_id();
+            sqlx::query(
+                "INSERT INTO libraries (id,name,root,root_identity,managed) VALUES (?,?,?,?,?)",
+            )
+            .bind(&id)
+            .bind(name.trim())
+            .bind(root)
+            .bind(identity)
+            .bind(managed)
+            .execute(&mut *tx)
+            .await?;
+            id
+        }
+    };
+    let library: Library = sqlx::query_as("SELECT id,name FROM libraries WHERE id=?")
+        .bind(id)
         .fetch_one(&mut *tx)
         .await?;
     if !managed {
@@ -581,41 +591,39 @@ pub async fn cancel(app: &App, id: &str) -> anyhow::Result<JobRow> {
 }
 
 pub async fn recover(db: &SqlitePool) -> anyhow::Result<()> {
-    let rows: Vec<JobRow> = sqlx::query_as(
-        "SELECT * FROM jobs WHERE phase IN ('running','cancelling') ORDER BY created_at,id",
-    )
-    .fetch_all(db)
-    .await?;
+    use playscale_core::demands::{self, RecoveryEffect};
+
     let mut tx = begin_write(db).await?;
-    for row in rows {
-        let (mut next, _) = transition(&row.state()?, Input::Recover);
-        if next.phase == Phase::Queued {
-            // A queued follow-up already exists: it absorbs the interrupted
-            // attempt's mode, and the interrupted attempt is cancelled rather
-            // than becoming a second queued attempt for the source.
-            let queued: Option<String> = sqlx::query_scalar(
-                "SELECT id FROM jobs WHERE library_id=? AND phase='queued' AND id<>?",
-            )
-            .bind(&row.library_id)
-            .bind(&row.id)
-            .fetch_optional(&mut *tx)
-            .await?;
-            if let Some(queued) = queued {
-                // Mode and direct-requester ownership both carry over.
-                sqlx::query("UPDATE jobs SET full_scan=max(full_scan,?),direct_request=max(direct_request,(SELECT direct_request FROM jobs WHERE id=?)) WHERE id=?")
-                    .bind(row.full_scan)
-                    .bind(&row.id)
-                    .bind(&queued)
-                    .execute(&mut *tx)
-                    .await?;
-                next = transition(&next, Input::Cancel).0;
+    let sources: Vec<String> = sqlx::query_scalar(
+        "SELECT library_id FROM jobs WHERE phase IN ('running','cancelling') ORDER BY created_at,id",
+    )
+    .fetch_all(&mut *tx)
+    .await?;
+    for source in sources {
+        let attempts = crate::scans::attempts(&mut tx, &source).await?;
+        for effect in demands::recover(&attempts) {
+            match effect {
+                RecoveryEffect::MergeQueued {
+                    job,
+                    verify,
+                    direct,
+                } => {
+                    sqlx::query("UPDATE jobs SET full_scan=?,direct_request=? WHERE id=?")
+                        .bind(verify)
+                        .bind(direct)
+                        .bind(job)
+                        .execute(&mut *tx)
+                        .await?;
+                }
+                RecoveryEffect::ResetInterrupted { job, phase } => {
+                    sqlx::query("UPDATE jobs SET phase=?,started_barrier=NULL WHERE id=?")
+                        .bind(phase_name(phase))
+                        .bind(job)
+                        .execute(&mut *tx)
+                        .await?;
+                }
             }
         }
-        sqlx::query("UPDATE jobs SET phase=?,started_barrier=NULL WHERE id=?")
-            .bind(phase_name(next.phase))
-            .bind(row.id)
-            .execute(&mut *tx)
-            .await?;
     }
     crate::scans::reconcile_all(&mut tx).await?;
     tx.commit().await?;
@@ -825,7 +833,12 @@ fn preview_geometry_uses_display_rotation() {
         };
         assert_eq!(track.display_dimensions(), expected);
         assert!(
-            track.lacks_probe_facts(),
+            playscale_core::scan::probe_decision(
+                "same",
+                "same",
+                [(track.kind.as_str(), track.probe_version)],
+                true
+            ) == playscale_core::scan::ProbeDecision::InspectFully,
             "old video probe must refresh orientation"
         );
     }

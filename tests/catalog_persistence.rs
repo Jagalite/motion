@@ -802,6 +802,62 @@ async fn timeline_repair_retracts_only_untouched_empty_cut_and_retries_atomicall
     assert_eq!(retained, 5.0);
 }
 
+#[tokio::test]
+async fn timeline_repair_preserves_backfill_with_changed_timestamp() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db.sqlite");
+    let old = db::connect_with(&path, &migrator(dir.path(), 9, None).await)
+        .await
+        .unwrap();
+    legacy_fixture(&old).await;
+    sqlx::query("INSERT INTO editions(id,item_id,label) VALUES ('empty-cut','empty','Empty')")
+        .execute(&old)
+        .await
+        .unwrap();
+    sqlx::migrate!("./migrations").run(&old).await.unwrap();
+    let before: (i64, i64, i64) = sqlx::query_as("UPDATE timeline_viewing SET updated_at=updated_at+1 WHERE timeline_id='empty-cut' RETURNING revision,position_ms,updated_at")
+        .fetch_one(&old).await.unwrap();
+    assert_eq!(before.0, 0);
+    old.close().await;
+    let pool = db::connect(&path).await.unwrap();
+    let after: (i64, i64, i64) = sqlx::query_as("SELECT revision,position_ms,updated_at FROM timeline_viewing WHERE timeline_id='empty-cut'")
+        .fetch_one(&pool).await.unwrap();
+    assert_eq!(after, before);
+}
+
+#[tokio::test]
+async fn metadata_generation_migration_preserves_old_documents() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db.sqlite");
+    let old = db::connect_with(&path, &migrator(dir.path(), 65, None).await)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO items(id,title,kind) VALUES ('historical','Original','video')")
+        .execute(&old)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO item_origins VALUES ('historical','Original')")
+        .execute(&old)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO metadata_documents VALUES ('historical','local',7,NULL,'{\"values\":{},\"tags\":[],\"excluded_tags\":[]}',3)").execute(&old).await.unwrap();
+    old.close().await;
+    let db = db::connect(&path).await.unwrap();
+    let row: (i64, i64) = sqlx::query_as("SELECT g.generation,d.revision FROM metadata_resource_generations g JOIN metadata_documents d ON d.item_id=g.item_id WHERE g.item_id='historical'").fetch_one(&db).await.unwrap();
+    assert_eq!(row, (1, 7));
+    sqlx::query("DELETE FROM metadata_documents WHERE item_id='historical'")
+        .execute(&db)
+        .await
+        .unwrap();
+    let next: i64 = sqlx::query_scalar(
+        "SELECT generation FROM metadata_resource_generations WHERE item_id='historical'",
+    )
+    .fetch_one(&db)
+    .await
+    .unwrap();
+    assert_eq!(next, 2);
+}
+
 /// A restore captures each timeline's viewing as restored, under the new
 /// history, in the same transaction that starts it: kept offline progress
 /// is pinned to this baseline (completion 5C).

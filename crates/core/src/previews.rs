@@ -144,6 +144,171 @@ impl PublicationFacts {
     }
 }
 
+/// Identity of the artifact a worker rendered or previously published.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ArtifactIdentity {
+    pub file: String,
+    pub revision: String,
+    pub layout_identity: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PublicationAction {
+    /// An equivalent row already exists; no replacement is necessary.
+    Reuse { artifact: ArtifactIdentity },
+    /// Sync and rename this attempt's staging directory, then persist the row
+    /// in the same reserved publication transaction.
+    Publish {
+        job: String,
+        attempt: u32,
+        artifact: ArtifactIdentity,
+        layout: Layout,
+    },
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PublicationPlan {
+    /// None means an obsolete worker must not update the current row.
+    pub job: Option<crate::jobs::Job>,
+    pub error: Option<String>,
+    pub action: Option<PublicationAction>,
+    pub remove_staging: bool,
+}
+
+/// Decide attempt completion and exact publication identity from observations.
+/// Filesystem sync/rename precede row commit; cleanup happens after commit.
+/// An obsolete worker never rewrites the current job or its error metadata.
+pub fn plan_publication(
+    current: &crate::jobs::Job,
+    attempt: u32,
+    job_id: &str,
+    artifact: &ArtifactIdentity,
+    current_layout_identity: Option<&str>,
+    rendered: Option<(&Layout, &[Sheet], bool)>,
+    requester_authorized: bool,
+    previous: Option<&ArtifactIdentity>,
+    stuck: bool,
+) -> PublicationPlan {
+    if current.attempt != attempt
+        || !matches!(
+            current.phase,
+            crate::jobs::Phase::Running | crate::jobs::Phase::Cancelling
+        )
+    {
+        return PublicationPlan {
+            job: None,
+            error: None,
+            action: None,
+            remove_staging: !stuck,
+        };
+    }
+    let valid = current.executing(attempt)
+        && requester_authorized
+        && current_layout_identity == Some(artifact.layout_identity.as_str())
+        && rendered
+            .is_some_and(|(layout, sheets, unchanged)| unchanged && valid_sheets(layout, sheets));
+    let (job, _) = crate::jobs::transition(
+        current,
+        crate::jobs::Input::Finished {
+            attempt,
+            success: valid,
+        },
+    );
+    let action = if valid {
+        if previous == Some(artifact) {
+            Some(PublicationAction::Reuse {
+                artifact: artifact.clone(),
+            })
+        } else {
+            Some(PublicationAction::Publish {
+                job: job_id.to_owned(),
+                attempt,
+                artifact: artifact.clone(),
+                layout: *rendered.unwrap().0,
+            })
+        }
+    } else {
+        None
+    };
+    let error = (job.phase == crate::jobs::Phase::Failed).then(|| "preview_failed".to_owned());
+    PublicationPlan {
+        job: Some(job),
+        error,
+        action,
+        remove_staging: !stuck,
+    }
+}
+
+/// A published row and the current layout/sheet observations needed to decide
+/// whether it can still be served. The adapter bounds sheet observations to 20.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RetentionObservation {
+    pub artifact: ArtifactIdentity,
+    pub current_layout_identity: Option<String>,
+    pub sheet_count: i64,
+    pub sheets_present: Vec<bool>,
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RetentionAction {
+    Keep,
+    Withdraw { artifact: ArtifactIdentity },
+}
+pub fn retain_publication(observed: &RetentionObservation) -> RetentionAction {
+    let valid = observed.current_layout_identity.as_deref()
+        == Some(observed.artifact.layout_identity.as_str())
+        && (1..=20).contains(&observed.sheet_count)
+        && observed.sheets_present.len() == observed.sheet_count as usize
+        && observed.sheets_present.iter().all(|present| *present);
+    if valid {
+        RetentionAction::Keep
+    } else {
+        RetentionAction::Withdraw {
+            artifact: observed.artifact.clone(),
+        }
+    }
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CleanupAction {
+    Keep,
+    RemoveOrphan { file: String, revision: String },
+    RemoveStaging { job: String, attempt: i64 },
+}
+/// The exact orphan is removable only when no committed row owns it.
+pub fn orphan_cleanup(file: &str, revision: &str, row_present: bool) -> CleanupAction {
+    if row_present {
+        CleanupAction::Keep
+    } else {
+        CleanupAction::RemoveOrphan {
+            file: file.to_owned(),
+            revision: revision.to_owned(),
+        }
+    }
+}
+/// A staging directory remains while its exact attempt is active or a worker
+/// witness is still held. A malformed attempt uses the adapter's -1 sentinel.
+pub fn staging_cleanup(
+    job_id: &str,
+    job: Option<(crate::jobs::Phase, i64)>,
+    directory_attempt: i64,
+    witness_held: bool,
+) -> CleanupAction {
+    if witness_held
+        || job.is_some_and(|(phase, attempt)| {
+            attempt == directory_attempt
+                && matches!(
+                    phase,
+                    crate::jobs::Phase::Running | crate::jobs::Phase::Cancelling
+                )
+        })
+    {
+        CleanupAction::Keep
+    } else {
+        CleanupAction::RemoveStaging {
+            job: job_id.to_owned(),
+            attempt: directory_attempt,
+        }
+    }
+}
+
 /// Where the thumbnail for `position_ms` is: (sheet, column, row), the
 /// thumbnail at or before the position. None beyond the last one.
 pub fn tile_at(layout: &Layout, position_ms: u64) -> Option<(u32, u32, u32)> {
@@ -303,5 +468,158 @@ mod tests {
         assert_eq!(tile_at(&l, 1_000_000), Some((1, 0, 0)));
         assert_eq!(tile_at(&l, 5_399_999), Some((5, 9, 3)));
         assert_eq!(tile_at(&l, 5_400_000), None);
+    }
+}
+
+#[cfg(test)]
+mod publication_plan_tests {
+    use super::*;
+    use crate::jobs::{Job, Phase};
+    #[test]
+    fn publication_fences_identity_and_selects_exact_action() {
+        let layout = layout(10_000, 160, 90).unwrap();
+        let sheets = vec![Sheet {
+            width: layout.tile_width * layout.columns,
+            height: layout.tile_height * layout.rows,
+            bytes: 10,
+        }];
+        let artifact = ArtifactIdentity {
+            file: "f".into(),
+            revision: "r".into(),
+            layout_identity: "l".into(),
+        };
+        let job = Job {
+            phase: Phase::Running,
+            attempt: 2,
+        };
+        let plan = |attempt, identity, previous: Option<&ArtifactIdentity>, stuck| {
+            plan_publication(
+                &job,
+                attempt,
+                "job",
+                &artifact,
+                identity,
+                Some((&layout, &sheets, true)),
+                true,
+                previous,
+                stuck,
+            )
+        };
+        let new = plan(2, Some("l"), None, false);
+        assert_eq!(new.job.as_ref().unwrap().phase, Phase::Completed);
+        assert_eq!(
+            new.action,
+            Some(PublicationAction::Publish {
+                job: "job".into(),
+                attempt: 2,
+                artifact: artifact.clone(),
+                layout
+            })
+        );
+        assert!(new.remove_staging);
+        assert_eq!(
+            plan(2, Some("l"), Some(&artifact), false).action,
+            Some(PublicationAction::Reuse {
+                artifact: artifact.clone()
+            })
+        );
+        assert_eq!(
+            plan(2, Some("other"), None, false).job.unwrap().phase,
+            Phase::Failed
+        );
+        assert!(!plan(2, Some("l"), None, true).remove_staging);
+        assert_eq!(plan(1, Some("l"), None, false).job, None);
+        let cancelling = Job {
+            phase: Phase::Cancelling,
+            attempt: 2,
+        };
+        let cancelled = plan_publication(
+            &cancelling,
+            2,
+            "job",
+            &artifact,
+            Some("l"),
+            Some((&layout, &sheets, true)),
+            true,
+            None,
+            false,
+        );
+        assert_eq!(cancelled.job.unwrap().phase, Phase::Cancelled);
+        assert_eq!(cancelled.action, None);
+    }
+}
+
+#[cfg(test)]
+mod retention_plan_tests {
+    use super::*;
+    use crate::jobs::Phase;
+    #[test]
+    fn withdrawal_and_cleanup_require_current_evidence() {
+        let artifact = ArtifactIdentity {
+            file: "f".into(),
+            revision: "r".into(),
+            layout_identity: "layout".into(),
+        };
+        let mut observed = RetentionObservation {
+            artifact: artifact.clone(),
+            current_layout_identity: Some("layout".into()),
+            sheet_count: 2,
+            sheets_present: vec![true, true],
+        };
+        assert_eq!(retain_publication(&observed), RetentionAction::Keep);
+        observed.sheets_present[1] = false;
+        assert_eq!(
+            retain_publication(&observed),
+            RetentionAction::Withdraw {
+                artifact: artifact.clone()
+            }
+        );
+        observed.sheets_present[1] = true;
+        observed.current_layout_identity = Some("changed".into());
+        assert_eq!(
+            retain_publication(&observed),
+            RetentionAction::Withdraw {
+                artifact: artifact.clone()
+            }
+        );
+        observed.current_layout_identity = None;
+        assert_eq!(
+            retain_publication(&observed),
+            RetentionAction::Withdraw { artifact }
+        );
+        assert_eq!(orphan_cleanup("f", "r", true), CleanupAction::Keep);
+        assert_eq!(
+            orphan_cleanup("f", "r", false),
+            CleanupAction::RemoveOrphan {
+                file: "f".into(),
+                revision: "r".into()
+            }
+        );
+        assert_eq!(
+            staging_cleanup("j", Some((Phase::Running, 2)), 2, false),
+            CleanupAction::Keep
+        );
+        assert_eq!(
+            staging_cleanup("j", Some((Phase::Cancelling, 2)), 2, false),
+            CleanupAction::Keep
+        );
+        assert_eq!(
+            staging_cleanup("j", Some((Phase::Completed, 2)), 2, true),
+            CleanupAction::Keep
+        );
+        assert_eq!(
+            staging_cleanup("j", Some((Phase::Running, 3)), 2, false),
+            CleanupAction::RemoveStaging {
+                job: "j".into(),
+                attempt: 2
+            }
+        );
+        assert_eq!(
+            staging_cleanup("j", None, -1, false),
+            CleanupAction::RemoveStaging {
+                job: "j".into(),
+                attempt: -1
+            }
+        );
     }
 }

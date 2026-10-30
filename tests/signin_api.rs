@@ -2114,3 +2114,48 @@ async fn direct_delivery_signs_tests_confirms_receipt_and_diagnoses_dns() {
         enabled.body["dkim"]["key_id"]
     );
 }
+
+#[tokio::test]
+async fn missing_mail_payload_keeps_recovered_delivery_uncertainty() {
+    let f = Fixture::new().await;
+    f.configure_mail().await;
+    assert_eq!(
+        f.set_registration("open", &["catalog:read"]).await.status,
+        StatusCode::OK
+    );
+    let started = f.register(NEWCOMER, "Payload recovery").await;
+    let owner = started.body["transaction_id"].as_str().unwrap().to_owned();
+    f.drain(0).await;
+    for (phase, payload, expected_phase, expected_ambiguous) in [
+        ("queued", None, "failed", false),
+        (
+            "sending",
+            Some("not-a-valid-sealed-payload"),
+            "unknown",
+            true,
+        ),
+    ] {
+        sqlx::query("UPDATE signin_outbox SET phase=?,payload=?,attempts=1,ambiguous=0,accepted_at=NULL,lease_token=CASE WHEN ?='sending' THEN 'crashed' ELSE NULL END,lease_attempt=CASE WHEN ?='sending' THEN 1 ELSE NULL END,lease_until=CASE WHEN ?='sending' THEN 0 ELSE NULL END,next_attempt=0 WHERE owner_id=?")
+            .bind(phase).bind(payload).bind(phase).bind(phase).bind(phase).bind(&owner).execute(&f.app.db).await.unwrap();
+        assert!(
+            playscale::v2::signin::deliver_mail_once(&f.app)
+                .await
+                .unwrap()
+        );
+        let row: (String, bool, i64, Option<String>, Option<i64>, Option<i64>, Option<String>, Option<String>) = sqlx::query_as("SELECT phase,ambiguous,attempts,lease_token,lease_attempt,lease_until,payload,last_error FROM signin_outbox WHERE owner_id=?")
+            .bind(&owner).fetch_one(&f.app.db).await.unwrap();
+        assert_eq!(
+            row,
+            (
+                expected_phase.into(),
+                expected_ambiguous,
+                1,
+                None,
+                None,
+                None,
+                None,
+                Some("payload unavailable".into())
+            )
+        );
+    }
+}

@@ -265,6 +265,119 @@ pub fn queue_admits(active_jobs: i64) -> bool {
     active_jobs < 100
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RetryRefusal {
+    StaleRevision,
+    NotRetryable,
+    QueueFull,
+}
+
+/// Plan a processing retry from observations held under the writer boundary.
+/// Exact receipt replay and authorization precede this decision. The adapter
+/// must reserve the writer before counting active jobs and retain it through
+/// the phase update and any receipt write.
+pub fn retry(
+    job: &crate::jobs::Job,
+    revisions: Option<(u64, u64)>,
+    active_jobs: i64,
+) -> Result<crate::jobs::Job, RetryRefusal> {
+    if let Some((current, reviewed)) = revisions {
+        crate::jobs::admit_retry(job, current, reviewed).map_err(|reason| match reason {
+            crate::jobs::RetryRefusal::StaleRevision => RetryRefusal::StaleRevision,
+            crate::jobs::RetryRefusal::NotRetryable => RetryRefusal::NotRetryable,
+        })?;
+    } else if !job.retryable() {
+        return Err(RetryRefusal::NotRetryable);
+    }
+    if !queue_admits(active_jobs) {
+        return Err(RetryRefusal::QueueFull);
+    }
+    Ok(crate::jobs::transition(job, crate::jobs::Input::Retry).0)
+}
+
+#[cfg(test)]
+mod retry_tests {
+    use super::*;
+
+    #[test]
+    fn retry_checks_revision_phase_attempt_and_capacity_in_order() {
+        let job = Job {
+            phase: jobs::Phase::Failed,
+            attempt: 2,
+        };
+        assert_eq!(
+            retry(&job, Some((3, 2)), 100),
+            Err(RetryRefusal::StaleRevision)
+        );
+        assert_eq!(retry(&job, Some((3, 3)), 100), Err(RetryRefusal::QueueFull));
+        assert_eq!(
+            retry(&job, None, 99),
+            Ok(Job {
+                phase: jobs::Phase::Queued,
+                attempt: 2
+            })
+        );
+        let exhausted = Job {
+            attempt: u32::MAX,
+            ..job.clone()
+        };
+        assert_eq!(retry(&exhausted, None, 0), Err(RetryRefusal::NotRetryable));
+        let queued = Job {
+            phase: jobs::Phase::Queued,
+            ..job
+        };
+        assert_eq!(retry(&queued, None, 0), Err(RetryRefusal::NotRetryable));
+    }
+}
+
+/// Candidate original-version binding and the authoritative facts needed to
+/// decide whether it is the requested whole-file timeline binding.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct WholeBinding {
+    pub version: String,
+    pub timeline: String,
+    pub file: String,
+    pub file_revision: String,
+    pub origin: String,
+    pub file_edition: String,
+    pub timeline_edition: String,
+    pub part: i64,
+    pub start_ms: Option<i64>,
+    pub end_ms: Option<i64>,
+    pub part_count: i64,
+}
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct BindingEvidence {
+    pub timeline: String,
+    pub file: String,
+    pub revision: String,
+    pub candidates: Vec<WholeBinding>,
+}
+impl BindingEvidence {
+    fn whole(b: &WholeBinding) -> bool {
+        b.start_ms.is_none() && b.end_ms.is_none() && b.part_count == 1
+    }
+    fn same_file(&self, b: &WholeBinding) -> bool {
+        b.timeline == self.timeline && b.file == self.file && b.file_revision == self.revision
+    }
+    /// Preparation accepts any whole original version owned by the timeline's edition.
+    pub fn is_current(&self) -> bool {
+        self.candidates.iter().any(|b| {
+            self.same_file(b)
+                && Self::whole(b)
+                && b.origin == "original"
+                && b.file_edition == b.timeline_edition
+        })
+    }
+    /// Downloads pin a particular version and its first (only) part; generated
+    /// versions are permitted and their rendition is checked separately.
+    pub fn matches_download(&self, version: &str) -> bool {
+        self.candidates
+            .iter()
+            .any(|b| self.same_file(b) && Self::whole(b) && b.version == version && b.part == 1)
+    }
+}
+
 /// Current observations for a preparation's publication. Adapters must observe
 /// these in the same write transaction that acknowledges publication.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -272,7 +385,7 @@ pub struct PreparationFacts {
     pub requester_authorized: bool,
     pub source_enabled: bool,
     pub source_in_scope: bool,
-    pub exact_whole_timeline_binding: bool,
+    pub binding: BindingEvidence,
     pub recipe_unchanged: bool,
 }
 impl PreparationFacts {
@@ -283,7 +396,7 @@ impl PreparationFacts {
         if !self.source_enabled || !self.source_in_scope {
             return Err("preparation_source_unavailable");
         }
-        if !self.exact_whole_timeline_binding {
+        if !self.binding.is_current() {
             return Err("preparation_timeline_changed");
         }
         if !self.recipe_unchanged {
@@ -297,7 +410,7 @@ pub struct RenditionFacts {
     pub expired: bool,
     pub phase: jobs::Phase,
     pub source_current: bool,
-    pub binding_current: bool,
+    pub binding: BindingEvidence,
     pub output_current: bool,
 }
 pub fn rendition_status(facts: &RenditionFacts) -> &'static str {
@@ -305,7 +418,7 @@ pub fn rendition_status(facts: &RenditionFacts) -> &'static str {
         "expired"
     } else if matches!(facts.phase, jobs::Phase::Failed | jobs::Phase::Cancelled) {
         "failed"
-    } else if !facts.source_current || !facts.binding_current {
+    } else if !facts.source_current || !facts.binding.is_current() {
         "stale"
     } else if facts.phase == jobs::Phase::Completed {
         if facts.output_current {
@@ -333,6 +446,53 @@ pub fn finish_preparation(
 #[cfg(test)]
 mod preparation_tests {
     use super::*;
+    fn test_binding(valid: bool) -> BindingEvidence {
+        BindingEvidence {
+            timeline: "t".into(),
+            file: "f".into(),
+            revision: "r".into(),
+            candidates: if valid {
+                vec![WholeBinding {
+                    version: "v".into(),
+                    timeline: "t".into(),
+                    file: "f".into(),
+                    file_revision: "r".into(),
+                    origin: "original".into(),
+                    file_edition: "e".into(),
+                    timeline_edition: "e".into(),
+                    part: 1,
+                    start_ms: None,
+                    end_ms: None,
+                    part_count: 1,
+                }]
+            } else {
+                vec![]
+            },
+        }
+    }
+    #[test]
+    fn exact_binding_checks_all_identity_and_whole_file_facts() {
+        let valid = test_binding(true);
+        assert!(valid.is_current());
+        for variant in 0..8 {
+            let mut evidence = valid.clone();
+            let candidate = &mut evidence.candidates[0];
+            match variant {
+                0 => candidate.timeline = "other".into(),
+                1 => candidate.file = "other".into(),
+                2 => candidate.file_revision = "stale".into(),
+                3 => candidate.origin = "generated".into(),
+                4 => candidate.file_edition = "other".into(),
+                5 => candidate.start_ms = Some(0),
+                6 => candidate.end_ms = Some(10),
+                _ => candidate.part_count = 2,
+            }
+            assert!(!evidence.is_current(), "variant {variant}");
+            evidence.candidates.push(valid.candidates[0].clone());
+            assert!(evidence.is_current(), "a later valid candidate must count");
+        }
+    }
+
     #[test]
     fn a_kept_subtitle_is_explicit_and_required() {
         assert_eq!(kept_subtitle("off", false), Ok(()));
@@ -420,7 +580,7 @@ mod preparation_tests {
                 requester_authorized: mask & 1 != 0,
                 source_enabled: mask & 2 != 0,
                 source_in_scope: mask & 4 != 0,
-                exact_whole_timeline_binding: mask & 8 != 0,
+                binding: test_binding(mask & 8 != 0),
                 recipe_unchanged: mask & 16 != 0,
             };
             for phase in [
@@ -467,7 +627,7 @@ mod preparation_tests {
                     expired: false,
                     phase: jobs::Phase::Completed,
                     source_current: bits & 1 != 0,
-                    binding_current: bits & 2 != 0,
+                    binding: test_binding(bits & 2 != 0),
                     output_current: bits & 4 != 0
                 }),
                 if bits == 7 { "ready" } else { "stale" }
