@@ -5614,3 +5614,49 @@ async fn household_viewers_cannot_perform_first_run_owner_setup() {
     let me = f.call("GET", "/api/v2/me", None, &[]).await;
     assert_eq!(me.body["id"], "household");
 }
+
+#[tokio::test]
+async fn failed_bootstrap_persistence_burns_proof_without_partial_identity() {
+    let f = Fixture::new(AccessMode::Restricted).await;
+    let secret = "desktop-bootstrap-rollback-0123456789abcdef0123456789";
+    f.app.access.set_bootstrap(secret).unwrap();
+    sqlx::query("CREATE TRIGGER reject_desktop_insert BEFORE INSERT ON devices WHEN NEW.id='desktop-local' BEGIN SELECT RAISE(ABORT,'injected persistence failure'); END").execute(&f.app.db).await.unwrap();
+    let first = f
+        .call(
+            "POST",
+            "/api/v2/auth/session",
+            Some(json!({"kind":"credential","credential":secret})),
+            &[("origin", ORIGIN)],
+        )
+        .await;
+    assert!(!first.status.is_success());
+    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM devices WHERE id='desktop-local'")
+        .fetch_one(&f.app.db)
+        .await
+        .unwrap();
+    assert_eq!(count, 0);
+    sqlx::query("DROP TRIGGER reject_desktop_insert")
+        .execute(&f.app.db)
+        .await
+        .unwrap();
+    let retry = f
+        .call(
+            "POST",
+            "/api/v2/auth/session",
+            Some(json!({"kind":"credential","credential":secret})),
+            &[("origin", ORIGIN)],
+        )
+        .await;
+    assert_eq!(retry.status, StatusCode::UNAUTHORIZED);
+    // A fresh explicit startup issuance restores the ability to bootstrap.
+    f.app.access.set_bootstrap(secret).unwrap();
+    let fresh = f
+        .call(
+            "POST",
+            "/api/v2/auth/session",
+            Some(json!({"kind":"credential","credential":secret})),
+            &[("origin", ORIGIN)],
+        )
+        .await;
+    assert_eq!(fresh.status, StatusCode::OK, "{}", fresh.body);
+}

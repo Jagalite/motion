@@ -1,0 +1,16 @@
+[
+  {"unknown": false, "status": 401, "code": "", "outcome": "settled"},
+  {"unknown": false, "status": 403, "code": "", "outcome": "settled"},
+  {"unknown": false, "status": 404, "code": "", "outcome": "settled"},
+  {"unknown": false, "status": 412, "code": "revision_conflict", "outcome": "settled"},
+  {"unknown": false, "status": 503, "code": "", "outcome": "unknown"},
+  {"unknown": true, "status": 401, "code": "", "outcome": "unknown"},
+  {"unknown": true, "status": 403, "code": "", "outcome": "unknown"},
+  {"unknown": true, "status": 404, "code": "", "outcome": "unknown"},
+  {"unknown": true, "status": 409, "code": "idempotency_key_reused", "outcome": "unknown"},
+  {"unknown": true, "status": 409, "code": "idempotent_replay_unavailable", "outcome": "unknown"},
+  {"unknown": true, "status": 409, "code": "revision_conflict", "outcome": "settled"},
+  {"unknown": true, "status": 412, "code": "revision_conflict", "outcome": "settled"},
+  {"unknown": true, "status": 429, "code": "", "outcome": "unknown"},
+  {"unknown": true, "status": 503, "code": "", "outcome": "unknown"}
+]

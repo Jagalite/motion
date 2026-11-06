@@ -3,6 +3,8 @@
 //! Execution reports (ready, segment, completion, failure, stop) are observations
 //! that are ignored unless they belong to a generation that may still produce
 //! output. Client commands name the generation they expect to replace.
+pub mod publication;
+
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -528,9 +530,13 @@ pub enum Input {
     },
     /// Stage one pending generation. `replan` replaces the pin; a seek keeps it.
     Change {
+        /// Generation whose selection was read before asynchronous partial replanning.
+        /// None is a seek/full replacement that does not merge prior selection.
+        #[serde(default)]
+        expected_selection: Option<u64>,
         expected_generation: u64,
         position_ms: u64,
-        replan: Option<(String, Pin)>,
+        replan: Option<(String, Box<Pin>)>,
         /// Resource admission allows the current and new workers to coexist.
         overlap: bool,
         now_ms: u64,
@@ -1037,6 +1043,7 @@ pub fn transition(before: &Delivery, input: &Input) -> Result<(Delivery, Vec<Eff
             d.finish_closing();
         }
         Input::Change {
+            expected_selection,
             expected_generation,
             position_ms,
             replan,
@@ -1049,13 +1056,16 @@ pub fn transition(before: &Delivery, input: &Input) -> Result<(Delivery, Vec<Eff
             if d.active != Some(*expected_generation) {
                 return Err(Error::GenerationConflict);
             }
+            if expected_selection.is_some_and(|basis| d.pending.or(d.active) != Some(basis)) {
+                return Err(Error::GenerationConflict);
+            }
             // The latest selection: the pending candidate if any, else the active one.
             let current = d.pending.or(d.active).and_then(|n| d.generations.get(&n));
             let pin = match replan {
                 Some((timeline, _)) if *timeline != d.timeline => {
                     return Err(Error::TimelineChanged);
                 }
-                Some((_, pin)) => pin.clone(),
+                Some((_, pin)) => (**pin).clone(),
                 None => current.ok_or(Error::GenerationConflict)?.pin.clone(),
             };
             if !valid_position(d.duration_ms, *position_ms) {
@@ -1286,6 +1296,52 @@ pub fn media_playlist(
     out
 }
 
+/// Backend selection is a policy over observed platform, not a probe.
+pub fn backend_supported(operation: Operation, hardware: bool, macos: bool) -> bool {
+    !hardware || operation == Operation::VideoTranscode && macos
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BurnSelection {
+    Bitmap,
+    Text { attachments: u32 },
+}
+pub fn burn_selection_supported(
+    operation: Operation,
+    selection: BurnSelection,
+    codec: &str,
+    libass: bool,
+    attachment_count: u32,
+) -> bool {
+    operation == Operation::VideoTranscode
+        && match selection {
+            BurnSelection::Bitmap => burnable_subtitle(codec),
+            BurnSelection::Text { attachments } => {
+                libass
+                    && (sidecar_subtitle(codec) || styled_subtitle(codec))
+                    && attachments == attachment_count
+            }
+        }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SidecarAdmission {
+    InvalidIdentity,
+    Changed,
+    Unsupported,
+    Admitted,
+}
+pub fn admit_sidecar(name: &str, fingerprint: &str, format: Option<&str>) -> SidecarAdmission {
+    if name.contains('/') || fingerprint.contains('/') {
+        SidecarAdmission::InvalidIdentity
+    } else {
+        match format {
+            None => SidecarAdmission::Changed,
+            Some("srt" | "vtt") => SidecarAdmission::Admitted,
+            Some(_) => SidecarAdmission::Unsupported,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1396,6 +1452,7 @@ mod tests {
     }
     fn change(expected: u64, position: u64, overlap: bool, now: u64) -> Input {
         Input::Change {
+            expected_selection: None,
             expected_generation: expected,
             position_ms: position,
             replan: None,
@@ -1468,9 +1525,10 @@ mod tests {
         let (mut d, _) = Delivery::admit("t".into(), pin(&["a1"]), 0, None, 0).unwrap();
         step(&mut d, ready(1, 0)).unwrap();
         let replan = |timeline: &str, tracks| Input::Change {
+            expected_selection: None,
             expected_generation: 1,
             position_ms: 0,
-            replan: Some((timeline.into(), pin(tracks))),
+            replan: Some((timeline.into(), Box::new(pin(tracks)))),
             overlap: true,
             now_ms: 1,
         };
@@ -1574,9 +1632,10 @@ mod tests {
         let effects = step(
             &mut d,
             Input::Change {
+                expected_selection: None,
                 expected_generation: 1,
                 position_ms: 5_000,
-                replan: Some(("t".into(), pin(&["a1"]))),
+                replan: Some(("t".into(), Box::new(pin(&["a1"])))),
                 overlap: false,
                 now_ms: 1,
             },

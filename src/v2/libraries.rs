@@ -511,7 +511,8 @@ pub async fn preview_relocation(
     access::revise(plan.expected_revision, expected, true)?;
     let token = crate::new_id();
     let expires = crate::now() + 300;
-    sqlx::query("INSERT INTO catalog_receipts(id,kind,created_at,document_json) VALUES (?,'source:relocation_plan',?,?)").bind(&token).bind(crate::now()).bind(serde_json::json!({"principal":principal.id,"expires":expires,"plan":plan}).to_string()).execute(&mut *tx).await?;
+    let history = super::catalog::review_history(&mut tx).await?;
+    sqlx::query("INSERT INTO catalog_receipts(id,kind,created_at,document_json) VALUES (?,'source:relocation_plan',?,?)").bind(&token).bind(crate::now()).bind(serde_json::json!({"principal":principal.id,"history":history,"expires":expires,"plan":plan}).to_string()).execute(&mut *tx).await?;
     let value = serde_json::json!({"plan_token":token,"expires_at":super::timestamp(expires),"affected_ids":[id],"warnings":[]});
     record
         .save(&mut tx, &body.digest, StatusCode::OK, Some(&value), None)
@@ -519,6 +520,18 @@ pub async fn preview_relocation(
     tx.commit().await?;
     Ok(Json(value).into_response())
 }
+fn relocation_envelope_problem(error: playscale_core::sources::RelocationEnvelopeError) -> Problem {
+    match error {
+        playscale_core::sources::RelocationEnvelopeError::ForeignSource => {
+            access::AccessError::StaleRevision.into()
+        }
+        _ => Problem::invalid(
+            "invalid_plan",
+            "Relocation plan expired or belongs to another principal",
+        ),
+    }
+}
+
 pub async fn commit_relocation(
     State(app): State<App>,
     caller: Caller,
@@ -559,21 +572,24 @@ pub async fn commit_relocation(
         &document.ok_or_else(|| Problem::invalid("invalid_plan", "Unknown relocation plan"))?,
     )
     .map_err(Problem::internal)?;
-    if document["principal"] != principal.id
-        || document["expires"]
-            .as_i64()
-            .is_none_or(|e| e <= crate::now())
-    {
-        return Err(Problem::invalid(
-            "invalid_plan",
-            "Relocation plan expired or belongs to another principal",
-        ));
-    }
     let plan: playscale_core::sources::RelocationPlan =
         serde_json::from_value(document["plan"].clone()).map_err(Problem::internal)?;
-    if plan.source != id {
-        return Err(access::AccessError::StaleRevision.into());
-    }
+    let plan_actor = document["principal"].as_str().unwrap_or_default();
+    let plan_expires = document["expires"].as_i64().unwrap_or(i64::MIN);
+    let history = super::catalog::review_history(&mut tx).await?;
+    playscale_core::sources::relocation_envelope(
+        playscale_core::catalog::ReviewedAuthority {
+            principal: plan_actor,
+            history: document["history"].as_str().unwrap_or_default(),
+            expires: plan_expires,
+        },
+        &plan.source,
+        &principal.id,
+        &id,
+        &history,
+        crate::now(),
+    )
+    .map_err(relocation_envelope_problem)?;
     tx.rollback().await?;
     let facts = service::observe_relocation(&app, &plan)
         .await
@@ -598,12 +614,20 @@ pub async fn commit_relocation(
         let s = stored.unwrap();
         return Ok(tagged(s.status, s.body.unwrap()));
     }
-    if document["expires"]
-        .as_i64()
-        .is_none_or(|e| e <= crate::now())
-    {
-        return Err(Problem::invalid("invalid_plan", "Relocation plan expired"));
-    }
+    let history = super::catalog::review_history(&mut tx).await?;
+    playscale_core::sources::relocation_envelope(
+        playscale_core::catalog::ReviewedAuthority {
+            principal: plan_actor,
+            history: document["history"].as_str().unwrap_or_default(),
+            expires: plan_expires,
+        },
+        &plan.source,
+        &principal.id,
+        &id,
+        &history,
+        crate::now(),
+    )
+    .map_err(relocation_envelope_problem)?;
     let value = wire(
         service::commit_relocation_in(&mut tx, &plan, facts)
             .await

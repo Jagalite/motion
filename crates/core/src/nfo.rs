@@ -516,7 +516,7 @@ mod publication_tests {
             publication(
                 "file",
                 None,
-                &[old.clone()],
+                std::slice::from_ref(&old),
                 Some("old"),
                 &SidecarObservation::Unusable
             )
@@ -524,7 +524,13 @@ mod publication_tests {
             .is_empty()
         );
         assert_eq!(
-            publication("file", Some(&target), &[old.clone()], Some("old"), &parsed),
+            publication(
+                "file",
+                Some(&target),
+                std::slice::from_ref(&old),
+                Some("old"),
+                &parsed
+            ),
             Ok(vec![
                 DeleteContribution { item: "old".into() },
                 ClearOrigin { item: "old".into() },
@@ -547,7 +553,7 @@ mod publication_tests {
             publication(
                 "file",
                 Some(&target),
-                &[pinned.clone()],
+                std::slice::from_ref(&pinned),
                 Some("old"),
                 &parsed
             ),

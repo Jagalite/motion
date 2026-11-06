@@ -16,7 +16,7 @@ pub fn default_recipe() -> String {
     "h264720p".into()
 }
 pub fn valid_recipe(value: &str) -> bool {
-    matches!(value, "remux_mp4" | "audio_aac" | "h264720p")
+    playscale_core::playback_session::valid_recipe(value)
 }
 #[derive(Clone, Debug, Deserialize, Serialize, ToSchema, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -179,27 +179,17 @@ pub async fn plan(
     let mut selections = Vec::new();
     let mut candidates = Vec::new();
     for original in choices.originals {
-        let profile_source = request.video_profile.is_none()
-            || original
-                .tracks
-                .iter()
-                .find(|t| t.kind == "video")
-                .is_some_and(|t| {
-                    t.width.is_some()
-                        && t.height.is_some()
-                        && !matches!(
-                            t.color_transfer.as_deref(),
-                            Some("smpte2084" | "arib-std-b67")
-                        )
-                });
-        let processable = profile_source
-            && request
-                .video_profile
-                .as_ref()
-                .is_none_or(|p| p.admits_duration(original.duration_seconds.unwrap_or(0.0)))
-            && original
-                .duration_seconds
-                .is_some_and(|v| v.is_finite() && v > 0.0);
+        let profile = request.video_profile.as_ref().map(|p| p.facts());
+        let video = original
+            .tracks
+            .iter()
+            .find(|t| t.kind == "video")
+            .map(|t| (t.width, t.height, t.color_transfer.as_deref()));
+        let processable = playscale_core::playback::legacy_processable(
+            original.duration_seconds,
+            profile.as_ref(),
+            video,
+        );
         selections.push(Selection {
             source_file_id: original.file_id.clone(),
             source_revision: original.revision.clone(),
@@ -232,12 +222,62 @@ pub async fn plan(
                 .await?;
         // Registration provenance is informational. Only completed local jobs establish
         // that a rendition satisfies one of our fixed recipe contracts.
-        let actual_recipe: Option<String> = sqlx::query_scalar(
-            "SELECT p.recipe FROM processing_jobs p JOIN renditions published ON published.source='playscale' AND published.external_id=p.id AND published.file_id=p.output_file_id AND published.source_file_id=p.source_file_id AND published.source_revision=p.source_revision WHERE p.output_file_id=? AND p.source_file_id=? AND p.source_revision=? AND published.file_revision=? AND p.phase='completed' AND p.expired=0 ORDER BY p.id LIMIT 1")
-            .bind(&rendition.file_id).bind(&rendition.source_file_id).bind(&rendition.source_revision).bind(&rendition.file_revision)
-            .fetch_optional(&app.db).await?;
-        let actual_profile: Option<sqlx::types::Json<crate::encoding::VideoProfile>> = sqlx::query_scalar("SELECT video_profile FROM processing_jobs WHERE output_file_id=? AND phase='completed' AND expired=0 ORDER BY id LIMIT 1")
-            .bind(&rendition.file_id).fetch_optional(&app.db).await?.flatten();
+        type ProvenanceRow = (
+            String,
+            String,
+            String,
+            String,
+            String,
+            String,
+            String,
+            String,
+            String,
+            String,
+            String,
+            bool,
+            Option<sqlx::types::Json<crate::encoding::VideoProfile>>,
+        );
+        let provenance:Vec<ProvenanceRow>=sqlx::query_as("SELECT r.source,r.external_id,r.file_id,r.file_revision,r.source_file_id,r.source_revision,p.id,p.source_file_id,p.source_revision,p.recipe,p.phase,p.expired,p.video_profile FROM renditions r JOIN processing_jobs p ON p.output_file_id=r.file_id WHERE r.file_id=? ORDER BY p.id")
+            .bind(&rendition.file_id).fetch_all(&app.db).await?;
+        let actual = provenance.iter().find(|r| {
+            playscale_core::playback::local_output_contract(
+                &playscale_core::playback::LegacyProvenance {
+                    registration_source: &r.0,
+                    external_id: &r.1,
+                    file: &r.2,
+                    file_revision: &r.3,
+                    source_file: &r.4,
+                    source_revision: &r.5,
+                    job_id: &r.6,
+                    job_source_file: &r.7,
+                    job_source_revision: &r.8,
+                    phase: &r.10,
+                    expired: r.11,
+                },
+                &rendition.file_id,
+                &rendition.file_revision,
+                &rendition.source_file_id,
+                &rendition.source_revision,
+            )
+        });
+        let actual_recipe = actual.map(|r| r.9.as_str());
+        let actual_profile = actual
+            .and_then(|r| r.12.as_ref())
+            .map(|p| serde_json::to_value(&p.0))
+            .transpose()
+            .map_err(ApiError::internal)?;
+        let wanted_profile = request
+            .video_profile
+            .as_ref()
+            .map(serde_json::to_value)
+            .transpose()
+            .map_err(ApiError::internal)?;
+        let matches_recipe = playscale_core::playback::legacy_recipe_matches(
+            actual_recipe,
+            actual_profile.as_ref(),
+            recipe,
+            wanted_profile.as_ref(),
+        );
         selections.push(Selection {
             source_file_id: rendition.source_file_id,
             source_revision: rendition.source_revision,
@@ -246,7 +286,7 @@ pub async fn plan(
             media_url: rendition.media_url,
             label: rendition.label,
             delivery: "existing_rendition".into(),
-            operation: operation(actual_recipe.as_deref().unwrap_or("")).into(),
+            operation: operation(actual_recipe.unwrap_or("")).into(),
             client_support: "unknown".into(),
         });
         candidates.push((
@@ -254,8 +294,7 @@ pub async fn plan(
                 original: false,
                 available: rendition.available,
                 support: Support::Unknown,
-                matches_recipe: actual_recipe.as_deref() == Some(recipe)
-                    && actual_profile.as_deref() == request.video_profile.as_ref(),
+                matches_recipe,
                 within_budget: true,
                 can_process: false,
             },
@@ -285,12 +324,8 @@ pub async fn plan(
             candidate.support = Support::Unsupported;
         }
         if let Some(limit) = request.max_average_bitrate {
-            candidate.within_budget = duration.is_some_and(|seconds| {
-                seconds.is_finite()
-                    && seconds > 0.0
-                    && *bytes >= 0
-                    && (*bytes as f64 * 8.0 / seconds) <= limit as f64
-            });
+            candidate.within_budget =
+                playscale_core::playback::within_average_budget(*bytes, *duration, limit);
         }
     }
     let selected = request

@@ -27,7 +27,7 @@ use playscale_core::{
     identity::{IdentityError, MergePlan, MergeRequest, SplitMove, SplitPlan, SplitRequest},
 };
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -436,17 +436,26 @@ pub(crate) async fn authorize_merge_scope(
     sources: &[String],
     target: &str,
 ) -> Result<(), Problem> {
-    let mut affected: BTreeSet<String> = sources.iter().cloned().collect();
-    affected.insert(target.to_owned());
-    for source in sources.iter().filter(|source| source.as_str() != target) {
-        let owners: Vec<String> = sqlx::query_scalar(
-            "SELECT source_item_id FROM item_relationships WHERE source_item_id=? OR target_item_id=? UNION SELECT target_item_id FROM item_relationships WHERE source_item_id=? OR target_item_id=? UNION SELECT owner.item_id FROM timelines t JOIN editions moved ON moved.id=t.edition_id JOIN order_groups g ON g.id=t.order_group_id JOIN editions owner ON owner.id=g.edition_id WHERE moved.item_id=?",
-        )
-        .bind(source).bind(source).bind(source).bind(source).bind(source)
+    let edges: Vec<(String, String, String, String)> =
+        sqlx::query_as("SELECT id,source_item_id,target_item_id,kind FROM item_relationships")
+            .fetch_all(&mut *conn)
+            .await?;
+    let edges = edges
+        .into_iter()
+        .map(|(id, source, target, kind)| {
+            Ok(playscale_core::identity::Edge {
+                id,
+                source,
+                target,
+                kind: serde_json::from_value(json!(kind)).map_err(Problem::internal)?,
+            })
+        })
+        .collect::<Result<Vec<_>, Problem>>()?;
+    let order_owners: Vec<(String, String)> = sqlx::query_as("SELECT moved.item_id,owner.item_id FROM timelines t JOIN editions moved ON moved.id=t.edition_id JOIN order_groups g ON g.id=t.order_group_id JOIN editions owner ON owner.id=g.edition_id")
         .fetch_all(&mut *conn).await?;
-        affected.extend(owners);
-    }
-    for item in affected {
+    let footprint =
+        playscale_core::identity::merge_footprint(sources, target, &edges, &order_owners);
+    for item in footprint.owners {
         curatable_item(conn, scope, &item, false).await?;
     }
     Ok(())
@@ -478,12 +487,7 @@ pub struct CatalogItemBody {
 /// Availability of the files the principal may read: no files is unknown.
 fn availability(files: &[&(String, bool)]) -> &'static str {
     let available = files.iter().filter(|(_, a)| *a).count();
-    match (files.len(), available) {
-        (0, _) => "unknown",
-        (n, a) if a == n => "available",
-        (_, 0) => "unavailable",
-        _ => "degraded",
-    }
+    playscale_core::catalog::file_availability(files.len(), available)
 }
 
 pub(crate) async fn item_body(
@@ -519,10 +523,7 @@ pub(crate) async fn item_body(
             .bind(&row.id).bind(all).bind(all).bind(ids)
             .fetch_all(&mut *conn)
             .await?;
-    let default_timeline_id = match editions.as_slice() {
-        [only] => Some(only.clone()),
-        _ => None,
-    };
+    let default_timeline_id = playscale_core::catalog::default_timeline(&editions);
     let mut parent_ids = Vec::new();
     if let Some(parent) = &row.parent_id {
         let parent_libraries = libraries(&files_of(conn, parent).await?);
@@ -943,11 +944,14 @@ pub async fn replace_item(
     let row = curatable_item(&mut tx, &scope, &id, true).await?;
     let current: BTreeSet<String> = libraries(&files_of(&mut tx, &row.id).await?);
     let requested: BTreeSet<String> = input.library_ids.into_iter().collect();
-    if requested != current {
-        return Err(derived_membership());
-    }
-    if family.is_some_and(|f| f != row.kind) {
-        return Err(unsupported_kind());
+    match playscale_core::catalog::item_precondition(&current, &requested, &row.kind, family) {
+        playscale_core::catalog::ItemPrecondition::DerivedMembership => {
+            return Err(derived_membership());
+        }
+        playscale_core::catalog::ItemPrecondition::ImmutableFamily => {
+            return Err(unsupported_kind());
+        }
+        playscale_core::catalog::ItemPrecondition::Current => {}
     }
     let (origin, number): (String, Option<i64>) = sqlx::query_as(
         "SELECT coalesce(o.title,i.title),s.number FROM items i LEFT JOIN item_origins o ON o.item_id=i.id LEFT JOIN item_structure s ON s.item_id=i.id WHERE i.id=?",
@@ -1180,20 +1184,27 @@ async fn item_receipt(
         .as_str()
         .ok_or_else(|| Problem::internal("invalid item receipt"))?;
     let (current, _) = item_response(conn, scope, id).await?;
-    for field in ["library_ids", "parent_ids"] {
-        if let Some(ids) = body[field].as_array_mut() {
-            ids.retain(|id| {
-                current[field]
-                    .as_array()
-                    .is_some_and(|visible| visible.contains(id))
-            });
-        }
-    }
-    for field in ["default_timeline_id", "artwork_id"] {
-        if body[field] != current[field] {
-            body[field] = Value::Null;
-        }
-    }
+    let projection = |value: &Value| playscale_core::catalog::ReceiptProjection {
+        libraries: value["library_ids"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|id| id.as_str().map(str::to_owned))
+            .collect(),
+        parents: value["parent_ids"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|id| id.as_str().map(str::to_owned))
+            .collect(),
+        timeline: value["default_timeline_id"].as_str().map(str::to_owned),
+        artwork: value["artwork_id"].as_str().map(str::to_owned),
+    };
+    let visible = playscale_core::catalog::project_receipt(projection(body), &projection(&current));
+    body["library_ids"] = json!(visible.libraries);
+    body["parent_ids"] = json!(visible.parents);
+    body["default_timeline_id"] = json!(visible.timeline);
+    body["artwork_id"] = json!(visible.artwork);
     Ok(replayed(stored))
 }
 
@@ -1218,8 +1229,18 @@ enum Reviewed {
 #[derive(Serialize, Deserialize)]
 struct Envelope {
     principal: String,
+    #[serde(default)]
+    history: String,
     expires_at: i64,
     change: Reviewed,
+}
+
+pub(crate) async fn review_history(conn: &mut sqlx::SqliteConnection) -> Result<String, Problem> {
+    Ok(sqlx::query_scalar(
+        "SELECT server_id || ':' || restore_epoch FROM server_identity WHERE singleton=1",
+    )
+    .fetch_one(conn)
+    .await?)
 }
 
 fn plan_mac(app: &App, payload: &str) -> String {
@@ -1230,18 +1251,40 @@ fn plan_mac(app: &App, payload: &str) -> String {
     format!("{:x}", mac.finalize().into_bytes())
 }
 
-fn sign_plan(app: &App, envelope: &Envelope) -> Result<String, Problem> {
-    let payload = b64_encode(
-        serde_json::to_string(envelope)
-            .map_err(Problem::internal)?
-            .as_bytes(),
-    );
-    let token = format!("{PLAN_PREFIX}{payload}.{}", plan_mac(app, &payload));
-    if token.len() > PLAN_TOKEN_MAX {
+async fn sign_plan(
+    conn: &mut sqlx::SqliteConnection,
+    app: &App,
+    envelope: &Envelope,
+) -> Result<String, Problem> {
+    // Bound durable envelopes independently of the small public token budget.
+    const MAX_PLAN_DOCUMENT_BYTES: usize = 8 * 1024 * 1024;
+    let document = serde_json::to_string(envelope).map_err(Problem::internal)?;
+    if document.len() > MAX_PLAN_DOCUMENT_BYTES {
         return Err(Problem::invalid(
             "plan_too_large",
-            "The plan is too large for one token; select fewer participants",
+            "The exact reviewed plan exceeds the durable plan budget",
         ));
+    }
+    sqlx::query("DELETE FROM catalog_review_plans WHERE expires_at<=?")
+        .bind(now())
+        .execute(&mut *conn)
+        .await?;
+    let payload = b64_encode(document.as_bytes());
+    let token = format!("{PLAN_PREFIX}{payload}.{}", plan_mac(app, &payload));
+    if token.len() > PLAN_TOKEN_MAX {
+        // Exact occurrence plans can be larger than transport token limits.
+        // Persist the reviewed envelope atomically with its preview receipt;
+        // only a MAC-authenticated opaque reference crosses the wire.
+        let id = crate::new_id();
+        sqlx::query("INSERT INTO catalog_review_plans VALUES (?,?,?,?)")
+            .bind(&id)
+            .bind(&envelope.principal)
+            .bind(envelope.expires_at)
+            .bind(&document)
+            .execute(conn)
+            .await?;
+        let payload = format!("reference:{id}");
+        return Ok(format!("mcr_{id}.{}", plan_mac(app, &payload)));
     }
     Ok(token)
 }
@@ -1253,27 +1296,60 @@ fn invalid_plan() -> Problem {
     )
 }
 
-fn open_plan(app: &App, token: &str, principal: &str) -> Result<Envelope, Problem> {
+async fn open_plan(
+    conn: &mut sqlx::SqliteConnection,
+    app: &App,
+    token: &str,
+    principal: &str,
+) -> Result<Envelope, Problem> {
+    let reference = token.starts_with("mcr_");
     let (payload, mac) = token
-        .strip_prefix(PLAN_PREFIX)
+        .strip_prefix(if reference { "mcr_" } else { PLAN_PREFIX })
         .and_then(|t| t.split_once('.'))
         .ok_or_else(invalid_plan)?;
     // Digest comparison keeps the MAC check independent of the mismatch position.
-    if Sha256::digest(plan_mac(app, payload).as_bytes()) != Sha256::digest(mac.as_bytes()) {
+    let signed_payload = if reference {
+        format!("reference:{payload}")
+    } else {
+        payload.to_owned()
+    };
+    if Sha256::digest(plan_mac(app, &signed_payload).as_bytes()) != Sha256::digest(mac.as_bytes()) {
         return Err(invalid_plan());
     }
-    let envelope: Envelope = b64_decode(payload)
-        .and_then(|b| serde_json::from_slice(&b).ok())
-        .ok_or_else(invalid_plan)?;
-    if envelope.principal != principal {
-        return Err(invalid_plan());
-    }
-    if !access::plan_token_current(envelope.expires_at, now()) {
-        return Err(Problem::new(
-            StatusCode::CONFLICT,
-            "plan_expired",
-            "The plan expired; preview the change again",
-        ));
+    let envelope: Envelope = if reference {
+        let document: Option<String> = sqlx::query_scalar(
+            "SELECT document_json FROM catalog_review_plans WHERE id=? AND principal_id=?",
+        )
+        .bind(payload)
+        .bind(principal)
+        .fetch_optional(&mut *conn)
+        .await?;
+        serde_json::from_str(&document.ok_or_else(invalid_plan)?).map_err(|_| invalid_plan())?
+    } else {
+        b64_decode(payload)
+            .and_then(|b| serde_json::from_slice(&b).ok())
+            .ok_or_else(invalid_plan)?
+    };
+    let history = review_history(conn).await?;
+    match playscale_core::catalog::review_admission(
+        playscale_core::catalog::ReviewedAuthority {
+            principal: &envelope.principal,
+            history: &envelope.history,
+            expires: envelope.expires_at,
+        },
+        principal,
+        &history,
+        now(),
+    ) {
+        Ok(()) => {}
+        Err(playscale_core::catalog::ReviewAdmissionError::Expired) => {
+            return Err(Problem::new(
+                StatusCode::CONFLICT,
+                "plan_expired",
+                "The plan expired; preview the change again",
+            ));
+        }
+        Err(_) => return Err(invalid_plan()),
     }
     Ok(envelope)
 }
@@ -1342,6 +1418,20 @@ fn split_affected(plan: &SplitPlan) -> Result<Vec<String>, Problem> {
     dedup(ids)
 }
 
+async fn authorize_split_scope(
+    conn: &mut sqlx::SqliteConnection,
+    scope: &CatalogScope,
+    plan: &SplitPlan,
+) -> Result<(), Problem> {
+    let footprint = crate::curation::split_authorization_plan(conn, plan)
+        .await
+        .map_err(curation_problem)?;
+    for owner in footprint.owners {
+        curatable_item(conn, scope, &owner, false).await?;
+    }
+    Ok(())
+}
+
 enum Preview {
     Merge(MergeRequest),
     Split(SplitRequest),
@@ -1369,6 +1459,7 @@ async fn plan(
             let plan = crate::curation::preview_split_on(conn, request)
                 .await
                 .map_err(curation_problem)?;
+            authorize_split_scope(conn, scope, &plan).await?;
             let affected = split_affected(&plan)?;
             let warnings = plan.warnings.clone();
             Ok((Reviewed::Split { plan }, affected, warnings))
@@ -1417,14 +1508,18 @@ async fn issue_plan(
     }
     let (change, affected_ids, warnings) = plan(&mut tx, &scope, &preview).await?;
     let expires_at = now() + access::PLAN_TOKEN_TTL_SECONDS;
+    let history = review_history(&mut tx).await?;
     let plan_token = sign_plan(
+        &mut tx,
         app,
         &Envelope {
             principal: principal.id.clone(),
+            history,
             expires_at,
             change,
         },
-    )?;
+    )
+    .await?;
     let body = ChangePlanBody {
         plan_token,
         expires_at: timestamp(expires_at),
@@ -1576,7 +1671,7 @@ pub async fn commit_reconciliation(
     {
         return item_receipt(&mut tx, &scope, stored.unwrap()).await;
     }
-    let envelope = open_plan(&app, &input.plan_token, &principal.id)?;
+    let envelope = open_plan(&mut tx, &app, &input.plan_token, &principal.id).await?;
     let result = match &envelope.change {
         Reviewed::Merge { plan } => {
             authorize_merge_scope(&mut tx, &scope, &plan.retired, &plan.target).await?;
@@ -1586,7 +1681,7 @@ pub async fn commit_reconciliation(
             plan.target.clone()
         }
         Reviewed::Split { plan } => {
-            curatable_item(&mut tx, &scope, &plan.item, false).await?;
+            authorize_split_scope(&mut tx, &scope, plan).await?;
             crate::curation::split_in_transaction(&mut tx, plan)
                 .await
                 .map_err(curation_problem)?;
@@ -1982,12 +2077,18 @@ pub async fn place_timeline(
     .fetch_optional(&mut *tx)
     .await?
     .ok_or_else(Problem::not_found)?;
-    curatable_item(&mut tx, &scope, &timeline.item_id, false).await?;
-    // Leaving a group also mutates its revision; scope every affected owner.
+    let mut owners = Vec::new();
     for group in std::iter::once(&input.order_group_id).chain(timeline.order_group_id.iter()) {
-        let owner: String = sqlx::query_scalar(
-            "SELECT e.item_id FROM order_groups g JOIN editions e ON e.id=g.edition_id WHERE g.id=?",
-        ).bind(group).fetch_optional(&mut *tx).await?.ok_or_else(Problem::not_found)?;
+        let owner: String = sqlx::query_scalar("SELECT e.item_id FROM order_groups g JOIN editions e ON e.id=g.edition_id WHERE g.id=?")
+            .bind(group).fetch_optional(&mut *tx).await?.ok_or_else(Problem::not_found)?;
+        owners.push(owner);
+    }
+    let footprint = playscale_core::identity::order_footprint(
+        timeline.item_id.clone(),
+        owners.get(1).cloned(),
+        owners[0].clone(),
+    );
+    for owner in footprint.owners {
         curatable_item(&mut tx, &scope, &owner, false).await?;
     }
     access::revise(timeline.revision as u64, expected, true)?;
@@ -2451,4 +2552,82 @@ async fn files_page(
     let value = page(&mut tx, &caller.principal, values, limit).await?;
     tx.commit().await?;
     Ok(Json(value).into_response())
+}
+
+#[cfg(test)]
+mod catalog_boundary_tests {
+    use super::*;
+    use sqlx::Connection;
+
+    #[tokio::test]
+    async fn multipart_visibility_sql_matches_core_for_every_small_scope() {
+        let mut conn = sqlx::SqliteConnection::connect("sqlite::memory:")
+            .await
+            .unwrap();
+        for sql in [
+            "CREATE TABLE media_versions(id TEXT,timeline_id TEXT)",
+            "CREATE TABLE version_files(version_id TEXT,file_id TEXT)",
+            "CREATE TABLE media_files(id TEXT,library_id TEXT)",
+            "CREATE TABLE library_sources(library_id TEXT,source_id TEXT)",
+            "INSERT INTO library_sources VALUES ('a','a'),('b','b')",
+        ] {
+            sqlx::query(sql).execute(&mut conn).await.unwrap();
+        }
+        for parts in 0..=4 {
+            for visibility in 0..(1 << parts) {
+                sqlx::query("DELETE FROM version_files")
+                    .execute(&mut conn)
+                    .await
+                    .unwrap();
+                sqlx::query("DELETE FROM media_files")
+                    .execute(&mut conn)
+                    .await
+                    .unwrap();
+                sqlx::query("DELETE FROM media_versions")
+                    .execute(&mut conn)
+                    .await
+                    .unwrap();
+                sqlx::query("INSERT INTO media_versions VALUES ('version','timeline')")
+                    .execute(&mut conn)
+                    .await
+                    .unwrap();
+                let visible: Vec<_> = (0..parts)
+                    .map(|part| visibility & (1 << part) != 0)
+                    .collect();
+                for (part, allowed) in visible.iter().enumerate() {
+                    sqlx::query("INSERT INTO media_files VALUES (?,?)")
+                        .bind(part.to_string())
+                        .bind(if *allowed { "a" } else { "b" })
+                        .execute(&mut conn)
+                        .await
+                        .unwrap();
+                    sqlx::query("INSERT INTO version_files VALUES ('version',?)")
+                        .bind(part.to_string())
+                        .execute(&mut conn)
+                        .await
+                        .unwrap();
+                }
+                for admin in [false, true] {
+                    let scope = if admin {
+                        CatalogScope::All
+                    } else {
+                        CatalogScope::Libraries(BTreeSet::from(["a".into()]))
+                    };
+                    let actual = version_ids(&mut conn, &scope, "timeline", "", 10)
+                        .await
+                        .unwrap();
+                    let expected = playscale_core::catalog::version_visible(admin, &visible);
+                    assert_eq!(
+                        actual,
+                        if expected {
+                            vec!["version".to_owned()]
+                        } else {
+                            vec![]
+                        },
+                        "parts={parts} visibility={visibility} admin={admin}"
+                    );
+                }
+            }
+        }
+    }
 }

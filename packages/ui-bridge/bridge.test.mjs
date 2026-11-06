@@ -4,7 +4,7 @@ import {test} from 'node:test';
 import {runInNewContext} from 'node:vm';
 import {webcrypto} from 'node:crypto';
 
-const source = readFileSync(new URL('./bridge.js', import.meta.url), 'utf8');
+const source = readFileSync(new URL('../playback/viewing.mjs', import.meta.url), 'utf8').replaceAll('export ', '') + '\n' + readFileSync(new URL('./mutation.mjs', import.meta.url), 'utf8').replaceAll('export ', '') + '\n' + readFileSync(new URL('./bridge.js', import.meta.url), 'utf8');
 function harness(storage = new Map(), fetch = async () => ({ok: true, status: 204}), extra = {}) {
   const context = {
     document: {querySelector: () => null, addEventListener() {}},
@@ -476,4 +476,33 @@ test('watched marks retry a progress-only conflict once and never a manual one',
     await submitCommand(mark);
     assert.deepEqual(calls, expected, `rendered manual epoch ${epoch}, session ${session}`);
   }
+});
+
+for (const [status, code, retain] of [[401, null, true], [403, null, true], [404, null, true],
+  [409, 'idempotency_key_reused', true], [409, 'idempotent_replay_unavailable', true],
+  [409, 'revision_conflict', false], [412, 'revision_conflict', false]]) {
+  test(`unknown then ${status}/${code} retains only unresolved identity across reload`, async () => {
+    const storage = new Map();
+    const keys = [];
+    const submit = async failure => harness(storage, async (_, options) => {
+      keys.push(options.headers['Idempotency-Key']);
+      if (!failure) throw new Error('lost acknowledgement');
+      return {ok: false, status: failure.status, json: async () => ({code: failure.code})};
+    }).submitCommand(form());
+    await submit(null);
+    await submit({status, code});
+    await submit(null);
+    assert.equal(keys[0], keys[1]);
+    assert.equal(keys[0] === keys[2], retain);
+  });
+}
+
+test('principal and server history scope isolate pending identities', () => {
+  const storage = new Map();
+  const context = (principal, epoch) => ({document: {addEventListener() {}, querySelector: selector =>
+    selector.includes('principal-id') ? {content: principal} : selector.includes('server-epoch') ? {content: epoch} : null}});
+  const first = harness(storage, undefined, context('p1', 'e1')).keyFor('request');
+  assert.equal(harness(storage, undefined, context('p1', 'e1')).keyFor('request'), first);
+  assert.notEqual(harness(storage, undefined, context('p2', 'e1')).keyFor('request'), first);
+  assert.notEqual(harness(storage, undefined, context('p1', 'e2')).keyFor('request'), first);
 });

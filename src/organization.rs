@@ -252,13 +252,16 @@ pub struct Collection {
 
 async fn live_items(conn: &mut SqliteConnection, ids: &[String]) -> Result<(), OrgError> {
     for id in ids {
-        let live: i64 = sqlx::query_scalar(
-            "SELECT count(*) FROM items WHERE id=? AND id NOT IN (SELECT alias_id FROM item_aliases)",
+        let retired: Option<bool> = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM item_aliases WHERE alias_id=items.id) FROM items WHERE id=?",
         )
         .bind(id)
-        .fetch_one(&mut *conn)
+        .fetch_optional(&mut *conn)
         .await?;
-        if live == 0 {
+        let reference = retired.map_or(org::Reference::Missing, |retired| org::Reference::Work {
+            retired,
+        });
+        if !org::reference_admitted("", &reference) {
             return Err(OrgError::InvalidReference(id.clone()));
         }
     }
@@ -295,13 +298,15 @@ pub async fn save_collection_in(
     org::validate_collection(name, kind, &item_ids, filter_id.as_ref())?;
     live_items(&mut *conn, &item_ids).await?;
     if let Some(filter) = &filter_id {
-        let own: i64 =
-            sqlx::query_scalar("SELECT count(*) FROM saved_filters WHERE id=? AND profile_id=?")
+        let owner: Option<String> =
+            sqlx::query_scalar("SELECT profile_id FROM saved_filters WHERE id=?")
                 .bind(filter)
-                .bind(profile)
-                .fetch_one(&mut *conn)
+                .fetch_optional(&mut *conn)
                 .await?;
-        if own == 0 {
+        let reference = owner.map_or(org::Reference::Missing, |profile| {
+            org::Reference::SavedFilter { profile }
+        });
+        if !org::reference_admitted(profile, &reference) {
             return Err(OrgError::InvalidReference(filter.clone()));
         }
     }
@@ -517,11 +522,12 @@ pub async fn members(db: &SqlitePool, profile: &str, id: &str) -> Result<Vec<Str
 
 async fn valid_timelines(conn: &mut SqliteConnection, entries: &[Entry]) -> Result<(), OrgError> {
     for entry in entries {
-        let known: i64 = sqlx::query_scalar("SELECT count(*) FROM timelines WHERE id=?")
+        let known: Option<String> = sqlx::query_scalar("SELECT id FROM timelines WHERE id=?")
             .bind(&entry.timeline_id)
-            .fetch_one(&mut *conn)
+            .fetch_optional(&mut *conn)
             .await?;
-        if known == 0 {
+        let reference = known.map_or(org::Reference::Missing, |_| org::Reference::Timeline);
+        if !org::reference_admitted("", &reference) {
             return Err(OrgError::InvalidReference(entry.timeline_id.clone()));
         }
     }

@@ -61,13 +61,25 @@ pub static BRIDGE: Asset = Asset::new(
     "bridge",
     "js",
     "text/javascript; charset=utf-8",
-    include_bytes!("../../../packages/ui-bridge/bridge.js"),
+    concat!(
+        include_str!("../../../packages/playback/viewing.mjs"),
+        "\n",
+        include_str!("../../../packages/ui-bridge/mutation.mjs"),
+        "\n",
+        include_str!("../../../packages/ui-bridge/bridge.js")
+    )
+    .as_bytes(),
 );
 pub static AUTH: Asset = Asset::new(
     "auth",
     "js",
     "text/javascript; charset=utf-8",
-    include_bytes!("../../../packages/ui-bridge/auth.js"),
+    concat!(
+        include_str!("../../../packages/ui-bridge/mutation.mjs"),
+        "\n",
+        include_str!("../../../packages/ui-bridge/auth.js")
+    )
+    .as_bytes(),
 );
 pub static PLAYER: Asset = Asset::new(
     "player",
@@ -76,6 +88,8 @@ pub static PLAYER: Asset = Asset::new(
     // One prebuilt ES module: pure coordinator followed by its DOM adapter.
     concat!(
         include_str!("../../../packages/playback/viewing.mjs"),
+        "\n",
+        include_str!("../../../packages/playback/replacement.mjs"),
         "\n",
         include_str!("../../../packages/playback/generation.mjs"),
         "\n",

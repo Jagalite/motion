@@ -187,7 +187,20 @@ impl Model for Playback {
                 let observed = Observed {
                     principal: &p,
                     file: Some(&file),
-                    bound: true,
+                    binding: playscale_core::playback_session::PlaybackBinding {
+                        version: "v".into(),
+                        timeline: claims.timeline.clone(),
+                        files: vec![playscale_core::playback_session::BoundFile {
+                            file: "f".into(),
+                            binding_revision: claims.file_revision.clone(),
+                            current_revision: s.revision.to_string(),
+                            library: "lib".into(),
+                            duration_ms: None,
+                            part: 1,
+                            start_ms: None,
+                            end_ms: None,
+                        }],
+                    },
                     now: s.now,
                 };
                 let decision = core::admit(claims, &observed).and_then(|_| match &s.owner {

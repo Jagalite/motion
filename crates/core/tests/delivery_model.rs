@@ -148,9 +148,12 @@ impl Enumerate for Deliveries {
                     ] {
                         for overlap in [false, true] {
                             inputs.push(Step::Delivery(Input::Change {
+                                expected_selection: None,
                                 expected_generation: g,
                                 position_ms: *position,
-                                replan: replan.clone(),
+                                replan: replan
+                                    .clone()
+                                    .map(|(timeline, pin)| (timeline, Box::new(pin))),
                                 overlap,
                                 now_ms: now,
                             }));
@@ -547,7 +550,7 @@ impl Model for Deliveries {
                 Input::Change {
                     replan: Some((_, p)),
                     ..
-                } => p == pin,
+                } => p.as_ref() == pin,
                 _ => false,
             }
         });
@@ -1035,6 +1038,7 @@ fn heartbeat_boundaries_renew_only_valid_generation_leases() {
     let (staged, _) = transition(
         &active,
         &Input::Change {
+            expected_selection: None,
             expected_generation: 1,
             position_ms: 30_000,
             replan: None,
@@ -1120,6 +1124,7 @@ fn seek_switch_and_stale_segment_replay_exactly() {
             target_duration_s: TARGET,
         }),
         Step::Delivery(Input::Change {
+            expected_selection: None,
             expected_generation: 1,
             position_ms: 6_000,
             replan: None,

@@ -12,6 +12,66 @@
 //! returned records in one transaction.
 use serde::{Deserialize, Serialize};
 
+/// Resume behavior is deliberately different for the online UI and a local
+/// offline observation. Online viewing restarts watched titles and the final
+/// second; a local pause exactly at duration remains resumable until an explicit
+/// ended observation. Compaction must not change that local behavior.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum ResumePolicy {
+    Online,
+    Offline,
+}
+
+pub fn resume_position(
+    policy: ResumePolicy,
+    position_ms: Option<u64>,
+    completed: bool,
+    duration_ms: Option<u64>,
+) -> u64 {
+    let position = position_ms.unwrap_or(0);
+    if completed {
+        return 0;
+    }
+    match policy {
+        ResumePolicy::Online
+            if duration_ms.is_some_and(|d| position.saturating_add(1_000) >= d) =>
+        {
+            0
+        }
+        ResumePolicy::Offline if duration_ms.is_some_and(|d| position > d) => 0,
+        _ => position,
+    }
+}
+
+/// Ordered observations from a single release-order page. The adapter supplies
+/// only visibility observations; database or authorization read errors must be
+/// propagated rather than represented as hidden candidates.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct NextCandidate {
+    pub timeline: String,
+    pub readable: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum NextTimeline {
+    Found(String),
+    NeedMore,
+    Exhausted,
+}
+
+/// `complete` means the adapter has reached the end of this order group, not
+/// merely the end of its current page. A full page of hidden entries cannot
+/// establish exhaustion.
+pub fn next_timeline(candidates: &[NextCandidate], complete: bool) -> NextTimeline {
+    if let Some(candidate) = candidates.iter().find(|c| c.readable) {
+        NextTimeline::Found(candidate.timeline.clone())
+    } else if complete {
+        NextTimeline::Exhausted
+    } else {
+        NextTimeline::NeedMore
+    }
+}
+
 /// A durable history command is valid across ordinary restart, but cannot
 /// cross a restored database or replacement server identity.
 pub fn accepts_history_identity(expected: (&str, &str), current: (&str, &str)) -> bool {
@@ -645,6 +705,67 @@ mod legacy_import_tests {
                         }
                     }
                 }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod selection_policy_tests {
+    use super::*;
+
+    #[test]
+    fn resume_policy_preserves_local_pause_at_duration_and_online_restart() {
+        for position in [0, 1, 8_999, 9_000, 9_999, 10_000, 10_001] {
+            assert_eq!(
+                resume_position(ResumePolicy::Offline, Some(position), false, Some(10_000)),
+                if position <= 10_000 { position } else { 0 }
+            );
+            assert_eq!(
+                resume_position(ResumePolicy::Online, Some(position), false, Some(10_000)),
+                if position < 9_000 { position } else { 0 }
+            );
+            for policy in [ResumePolicy::Online, ResumePolicy::Offline] {
+                assert_eq!(
+                    resume_position(policy, Some(position), true, Some(10_000)),
+                    0
+                );
+                assert_eq!(
+                    resume_position(policy, Some(position), false, None),
+                    position
+                );
+            }
+        }
+        assert_eq!(
+            resume_position(ResumePolicy::Online, Some(u64::MAX), false, Some(u64::MAX)),
+            0
+        );
+    }
+
+    #[test]
+    fn hidden_pages_need_more_until_complete_and_first_visible_identity_wins() {
+        for count in [0, 49, 50, 51] {
+            let mut candidates: Vec<_> = (0..count)
+                .map(|n| NextCandidate {
+                    timeline: format!("hidden-{n}"),
+                    readable: false,
+                })
+                .collect();
+            assert_eq!(next_timeline(&candidates, false), NextTimeline::NeedMore);
+            assert_eq!(next_timeline(&candidates, true), NextTimeline::Exhausted);
+            candidates.push(NextCandidate {
+                timeline: "visible".into(),
+                readable: true,
+            });
+            candidates.push(NextCandidate {
+                timeline: "later".into(),
+                readable: true,
+            });
+            for complete in [false, true] {
+                assert_eq!(
+                    next_timeline(&candidates, complete),
+                    NextTimeline::Found("visible".into())
+                );
             }
         }
     }

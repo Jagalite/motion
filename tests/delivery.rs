@@ -1082,6 +1082,9 @@ async fn copy_routes_start_at_keyframes_and_keep_source_video() {
                 "0",
                 "-c:a",
                 audio,
+                // Normalize encoder priming in the fixture, not production eligibility.
+                "-bsf:a",
+                "setts=pts=PTS-STARTPTS:dts=DTS-STARTDTS",
             ])
             .arg(f.dir.path().join("media").join(name))
             .status()
@@ -1393,6 +1396,8 @@ async fn text_subtitles_are_served_as_webvtt_sidecars() {
             "srt",
             // A container that starts at 5 s: cues and video are both relative
             // to the container start (timeline time).
+            "-bsf:a",
+            "setts=pts=PTS-STARTPTS:dts=DTS-STARTDTS",
             "-output_ts_offset",
             "5",
         ])
@@ -1400,6 +1405,16 @@ async fn text_subtitles_are_served_as_webvtt_sidecars() {
         .status()
         .unwrap();
     assert!(status.success());
+    for stream in probe(&f.dir.path().join("media/clip.mkv"))["streams"]
+        .as_array()
+        .unwrap()
+    {
+        let start: f64 = stream["start_time"].as_str().unwrap().parse().unwrap();
+        assert!(
+            (start - 5.0).abs() < 0.0005,
+            "offset fixture stream starts at {start}"
+        );
+    }
     f.scan().await;
     let (file_id, revision): (String, String) =
         sqlx::query_as("SELECT id,revision FROM media_files LIMIT 1")
@@ -1718,11 +1733,23 @@ async fn copy_route_refuses_open_gop_segments() {
                 gop,
                 "-c:a",
                 "aac",
+                // Normalize encoder priming in the fixture, not production eligibility.
+                "-bsf:a",
+                "setts=pts=PTS-STARTPTS:dts=DTS-STARTDTS",
             ])
             .arg(f.dir.path().join("media").join(name))
             .status()
             .unwrap();
         assert!(status.success());
+    }
+    for name in ["closed.mkv", "open.mkv"] {
+        for stream in probe(&f.dir.path().join("media").join(name))["streams"]
+            .as_array()
+            .unwrap()
+        {
+            let start: f64 = stream["start_time"].as_str().unwrap().parse().unwrap();
+            assert!(start.abs() < 0.0005, "{name} stream starts at {start}");
+        }
     }
     f.scan().await;
     let mut ids = Vec::new();

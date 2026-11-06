@@ -1,12 +1,14 @@
 # Playscale state machine refactoring plan
 
+> Historical scope/design document. Current implementation, executed evidence and remaining gates are tracked in [the completion matrix](STATE_MACHINE_COMPLETION_MATRIX.md). Source line links below refer to the audited snapshot.
+
 ## Objective
 
 Move as much domain logic and behavior as practical into deterministic production state machines in crates/core. This includes the decisions that connect operations: admission, selection, authorization, effect sequencing, publication, retries, cancellation, recovery, retention and replay. Adapters should gather observations, execute identified effects, and return results.
 
 A collection of extracted predicates is not the finish line. The production workflow must call the core decision that determines its next action, and Stateless must exercise that same workflow composition.
 
-This is a plan only. AGENTS.md and application code remain unchanged. The scope and finding IDs come from [the state boundary audit](/Volumes/seed2/Projects/playscale/STATE_BOUNDARY_AUDIT.md), which records 73 entries and the source/test evidence behind them.
+This is a plan only. AGENTS.md and application code remain unchanged. The scope and finding IDs come from [the state boundary audit](STATE_BOUNDARY_AUDIT.md), which records 73 entries and the source/test evidence behind them.
 
 ## Target boundary
 

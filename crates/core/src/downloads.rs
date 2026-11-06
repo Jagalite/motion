@@ -536,6 +536,7 @@ pub enum TransferDecision {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TransferRefusal {
+    ArtifactsUnavailable,
     /// The report describes another revision of the download.
     DownloadChanged,
     /// The device already reported something later.
@@ -1465,5 +1466,120 @@ mod tests {
             ),
             Decision::SequenceGap
         );
+    }
+}
+
+/// Exact device admission; adapters map these outcomes to their public errors.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DeviceAdmission {
+    Missing,
+    Foreign,
+    Own,
+}
+pub fn device_admission(own: Option<&str>, requested: Option<&str>) -> DeviceAdmission {
+    match own {
+        None => DeviceAdmission::Missing,
+        Some(own) if requested.is_some_and(|requested| requested != own) => {
+            DeviceAdmission::Foreign
+        }
+        Some(_) => DeviceAdmission::Own,
+    }
+}
+
+/// Explicit owner/profile facts, observed in the same transaction as the read.
+pub fn owned_download(
+    principal: &str,
+    device: &str,
+    owner: &str,
+    held_device: &str,
+    profile_allowed: bool,
+) -> bool {
+    principal == owner && device == held_device && profile_allowed
+}
+
+/// Curated positive duration wins; only an exact owned download may supply a fallback.
+pub fn offline_duration(curated: Option<i64>, pinned: Option<i64>) -> Option<u64> {
+    curated
+        .filter(|v| *v > 0)
+        .or_else(|| pinned.filter(|v| *v > 0))
+        .map(|v| v as u64)
+}
+
+/// First committed subtitle publication fixes identity for the pinned download.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum SubtitleArtifact {
+    Pending,
+    Ready { digest: String, size: u64 },
+    Failed,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SubtitlePublication {
+    Record,
+    Unchanged,
+    Cancelled,
+    Changed,
+}
+pub fn publish_subtitle(
+    active: bool,
+    prior: &SubtitleArtifact,
+    incoming: &SubtitleArtifact,
+) -> SubtitlePublication {
+    if !active {
+        return SubtitlePublication::Cancelled;
+    }
+    match prior {
+        SubtitleArtifact::Pending => SubtitlePublication::Record,
+        prior if prior == incoming || matches!(incoming, SubtitleArtifact::Failed) => {
+            SubtitlePublication::Unchanged
+        }
+        _ => SubtitlePublication::Changed,
+    }
+}
+/// Required subtitle readiness is part of transfer admission, not a caller-side
+/// boolean substituting a media-only byte count for a verified complete copy.
+pub fn accept_transfer_with_artifacts(
+    previous: Option<&TransferReport>,
+    incoming: &TransferReport,
+    revision: u64,
+    media: u64,
+    required: bool,
+    subtitle: Option<u64>,
+    ended: bool,
+) -> Result<TransferDecision, TransferRefusal> {
+    let size = transfer_bytes(media, required, subtitle);
+    if size.is_none() && incoming.state == TransferState::VerifiedLocal {
+        return Err(TransferRefusal::ArtifactsUnavailable);
+    }
+    accept_transfer(previous, incoming, revision, size.unwrap_or(media), ended)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SubtitleWork {
+    Cancelled,
+    PermanentFailure,
+    ReadArtifact,
+    SharedFailure,
+    Convert,
+}
+/// Observations gathered while holding the exact download's subtitle mutex.
+/// A waiter arriving before the previous failed attempt shares that outcome;
+/// a later caller may retry a transient failure. Caller cancellation does not
+/// alter a conversion task that still owns this mutex.
+pub fn subtitle_work(
+    active: bool,
+    permanent_failure: bool,
+    artifact_present: bool,
+    failure_since_request: bool,
+) -> SubtitleWork {
+    if !active {
+        SubtitleWork::Cancelled
+    } else if permanent_failure {
+        SubtitleWork::PermanentFailure
+    } else if artifact_present {
+        SubtitleWork::ReadArtifact
+    } else if failure_since_request {
+        SubtitleWork::SharedFailure
+    } else {
+        SubtitleWork::Convert
     }
 }

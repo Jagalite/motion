@@ -1666,6 +1666,22 @@ async fn viewing_authority_rebinds_fences_overrides_and_resolves_release_order()
         StatusCode::PRECONDITION_FAILED,
         "precondition_failed",
     );
+    // An authorized delivery of another timeline cannot become this session's
+    // binding, even with the correct revision and an otherwise live reducer.
+    let wrong = admit_original(&f, &auth, &sequel, "rebind-wrong-context", 0).await;
+    let wrong_reply = f
+        .call(
+            "PUT",
+            &rebind,
+            Some(json!({"delivery_id":wrong["id"]})),
+            &[
+                ("authorization", &auth),
+                ("if-match", one.headers["etag"].to_str().unwrap()),
+            ],
+        )
+        .await;
+    problem(&wrong_reply, StatusCode::CONFLICT, "delivery_mismatch");
+
     let tag = one.headers["etag"].to_str().unwrap().to_owned();
     let moved = f
         .call(
@@ -3010,6 +3026,34 @@ async fn selected_plain_text_subtitles_are_revision_bound_and_other_formats_refu
 /// A source eligible for stream copy: Main-profile H.264 with B-frames and a
 /// 2 s GOP, an AAC track (44.1 kHz) and an AC-3 track (48 kHz), every stream
 /// starting at zero. `level` overrides the H.264 level_idc.
+/// Copy eligibility deliberately requires zero stream starts. Encoder priming
+/// defaults differ between FFmpeg versions, so verify fixture facts before any
+/// application admission instead of weakening the production timestamp gate.
+fn assert_zero_stream_starts(path: &Path) {
+    let output = Command::new("ffprobe")
+        .args([
+            "-v",
+            "error",
+            "-show_entries",
+            "stream=start_time",
+            "-of",
+            "json",
+        ])
+        .arg(path)
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let probe: Value = serde_json::from_slice(&output.stdout).unwrap();
+    for stream in probe["streams"].as_array().unwrap() {
+        let start: f64 = stream["start_time"].as_str().unwrap().parse().unwrap();
+        assert!(
+            start.abs() < 0.0005,
+            "{} stream starts at {start}",
+            path.display()
+        );
+    }
+}
+
 fn copyable_mkv(f: &Fixture, name: &str, level: &str) {
     f.media(
         name,
@@ -3052,8 +3096,11 @@ fn copyable_mkv(f: &Fixture, name: &str, level: &str) {
             "aac",
             "-c:a:1",
             "ac3",
+            "-bsf:a",
+            "setts=pts=PTS-STARTPTS:dts=DTS-STARTDTS",
         ],
     );
+    assert_zero_stream_starts(&f.dir.path().join("media").join(name));
 }
 
 /// Streams of an init segment followed by one media segment.
@@ -5991,8 +6038,11 @@ async fn copied_manifests_declare_the_source_rate() {
             "48",
             "-c:a",
             "aac",
+            "-bsf:a",
+            "setts=pts=PTS-STARTPTS:dts=DTS-STARTDTS",
         ],
     );
+    assert_zero_stream_starts(&f.dir.path().join("media/noise.mkv"));
     f.scan().await;
     let (timeline, _) = f.timeline().await;
     let (_, auth) = f.device(&["default"], PLAYER).await;
@@ -8630,12 +8680,19 @@ async fn previews_are_rendered_once_served_by_revision_and_retired() {
     let file_id = ready["file_id"].as_str().unwrap().to_owned();
     let revision = ready["file_revision"].as_str().unwrap().to_owned();
     let root = &f.server.app.processing.root;
+    let storage_key: String =
+        sqlx::query_scalar("SELECT storage_key FROM previews WHERE file_id=? AND file_revision=?")
+            .bind(&file_id)
+            .bind(&revision)
+            .fetch_one(&f.server.app.db)
+            .await
+            .unwrap();
     let published = root
         .parent()
         .unwrap_or(root)
         .join("previews")
-        .join(&file_id)
-        .join(&revision);
+        .join(".published")
+        .join(storage_key);
     // A corrupted sparse sheet is refused without loading its full length.
     std::fs::OpenOptions::new()
         .write(true)
@@ -8710,4 +8767,38 @@ async fn planning_uses_one_pool_slot_for_components_and_preferences() {
         assert_eq!(response.status, StatusCode::OK, "{:?}", response.body);
         assert_eq!(response.body["status"], "ready");
     }
+}
+
+#[tokio::test]
+async fn exhausted_preference_revision_never_wraps_or_overwrites() {
+    let f = Fixture::new().await;
+    let (_, auth) = f.device(&["default"], PLAYER).await;
+    let path = "/api/v2/profiles/default/preferences";
+    let original = f.get(path, &auth).await;
+    let stored = serde_json::to_string(&playscale::viewing::Preferences::default()).unwrap();
+    sqlx::query("INSERT INTO playback_preferences(profile_id,revision,document_json) VALUES ('default',?,?)")
+        .bind(i64::MAX).bind(&stored).execute(&f.server.app.db).await.unwrap();
+    let reply = f
+        .call(
+            "PUT",
+            path,
+            Some(original.body),
+            &[
+                ("authorization", &auth),
+                ("if-match", &format!("\"r-{}\"", i64::MAX)),
+            ],
+        )
+        .await;
+    problem(
+        &reply,
+        StatusCode::PRECONDITION_FAILED,
+        "precondition_failed",
+    );
+    let row: (i64, String) = sqlx::query_as(
+        "SELECT revision,document_json FROM playback_preferences WHERE profile_id='default'",
+    )
+    .fetch_one(&f.server.app.db)
+    .await
+    .unwrap();
+    assert_eq!(row, (i64::MAX, stored));
 }

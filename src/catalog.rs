@@ -334,15 +334,21 @@ pub async fn assign(
             .bind(&id)
             .fetch_one(&mut *tx)
             .await?;
-    if edition != body.expected_edition_id {
-        return Err(conflict());
-    }
     let target: Edition = sqlx::query_as("SELECT * FROM editions WHERE id=?")
         .bind(body.edition_id)
         .fetch_one(&mut *tx)
         .await?;
-    if target.item_id != item {
-        return Err(ApiError::bad("Cross-item reassignment is not supported"));
+    match playscale_core::catalog::reassignment_precondition(
+        &edition,
+        &body.expected_edition_id,
+        &item,
+        &target.item_id,
+    ) {
+        playscale_core::catalog::ReassignmentPrecondition::StaleEdition => return Err(conflict()),
+        playscale_core::catalog::ReassignmentPrecondition::ForeignWork => {
+            return Err(ApiError::bad("Cross-item reassignment is not supported"));
+        }
+        playscale_core::catalog::ReassignmentPrecondition::Current => {}
     }
     crate::curation::reassign_file(&mut tx, &id, &target.id)
         .await

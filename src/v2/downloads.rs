@@ -92,19 +92,23 @@ impl From<Refusal> for Problem {
 
 /// The caller's own device: downloads and offline history are device-owned.
 fn device(principal: &Principal, requested: Option<&str>) -> Result<String, Problem> {
-    let own = principal.device_id.as_deref().ok_or_else(|| {
-        Problem::invalid(
-            "device_required",
-            "Downloads belong to a paired device; use a device credential",
-        )
-    })?;
-    if requested.is_some_and(|r| r != own) {
-        return Err(Problem::new(
-            StatusCode::FORBIDDEN,
-            "device_mismatch",
-            "A device can only manage its own downloads and offline history",
-        ));
+    match core::device_admission(principal.device_id.as_deref(), requested) {
+        core::DeviceAdmission::Missing => {
+            return Err(Problem::invalid(
+                "device_required",
+                "Downloads belong to a paired device; use a device credential",
+            ));
+        }
+        core::DeviceAdmission::Foreign => {
+            return Err(Problem::new(
+                StatusCode::FORBIDDEN,
+                "device_mismatch",
+                "A device can only manage its own downloads and offline history",
+            ));
+        }
+        core::DeviceAdmission::Own => {}
     }
+    let own = principal.device_id.as_deref().expect("admitted device");
     Ok(own.to_owned())
 }
 
@@ -164,7 +168,13 @@ async fn owned(
     .fetch_optional(&mut *conn)
     .await?
     .ok_or_else(Problem::not_found)?;
-    if !principal.may_use_profile(&row.profile_id) {
+    if !core::owned_download(
+        &principal.id,
+        &device,
+        &row.principal_id,
+        &row.device_id,
+        principal.may_use_profile(&row.profile_id),
+    ) {
         return Err(Problem::not_found());
     }
     Ok(row)
@@ -1125,32 +1135,56 @@ async fn record_subtitle(
             "The download was cancelled",
         ));
     }
-    let digest = bytes.map(|b| format!("{:x}", sha2::Sha256::digest(b)));
-    let changed = sqlx::query("INSERT INTO download_subtitle_artifacts(download_id,state,size_bytes,digest) VALUES (?,?,?,?) ON CONFLICT(download_id) DO NOTHING")
-        .bind(id).bind(if bytes.is_some() { "ready" } else { "failed" }).bind(bytes.map_or(0, |b| b.len() as i64)).bind(digest).execute(&mut *tx).await?.rows_affected();
-    if changed != 0 {
-        sqlx::query("UPDATE downloads SET revision=revision+1,updated_at=? WHERE id=?")
-            .bind(now())
-            .bind(id)
-            .execute(&mut *tx)
-            .await?;
-    }
-    let recorded: (String, i64, Option<String>) = sqlx::query_as(
+    let existing: Option<(String, i64, Option<String>)> = sqlx::query_as(
         "SELECT state,size_bytes,digest FROM download_subtitle_artifacts WHERE download_id=?",
     )
     .bind(id)
-    .fetch_one(&mut *tx)
+    .fetch_optional(&mut *tx)
     .await?;
-    if let Some(bytes) = bytes {
-        let expected = format!("{:x}", sha2::Sha256::digest(bytes));
-        if recorded.0 != "ready"
-            || recorded.1 != bytes.len() as i64
-            || recorded.2.as_deref() != Some(expected.as_str())
-        {
+    let prior = match existing {
+        Some((state, size, Some(digest))) if state == "ready" && size >= 0 => {
+            core::SubtitleArtifact::Ready {
+                digest,
+                size: size as u64,
+            }
+        }
+        Some(_) => core::SubtitleArtifact::Failed,
+        None => core::SubtitleArtifact::Pending,
+    };
+    let incoming = bytes.map_or(core::SubtitleArtifact::Failed, |bytes| {
+        core::SubtitleArtifact::Ready {
+            digest: format!("{:x}", sha2::Sha256::digest(bytes)),
+            size: bytes.len() as u64,
+        }
+    });
+    match core::publish_subtitle(active, &prior, &incoming) {
+        core::SubtitlePublication::Cancelled => {
+            return Err(crate::api::ApiError::conflict(
+                "download_cancelled",
+                "The download was cancelled",
+            ));
+        }
+        core::SubtitlePublication::Changed => {
             return Err(crate::api::ApiError::conflict(
                 "subtitle_artifact_changed",
                 "The pinned subtitle artifact changed",
             ));
+        }
+        core::SubtitlePublication::Unchanged => {}
+        core::SubtitlePublication::Record => {
+            let (state, size, digest) = match &incoming {
+                core::SubtitleArtifact::Ready { digest, size } => {
+                    ("ready", *size as i64, Some(digest.as_str()))
+                }
+                _ => ("failed", 0, None),
+            };
+            sqlx::query("INSERT INTO download_subtitle_artifacts(download_id,state,size_bytes,digest) VALUES (?,?,?,?)")
+                .bind(id).bind(state).bind(size).bind(digest).execute(&mut *tx).await?;
+            sqlx::query("UPDATE downloads SET revision=revision+1,updated_at=? WHERE id=?")
+                .bind(now())
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
         }
     }
     tx.commit().await?;
@@ -1201,35 +1235,39 @@ async fn ensure_subtitles(app: &App, row: &Row, track: &str) -> Result<Vec<u8>, 
     let converted = tokio::spawn(async move {
         let path = subtitles_path(&app, &id);
         let _held = subtitles_lock(&path).lock_owned().await;
-        let failed: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM download_subtitle_artifacts WHERE download_id=? AND state='failed')").bind(&id).fetch_one(&app.db).await?;
-        if failed {
-            return Err(crate::api::ApiError::new(
-                StatusCode::UNPROCESSABLE_ENTITY,
-                "subtitle_conversion_failed",
-                "The selected subtitle cannot be converted",
-            ));
-        }
-        // Another read converted it while this one waited.
-        if let Ok(bytes) = read_subtitle(&path).await {
-            record_subtitle(&app, &id, Some(&bytes)).await?;
-            return Ok(bytes);
-        }
-        let cancelled =
-            || crate::api::ApiError::conflict("download_cancelled", "The download was cancelled");
-        if !active(&app, &id).await {
-            return Err(cancelled());
-        }
-        // Or tried and failed while this read waited: share that outcome
-        // rather than converting again for a read that may already have
-        // stopped waiting.
-        let failed = failures()
+        let permanent: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM download_subtitle_artifacts WHERE download_id=? AND state='failed')").bind(&id).fetch_one(&app.db).await?;
+        let cached = read_subtitle(&path).await.ok();
+        let recent = failures()
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .get(&path)
             .copied()
             .filter(|(at, _)| *at >= asked);
-        if let Some((_, expired)) = failed {
-            return Err(failure(expired));
+        let cancelled =
+            || crate::api::ApiError::conflict("download_cancelled", "The download was cancelled");
+        match core::subtitle_work(
+            active(&app, &id).await,
+            permanent,
+            cached.is_some(),
+            recent.is_some(),
+        ) {
+            core::SubtitleWork::Cancelled => return Err(cancelled()),
+            core::SubtitleWork::PermanentFailure => {
+                return Err(crate::api::ApiError::new(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "subtitle_conversion_failed",
+                    "The selected subtitle cannot be converted",
+                ));
+            }
+            core::SubtitleWork::ReadArtifact => {
+                let bytes = cached.expect("observed artifact");
+                record_subtitle(&app, &id, Some(&bytes)).await?;
+                return Ok(bytes);
+            }
+            core::SubtitleWork::SharedFailure => {
+                return Err(failure(recent.expect("observed failure").1));
+            }
+            core::SubtitleWork::Convert => {}
         }
         CONVERSIONS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let text =
@@ -1445,27 +1483,23 @@ pub async fn report_transfer(
     .bind(&row.id)
     .fetch_optional(&mut *tx)
     .await?;
-    let transfer_size = core::transfer_bytes(
-        row.size_bytes as u64,
-        row.subtitle_track_id.is_some(),
-        subtitle_size.map(|n| n as u64),
-    );
-    if transfer_size.is_none() && incoming.state == core::TransferState::VerifiedLocal {
-        return Err(Problem::new(
-            StatusCode::CONFLICT,
-            "download_subtitles_unavailable",
-            "Required subtitles have not been prepared",
-        ));
-    }
     let refused =
         |code: &'static str, detail: &str| Problem::new(StatusCode::CONFLICT, code, detail);
-    match core::accept_transfer(
+    match core::accept_transfer_with_artifacts(
         previous.as_ref(),
         &incoming,
         row.revision as u64,
-        transfer_size.unwrap_or(row.size_bytes as u64),
+        row.size_bytes as u64,
+        row.subtitle_track_id.is_some(),
+        subtitle_size.map(|n| n as u64),
         ended,
     ) {
+        Err(core::TransferRefusal::ArtifactsUnavailable) => {
+            return Err(refused(
+                "download_subtitles_unavailable",
+                "Required subtitles have not been prepared",
+            ));
+        }
         Ok(core::TransferDecision::Record) => {
             sqlx::query("INSERT INTO download_transfers(download_id,sequence,download_revision,state,bytes_received,reported_at) VALUES (?,?,?,?,?,?) ON CONFLICT(download_id) DO UPDATE SET sequence=excluded.sequence,download_revision=excluded.download_revision,state=excluded.state,bytes_received=excluded.bytes_received,reported_at=excluded.reported_at")
                 .bind(&row.id)
@@ -1919,26 +1953,19 @@ async fn target(
             .bind(&event.timeline_id)
             .fetch_one(&mut *conn)
             .await?;
-    let duration = match duration.filter(|d| *d > 0) {
-        Some(d) => Some(d),
-        None => sqlx::query_scalar(
-            "SELECT duration_ms FROM downloads WHERE id=? AND device_id=? AND profile_id=? AND timeline_id=?",
-        )
-        .bind(&event.download_id)
-        .bind(device)
-        .bind(profile)
-        .bind(&event.timeline_id)
-        .fetch_optional(&mut *conn)
-        .await?,
+    let pinned = if duration.is_some_and(|d| d > 0) {
+        None
+    } else {
+        sqlx::query_scalar("SELECT duration_ms FROM downloads WHERE id=? AND device_id=? AND profile_id=? AND timeline_id=?")
+            .bind(&event.download_id).bind(device).bind(profile).bind(&event.timeline_id)
+            .fetch_optional(&mut *conn).await?
     };
-    // Without an effective duration the event cannot be validated (an
-    // unknown or foreign download names none): it is not reconcilable here.
-    let Some(duration) = duration.filter(|d| *d > 0) else {
+    let Some(duration) = core::offline_duration(duration, pinned) else {
         return Ok(None);
     };
     Ok(Some(Target {
         timeline_revision: revision as u64,
-        duration_ms: Some(duration as u64),
+        duration_ms: Some(duration),
     }))
 }
 

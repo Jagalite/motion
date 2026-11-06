@@ -451,3 +451,108 @@ pub fn unmatch(state: MatchState) -> MatchState {
         MatchState::Unmatched => MatchState::Unmatched,
     }
 }
+
+pub fn proposal_open(status: Status) -> bool {
+    matches!(status, Status::Pending | Status::Review | Status::Deferred)
+}
+/// History is supplied in durable insertion order, never wall-clock order.
+/// Return exact updates (staling first) and selected/new proposal. Decisions
+/// remain immutable; a competing open proposal prevents reopening old history.
+pub fn reconcile_history(
+    history: &[Proposal],
+    file: &str,
+    revision: &str,
+    candidates: Vec<Candidate>,
+    new_id: Id,
+) -> Result<(Vec<Proposal>, Proposal, bool), MatchError> {
+    let mut observed = history.to_vec();
+    if observed.iter().any(|p| p.file_id != file)
+        || observed.iter().filter(|p| proposal_open(p.status)).count() > 1
+    {
+        return Err(MatchError::StaleProposal);
+    }
+    let mut updates = Vec::new();
+    for proposal in &mut observed {
+        if proposal_open(proposal.status) && proposal.file_revision != revision {
+            *proposal = refresh(proposal, Some(revision), proposal.candidates.clone())?;
+            updates.push(proposal.clone());
+        }
+    }
+    let latest = observed
+        .iter()
+        .rev()
+        .find(|p| proposal_open(p.status))
+        .or_else(|| observed.last());
+    match (proposal_action(latest, revision), latest) {
+        (ProposalAction::Keep, Some(p)) => Ok((updates, p.clone(), false)),
+        (ProposalAction::Refresh, Some(p)) => {
+            let next = refresh(p, Some(revision), candidates)?;
+            if next != *p {
+                updates.push(next.clone());
+            }
+            Ok((updates, next, false))
+        }
+        _ => Ok((
+            updates,
+            propose(new_id, file.into(), revision.into(), candidates)?,
+            true,
+        )),
+    }
+}
+pub fn reopen_with_open(
+    proposal: &Proposal,
+    expected: u64,
+    current: Option<&str>,
+    open: &[Id],
+) -> Result<Proposal, MatchError> {
+    let next = reopen(proposal, expected, current)?;
+    if !open.is_empty() {
+        return Err(MatchError::StaleProposal);
+    }
+    Ok(next)
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LocalCandidateFacts {
+    pub id: Id,
+    pub title: String,
+    pub years: Vec<(String, i64)>,
+}
+pub fn local_candidate_title(parsed: &Parsed, title: &str) -> bool {
+    let wanted = normalize_title(&parsed.title);
+    !wanted.is_empty() && normalize_title(title) == wanted
+}
+/// Local-source year wins, then lexical source order. Candidate order is stable
+/// by work identity, capped only after title/year eligibility is established.
+pub fn local_candidates(parsed: &Parsed, mut facts: Vec<LocalCandidateFacts>) -> Vec<Candidate> {
+    let wanted = normalize_title(&parsed.title);
+    if wanted.is_empty() {
+        return Vec::new();
+    }
+    facts.sort_by(|a, b| a.id.cmp(&b.id));
+    facts
+        .into_iter()
+        .filter_map(|mut fact| {
+            if !local_candidate_title(parsed, &fact.title) {
+                return None;
+            }
+            fact.years
+                .sort_by(|a, b| (a.0 != "local", &a.0).cmp(&(b.0 != "local", &b.0)));
+            let year = fact.years.first().map(|(_, year)| *year);
+            let mut reasons = vec!["title".into()];
+            match (parsed.year, year) {
+                (Some(a), Some(b)) if i64::from(a) == b => reasons.push("year".into()),
+                (Some(_), Some(_)) => return None,
+                _ => {}
+            }
+            Some(Candidate {
+                id: format!("local:{}", fact.id),
+                item_id: Some(fact.id),
+                title: fact.title,
+                external_id: None,
+                reason_codes: reasons,
+            })
+        })
+        .take(MAX_CANDIDATES)
+        .collect()
+}

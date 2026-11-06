@@ -66,10 +66,12 @@ fn expected(s: &State, observation: &SidecarObservation) -> Vec<PublicationEffec
         return vec![];
     }
     let target = &s.works[s.target];
-    if let SidecarObservation::Parsed { external_id, .. } = observation {
-        if target.pinned && target.external.is_some() && target.external != *external_id {
-            return vec![];
-        }
+    if let SidecarObservation::Parsed { external_id, .. } = observation
+        && target.pinned
+        && target.external.is_some()
+        && target.external != *external_id
+    {
+        return vec![];
     }
     let mut effects = Vec::new();
     let mut removed = [false; 2];

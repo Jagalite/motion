@@ -101,12 +101,24 @@ export function createViewingWriter(session, {send, persist, uuid, wait,
 // retried start still names the adopted revision, so any competing start in
 // between fails closed.
 export function adoptableRevision(current, rendered, toleranceMs = 5000) {
-  const revision = typeof current?.revision === 'string' && /^(0|[1-9][0-9]{0,19})$/.test(current.revision);
-  if (!revision || current.watched !== false || current.manual_watched !== null) return null;
-  if (typeof rendered?.ownSession !== 'string' || current.session_id !== rendered.ownSession) return null;
+  if (!viewingAuthorityUnchanged(current, rendered?.manualEpoch, rendered?.ownSession)
+    || current.watched !== false || current.manual_watched !== null) return null;
   if (rendered.sameTab !== true && !['stopped', 'ended'].includes(rendered.ownSessionStatus)) return null;
-  if (current.manual_epoch !== rendered.manualEpoch) return null;
   const renderedResumeMs = rendered.resumeMs;
   if (!Number.isSafeInteger(current.position_ms) || !Number.isSafeInteger(renderedResumeMs)) return null;
   return Math.abs(current.position_ms - renderedResumeMs) <= toleranceMs ? current.revision : null;
+}
+
+// Shared conflict evidence. Operations retain their distinct intent rules:
+// watched marks only require unchanged manual/session authority, while starts
+// additionally require a retired predecessor and compatible resume position.
+function viewingAuthorityUnchanged(current, manualEpoch, session) {
+  return typeof current?.revision === 'string' && /^(0|[1-9][0-9]{0,19})$/.test(current.revision)
+    && BigInt(current.revision) <= 18446744073709551615n
+    && typeof manualEpoch === 'string' && manualEpoch !== ''
+    && typeof session === 'string' && session !== ''
+    && current.manual_epoch === manualEpoch && current.session_id === session;
+}
+export function markRetryRevision(current, renderedManualEpoch, renderedSession) {
+  return viewingAuthorityUnchanged(current, renderedManualEpoch, renderedSession) ? current.revision : null;
 }

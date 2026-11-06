@@ -4,6 +4,25 @@
 //! a position's thumbnail is.
 use serde::{Deserialize, Serialize};
 
+/// Preserve the technical metadata's existing canonical representation. A
+/// rescan changing duration or stream facts changes identity even with identical
+/// file bytes; callers must not independently choose a different serialization.
+pub fn layout_identity(duration: Option<f64>, tracks_json: &str) -> String {
+    use sha2::{Digest, Sha256};
+    format!(
+        "{:x}",
+        Sha256::digest(
+            serde_json::to_vec(&(duration, tracks_json)).expect("serializable preview facts")
+        )
+    )
+}
+
+/// Failure to observe an executing attempt is uncertainty, not permission to
+/// keep rendering. Publication independently rechecks all facts under its writer.
+pub fn rendering_continues(observed_running: Option<bool>) -> bool {
+    observed_running == Some(true)
+}
+
 /// Thumbnail width in pixels; the height follows the picture's shape.
 pub const TILE_WIDTH: u32 = 160;
 /// Thumbnails per sheet, row by row.
@@ -283,6 +302,12 @@ pub fn orphan_cleanup(file: &str, revision: &str, row_present: bool) -> CleanupA
         }
     }
 }
+/// Missing ownership evidence is not evidence of release. The adapter maps a
+/// genuinely missing witness to Some(false), and unreadable evidence to None.
+pub fn staging_owner_held(observed: Option<bool>) -> bool {
+    observed.unwrap_or(true)
+}
+
 /// A staging directory remains while its exact attempt is active or a worker
 /// witness is still held. A malformed attempt uses the adapter's -1 sentinel.
 pub fn staging_cleanup(
@@ -307,6 +332,41 @@ pub fn staging_cleanup(
             attempt: directory_attempt,
         }
     }
+}
+
+/// Identity-bearing durable removal intent. A pending intent is retained until
+/// the adapter acknowledges absence after synchronizing the parent directory.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemovalIntent {
+    pub directory: String,
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RemovalAction {
+    /// A new publication owns this directory; never execute a stale intent.
+    Keep,
+    Remove {
+        directory: String,
+    },
+}
+pub fn plan_removal(
+    intent: &RemovalIntent,
+    publication_references_directory: bool,
+) -> RemovalAction {
+    if publication_references_directory {
+        RemovalAction::Keep
+    } else {
+        RemovalAction::Remove {
+            directory: intent.directory.clone(),
+        }
+    }
+}
+/// Failed, unrelated or unflushed removals cannot consume the durable intent.
+pub fn acknowledge_removal(
+    intent: &RemovalIntent,
+    observed_directory: &str,
+    absence_durable: bool,
+) -> bool {
+    absence_durable && intent.directory == observed_directory
 }
 
 /// Where the thumbnail for `position_ms` is: (sheet, column, row), the
@@ -621,5 +681,21 @@ mod retention_plan_tests {
                 attempt: -1
             }
         );
+    }
+}
+
+#[cfg(test)]
+mod observation_tests {
+    use super::*;
+    #[test]
+    fn technical_identity_and_unknown_running_observation_are_explicit() {
+        let identity = layout_identity(Some(1.0), "[]");
+        assert_eq!(identity, layout_identity(Some(1.0), "[]"));
+        assert_ne!(identity, layout_identity(Some(2.0), "[]"));
+        assert_ne!(identity, layout_identity(Some(1.0), "[{\"index\":0}]"));
+        assert_ne!(identity, layout_identity(None, "[]"));
+        assert!(rendering_continues(Some(true)));
+        assert!(!rendering_continues(Some(false)));
+        assert!(!rendering_continues(None));
     }
 }

@@ -45,7 +45,11 @@ pub(crate) fn recipe(id: &str) -> Option<Value> {
             "v1;mp4;v0-libx264-veryfast-crf23-threads2;yuv420p;scale-min1280x720-aspect-even;a-selected-aac160k;no-subtitles;no-data;metadata-strip;faststart"
         }
     };
-    let backends = if matches!(id, "h264720p" | "video_profile") && cfg!(target_os = "macos") {
+    let backends = if playscale_core::processing::backend_allowed(
+        id,
+        "videotoolbox",
+        cfg!(target_os = "macos"),
+    ) {
         vec!["software", "videotoolbox"]
     } else {
         vec!["software"]
@@ -67,21 +71,13 @@ fn recipe_digest(
     subtitle: bool,
 ) -> Option<String> {
     let descriptor = recipe(id)?;
-    let base = descriptor["digest"].as_str()?;
-    if profile.is_none() && backend == "software" && id != "video_profile" && !subtitle {
-        return Some(base.to_owned());
-    }
-    if (id == "video_profile") != profile.is_some() {
-        return None;
-    }
-    let mut inputs = json!({"semantics":base,"backend":backend,"video_profile":profile});
-    if subtitle {
-        inputs["subtitle"] = json!("selected-text-mov_text");
-    }
-    Some(format!(
-        "sha256:{}",
-        super::sha256(&serde_json::to_vec(&inputs).ok()?)
-    ))
+    playscale_core::processing::recipe_identity(
+        id,
+        descriptor["digest"].as_str()?,
+        backend,
+        profile.map(serde_json::to_value).transpose().ok()?,
+        subtitle,
+    )
 }
 fn software_backend() -> String {
     "software".into()
@@ -417,16 +413,13 @@ pub(crate) async fn output_rendition_status(
 }
 
 pub(crate) async fn selection(
-    app: &App,
+    _app: &App,
     conn: &mut sqlx::SqliteConnection,
     timeline: &str,
     source: &FileRef,
     streams: &[crate::db::Track],
     requested: Tracks,
 ) -> Result<Tracks, Problem> {
-    use playscale_core::components::{
-        Kind, SubtitleOccurrence, embedded_track, subtitle_occurrence,
-    };
     let version: String = sqlx::query_scalar(
         "SELECT v.id FROM version_files b JOIN media_versions v ON v.id=b.version_id \
          WHERE v.timeline_id=? AND b.file_id=? AND b.file_revision=? AND v.origin='original' \
@@ -439,101 +432,53 @@ pub(crate) async fn selection(
     .await?;
     let components =
         if requested.audio_component_id.is_some() || requested.subtitle_component_id.is_some() {
-            crate::components::timeline_components(&app.db, timeline)
+            crate::components::timeline_components_in(conn, timeline)
                 .await
                 .map_err(Problem::internal)?
         } else {
             vec![]
         };
-    let ordinal = |kind: &str, index: i64| -> Option<u32> {
-        streams
+    use playscale_core::processing::{PreparationSelection, PreparationStream, SelectionRefusal};
+    let selected = playscale_core::processing::preparation_selection(
+        &PreparationSelection {
+            audio_track: requested.audio_track_id.clone(),
+            subtitle_track: requested.subtitle_track_id.clone(),
+            audio_component: requested.audio_component_id.clone(),
+            subtitle_component: requested.subtitle_component_id.clone(),
+        },
+        &streams
             .iter()
-            .filter(|t| t.kind == kind)
-            .position(|t| t.index == index)
-            .map(|i| i as u32)
-    };
-    let unavailable = || {
-        Problem::invalid(
+            .map(|t| PreparationStream {
+                index: t.index,
+                kind: t.kind.clone(),
+                codec: t.codec.clone(),
+            })
+            .collect::<Vec<_>>(),
+        &components,
+        &version,
+        &source.file_id,
+        &source.file_revision,
+    )
+    .map_err(|reason| match reason {
+        SelectionRefusal::UnknownTrack => {
+            Problem::invalid("unknown_track", "The selected track does not exist")
+        }
+        SelectionRefusal::ComponentUnavailable => Problem::invalid(
             "component_unavailable",
             "The component does not occur in this source revision",
-        )
-    };
-    let conflict = || {
-        Problem::invalid(
+        ),
+        SelectionRefusal::ConflictingPins => Problem::invalid(
             "track_component_conflict",
             "The track and component pins disagree",
-        )
-    };
-    let count = |kind: &str| streams.iter().filter(|t| t.kind == kind).count();
-    let audio_track = super::playback::track_index(&requested.audio_track_id, 'a', count("audio"))?;
-    let audio_component = match &requested.audio_component_id {
-        None => None,
-        Some(id) => Some(
-            embedded_track(
-                &components,
-                id,
-                Kind::Audio,
-                &version,
-                &source.file_id,
-                &source.file_revision,
-            )
-            .and_then(|index| ordinal("audio", index))
-            .ok_or_else(unavailable)?,
         ),
-    };
-    if audio_track
-        .zip(audio_component)
-        .is_some_and(|(a, b)| a != b)
-    {
-        return Err(conflict());
-    }
-    let subtitle_track =
-        super::playback::track_index(&requested.subtitle_track_id, 's', count("subtitle"))?;
-    let subtitle_component = match &requested.subtitle_component_id {
-        None => None,
-        Some(id) => match subtitle_occurrence(
-            &components,
-            id,
-            &version,
-            &source.file_id,
-            &source.file_revision,
-        ) {
-            Some(SubtitleOccurrence::Embedded(index)) => {
-                Some(ordinal("subtitle", index).ok_or_else(unavailable)?)
-            }
-            Some(SubtitleOccurrence::Sidecar(_)) => {
-                return Err(Problem::invalid(
-                    "preparation_subtitle_unsupported",
-                    "A preparation keeps only an embedded text subtitle",
-                ));
-            }
-            None => return Err(unavailable()),
-        },
-    };
-    if subtitle_track
-        .zip(subtitle_component)
-        .is_some_and(|(a, b)| a != b)
-    {
-        return Err(conflict());
-    }
-    let subtitle = subtitle_track.or(subtitle_component);
-    // Only text survives as an MP4 subtitle (mov_text) without changing its
-    // meaning; bitmap and styled subtitles would need burning in.
-    if let Some(n) = subtitle
-        && !streams
-            .iter()
-            .filter(|t| t.kind == "subtitle")
-            .nth(n as usize)
-            .is_some_and(|t| playscale_core::delivery::sidecar_subtitle(&t.codec))
-    {
-        return Err(Problem::invalid(
+        SelectionRefusal::UnsupportedSubtitle => Problem::invalid(
             "preparation_subtitle_unsupported",
             "A preparation keeps only an embedded text subtitle (SubRip, mov_text or WebVTT)",
-        ));
-    }
+        ),
+    })?;
     Ok(Tracks {
-        audio_track_id: audio_track.or(audio_component).map(|n| format!("a{n}")),
-        subtitle_track_id: subtitle.map(|n| format!("s{n}")),
+        audio_track_id: selected.audio.map(|n| format!("a{n}")),
+        subtitle_track_id: selected.subtitle.map(|n| format!("s{n}")),
         ..requested
     })
 }
@@ -547,14 +492,13 @@ async fn prepare(
     caller.require(Permission::ProcessingRequest)?;
     let key = idempotency_key(&headers)?;
     let input = body.value;
-    let recipe = recipe(&input.recipe_id)
+    recipe(&input.recipe_id)
         .ok_or_else(|| Problem::invalid("unknown_recipe", "Select a listed recipe"))?;
-    if !recipe["allowed_backends"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|b| b.as_str() == Some(&input.backend))
-    {
+    if !playscale_core::processing::backend_allowed(
+        &input.recipe_id,
+        &input.backend,
+        cfg!(target_os = "macos"),
+    ) {
         return Err(Problem::invalid(
             "unsupported_backend",
             "Select a recipe backend supported on this platform",
@@ -661,17 +605,14 @@ async fn prepare(
     }
     let tracks: Vec<crate::db::Track> =
         serde_json::from_str(&source.tracks_json).map_err(Problem::internal)?;
-    if matches!(input.recipe_id.as_str(), "h264720p" | "video_profile")
-        && !tracks.iter().find(|t| t.kind == "video").is_some_and(|t| {
-            t.kind == "video"
-                && t.width.is_some()
-                && t.height.is_some()
-                && !matches!(
-                    t.color_transfer.as_deref(),
-                    Some("smpte2084" | "arib-std-b67")
-                )
-        })
-    {
+    if !playscale_core::processing::video_source_eligible(
+        playscale_core::processing::SourceContract::Preparation,
+        &input.recipe_id,
+        tracks
+            .iter()
+            .find(|t| t.kind == "video")
+            .map(|t| (t.width, t.height, t.color_transfer.as_deref())),
+    ) {
         return Err(Problem::invalid(
             "preparation_video_unsupported",
             "Video preparation requires a probed SDR video stream with known dimensions",

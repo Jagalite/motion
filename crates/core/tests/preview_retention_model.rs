@@ -12,6 +12,7 @@ struct State {
     row: bool,
     directory: bool,
     current: bool,
+    pending: bool,
     staging: bool,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -19,10 +20,13 @@ enum Input {
     Invalidate,
     Sweep {
         commit: bool,
-        removal_ok: bool,
     },
-    Orphan {
+    Orphan,
+    StaleIntent,
+    Remove {
         removal_ok: bool,
+        acknowledge: bool,
+        matching_identity: bool,
     },
     Staging {
         live: bool,
@@ -51,7 +55,7 @@ impl Model for Retention {
     fn metadata(&self) -> ModelMetadata {
         ModelMetadata {
             name: "playscale.preview_retention".into(),
-            model_version: 1,
+            model_version: 2,
             properties_version: 1,
             codec_version: 1,
             build: include_str!("../src/previews.rs").into(),
@@ -62,6 +66,7 @@ impl Model for Retention {
             row: true,
             directory: true,
             current: true,
+            pending: false,
             staging: true,
         })
     }
@@ -74,7 +79,8 @@ impl Model for Retention {
         };
         match *i {
             Input::Invalidate => n.current = false,
-            Input::Sweep { commit, removal_ok } => {
+            Input::StaleIntent => n.pending = true,
+            Input::Sweep { commit } => {
                 let observed = RetentionObservation {
                     artifact: artifact(),
                     current_layout_identity: if s.current { Some("l".into()) } else { None },
@@ -90,19 +96,39 @@ impl Model for Retention {
                 {
                     n.row = false;
                     out.withdrew = true;
-                    out.remove_directory = true;
-                    if removal_ok {
-                        n.directory = false;
-                    }
+                    n.pending = true;
                 }
             }
-            Input::Orphan { removal_ok } => {
+            Input::Orphan => {
                 if s.directory
                     && matches!(previews::orphan_cleanup("f", "r", s.row), previews::CleanupAction::RemoveOrphan { file, revision } if file == "f" && revision == "r")
+                {
+                    n.pending = true;
+                }
+            }
+            Input::Remove {
+                removal_ok,
+                acknowledge,
+                matching_identity,
+            } => {
+                let intent = previews::RemovalIntent {
+                    directory: "f/r".into(),
+                };
+                if s.pending
+                    && matches!(previews::plan_removal(&intent, s.row), previews::RemovalAction::Remove { directory } if directory == "f/r")
                 {
                     out.remove_directory = true;
                     if removal_ok {
                         n.directory = false;
+                    }
+                    if acknowledge
+                        && previews::acknowledge_removal(
+                            &intent,
+                            if matching_identity { "f/r" } else { "other/r" },
+                            removal_ok,
+                        )
+                    {
+                        n.pending = false;
                     }
                 }
             }
@@ -145,21 +171,31 @@ impl Model for Retention {
         };
         match *i {
             Input::Invalidate => expected.current = false,
-            Input::Sweep { commit, removal_ok } => {
+            Input::StaleIntent => expected.pending = true,
+            Input::Sweep { commit } => {
                 if s.row && (!s.current || !s.directory) && commit {
                     expected.row = false;
                     out.withdrew = true;
+                    expected.pending = true;
+                }
+            }
+            Input::Orphan => {
+                if s.directory && !s.row {
+                    expected.pending = true;
+                }
+            }
+            Input::Remove {
+                removal_ok,
+                acknowledge,
+                matching_identity,
+            } => {
+                if s.pending && !s.row {
                     out.remove_directory = true;
                     if removal_ok {
                         expected.directory = false;
                     }
-                }
-            }
-            Input::Orphan { removal_ok } => {
-                if s.directory && !s.row {
-                    out.remove_directory = true;
-                    if removal_ok {
-                        expected.directory = false;
+                    if removal_ok && acknowledge && matching_identity {
+                        expected.pending = false;
                     }
                 }
             }
@@ -189,14 +225,20 @@ impl Model for Retention {
 }
 impl Enumerate for Retention {
     fn inputs(&self, _: &State) -> Result<Vec<Input>, ModelError> {
-        let mut v = vec![Input::Invalidate];
+        let mut v = vec![Input::Invalidate, Input::Orphan, Input::StaleIntent];
         for commit in [false, true] {
-            for removal_ok in [false, true] {
-                v.push(Input::Sweep { commit, removal_ok });
-            }
+            v.push(Input::Sweep { commit });
         }
         for removal_ok in [false, true] {
-            v.push(Input::Orphan { removal_ok });
+            for acknowledge in [false, true] {
+                for matching_identity in [false, true] {
+                    v.push(Input::Remove {
+                        removal_ok,
+                        acknowledge,
+                        matching_identity,
+                    });
+                }
+            }
             for live in [false, true] {
                 for witness in [false, true] {
                     v.push(Input::Staging {
@@ -239,7 +281,7 @@ fn bounded_withdrawal_retries_failed_cleanup() {
         &Retention,
         stateless::explore::SearchConfig {
             max_states: 100,
-            max_transitions: 2000,
+            max_transitions: 4000,
             max_depth: 10,
         },
     )

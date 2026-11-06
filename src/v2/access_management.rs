@@ -117,32 +117,15 @@ pub(super) async fn validate_grant(
     grant: &Grant,
     policy: &Policy,
 ) -> Result<(), Problem> {
-    if policy.deny_rated && !policy.allowed_ratings.is_empty() {
-        return Err(Problem::invalid(
-            "invalid_field",
-            "Denying rated content requires an empty rating allowlist",
-        ));
-    }
-    identity::valid_ids(
-        "profile_ids",
-        &grant.profile_ids.iter().cloned().collect::<Vec<_>>(),
-    )?;
-    identity::valid_ids(
-        "library_ids",
-        &policy.library_ids.iter().cloned().collect::<Vec<_>>(),
-    )?;
-    if policy.allowed_ratings.len() > 200 || policy.blocked_labels.len() > admin::MAX_BLOCKED_LABELS
+    if !playscale_core::access::policy_shape_valid(policy, grant.permissions.len())
+        || !playscale_core::access::reference_ids_valid(
+            grant.profile_ids.iter().map(String::as_str),
+        )
     {
         return Err(Problem::invalid(
             "invalid_field",
-            "Too many rating or label restrictions",
+            "Access policy identifiers, ratings, labels or permissions are invalid",
         ));
-    }
-    for rating in &policy.allowed_ratings {
-        identity::bounded("rating", rating, 1, 64)?;
-    }
-    for label in &policy.blocked_labels {
-        identity::bounded("label", label, 1, 100)?;
     }
     if identity::existing_profiles(conn, &grant.profile_ids).await? != grant.profile_ids {
         return Err(AccessError::UnknownProfile.into());
@@ -555,17 +538,17 @@ pub async fn list_pairings(
                  phase,
                  denied,
              }| {
-                let status = if denied {
-                    "denied"
-                } else if phase == "claimed" {
-                    "claimed"
-                } else if now() >= expires {
-                    "expired"
-                } else if phase == "approved" {
-                    "approved"
-                } else {
-                    "pending"
+                let phase = match phase.as_str() {
+                    "claimed" => playscale_core::access::PairingPhase::Claimed {
+                        device_id: String::new(),
+                        generation: 0,
+                    },
+                    "approved" => playscale_core::access::PairingPhase::Approved {
+                        device_id: String::new(),
+                    },
+                    _ => playscale_core::access::PairingPhase::Pending,
                 };
+                let status = playscale_core::access::pairing_status(&phase, denied, expires, now());
                 (
                     id.clone(),
                     PairingSummary {
@@ -633,7 +616,7 @@ pub(super) struct InviteRow {
     profile_ids: String,
     permissions: String,
     policy: String,
-    created_at: i64,
+    pub(super) created_at: i64,
     expires_at: i64,
     revision: i64,
     revoked: bool,
@@ -704,19 +687,7 @@ fn invite_body(
         revision: row.revision.to_string(),
         created_at: timestamp(row.created_at),
         expires_at: timestamp(row.expires_at),
-        status: if row.revoked {
-            "revoked"
-        } else if row.identity_id.is_some() {
-            "registered"
-        } else if row.device_id.is_some() {
-            "claimed"
-        } else if now() >= row.expires_at {
-            "expired"
-        } else if !available {
-            "invalidated"
-        } else {
-            "unused"
-        },
+        status: admin::invitation_status(&inv, available, now()),
         profile_ids: inv.grant.profile_ids,
         permissions: inv.grant.permissions,
         policy: inv.policy,
@@ -730,8 +701,12 @@ pub(super) async fn issuer_current(
     row: &InviteRow,
 ) -> Result<bool, Problem> {
     if row.issuer_id == "operator" {
-        return Ok(row.issuer_credential_hash.as_deref()
-            == Some(auth::token_hash(&app.admin_token).as_str()));
+        return Ok(admin::invitation_issuer_current(
+            admin::InvitationIssuer::Operator {
+                recorded_hash: row.issuer_credential_hash.as_deref(),
+                current_hash: &auth::token_hash(&app.admin_token),
+            },
+        ));
     }
     let Some(hash) = &row.issuer_credential_hash else {
         return Ok(false);
@@ -740,9 +715,13 @@ pub(super) async fn issuer_current(
         return Ok(false);
     };
     match auth::authenticate_stored(conn, &stored, now()).await {
-        Ok((p, _)) => Ok(p.id == row.issuer_id
-            && p.policy_revision == row.issuer_revision as u64
-            && p.is_admin()),
+        Ok((p, _)) => Ok(admin::invitation_issuer_current(
+            admin::InvitationIssuer::Administrator {
+                recorded_id: &row.issuer_id,
+                recorded_revision: u64::try_from(row.issuer_revision).unwrap_or(0),
+                current: Some(&p),
+            },
+        )),
         Err(e) if e.status == StatusCode::UNAUTHORIZED => Ok(false),
         Err(e) => Err(e),
     }
@@ -829,11 +808,11 @@ pub async fn create_invitation(
             .bind(id)
             .fetch_one(&mut *tx)
             .await?;
-        if row.revoked
-            || row.device_id.is_some()
-            || now() >= row.expires_at
-            || !invitation_available(&app, &mut tx, &row).await?
-        {
+        if !admin::replay_invitation_creation(
+            &row.invitation()?,
+            invitation_available(&app, &mut tx, &row).await?,
+            now(),
+        ) {
             return Err(AccessError::ReplayUnavailable.into());
         }
         let nonce = stored

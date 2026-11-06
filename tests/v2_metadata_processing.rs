@@ -2928,3 +2928,83 @@ async fn metadata_validator_is_fenced_by_restore_history() {
             .unwrap();
     assert_eq!(count, 0);
 }
+
+#[tokio::test]
+async fn preparation_component_selection_uses_the_reserved_pool_connection() {
+    let f = Fixture::new().await;
+    sqlx::query("UPDATE media_files SET duration_seconds=10,tracks_json=? WHERE id='file-a'")
+        .bind(json!([{"index":1,"kind":"audio","codec":"aac","language":"eng"}]).to_string())
+        .execute(&f.app.db)
+        .await
+        .unwrap();
+    let components = playscale::components::timeline_components(&f.app.db, "ed-film-a")
+        .await
+        .unwrap();
+    let audio = components
+        .iter()
+        .find(|c| c.kind == playscale_core::components::Kind::Audio)
+        .unwrap();
+    let input = json!({"source":{"file_id":"file-a","file_revision":"rev-a"},"timeline_id":"ed-film-a","recipe_id":"remux_mp4","tracks":{"audio_component_id":audio.id,"subtitle_component_id":null,"subtitle_policy":"off","audio_track_id":"a0","subtitle_track_id":null}});
+    let op = format!("Bearer {OPERATOR}");
+    let headers = [
+        ("authorization", op.as_str()),
+        ("idempotency-key", "single-slot-preparation-0001"),
+    ];
+    let mut occupied = Vec::new();
+    for _ in 0..3 {
+        occupied.push(f.app.db.acquire().await.unwrap());
+    }
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        f.call(
+            "POST",
+            "/api/v2/processing/preparations",
+            Some(input),
+            &headers,
+        ),
+    )
+    .await
+    .expect("preparation must not acquire a second connection while holding the writer");
+    assert_eq!(result.status, StatusCode::ACCEPTED, "{}", result.body);
+}
+
+#[tokio::test]
+async fn backup_cleanup_cursor_passes_five_hundred_failed_removals() {
+    let f = Fixture::new().await;
+    let root = f.app.storage.root.join("backups");
+    std::fs::create_dir_all(&root).unwrap();
+    let mut tx = f.app.db.begin().await.unwrap();
+    for n in 0..501 {
+        let id = format!("fair-{n:03}");
+        sqlx::query("INSERT INTO backup_jobs(id,phase,requester_id,include_generated_media,created_at,error) VALUES (?,'completed','operator',0,0,'backup_expired')")
+            .bind(&id).execute(&mut *tx).await.unwrap();
+        let directory = root.join(format!("request-{id}"));
+        std::fs::create_dir(&directory).unwrap();
+        // The first 500 are deliberately unowned and must not be deleted.
+        if n == 500 {
+            std::fs::write(
+                directory.join(".playscale-backup"),
+                b"playscale-scheduled-v1",
+            )
+            .unwrap();
+        }
+    }
+    tx.commit().await.unwrap();
+    assert!(!playscale::v2::admin::run_backup(&f.app).await.unwrap());
+    assert!(root.join("request-fair-500").exists());
+    let cursor: String =
+        sqlx::query_scalar("SELECT after_id FROM backup_cleanup_cursor WHERE singleton=1")
+            .fetch_one(&f.app.db)
+            .await
+            .unwrap();
+    assert_eq!(cursor, "fair-499");
+    // The next tick resumes from durable progress despite all earlier failures.
+    assert!(!playscale::v2::admin::run_backup(&f.app).await.unwrap());
+    assert!(!root.join("request-fair-500").exists());
+    assert!(root.join("request-fair-000").exists());
+    let marker: String = sqlx::query_scalar("SELECT error FROM backup_jobs WHERE id='fair-500'")
+        .fetch_one(&f.app.db)
+        .await
+        .unwrap();
+    assert_eq!(marker, "backup_reclaimed");
+}

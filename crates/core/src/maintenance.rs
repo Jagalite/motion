@@ -178,3 +178,265 @@ mod tests {
         assert_eq!(next_run(9_000, &short, 10_000, RunOutcome::Blocked), 10_060);
     }
 }
+
+/// Durable availability of an owned backup. Filesystem deletion must follow a
+/// committed withdrawal; only a durable absence acknowledgment permits reclaim.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum BackupAvailability {
+    Ready,
+    Withdrawn,
+    Reclaimed,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum BackupRetentionInput {
+    Expire,
+    RemovalFailed,
+    DurableAbsence,
+}
+impl BackupAvailability {
+    pub fn transition(self, input: BackupRetentionInput) -> Self {
+        match (self, input) {
+            (Self::Ready, BackupRetentionInput::Expire) => Self::Withdrawn,
+            (Self::Withdrawn, BackupRetentionInput::DurableAbsence) => Self::Reclaimed,
+            _ => self,
+        }
+    }
+    pub fn marker(self) -> Option<&'static str> {
+        match self {
+            Self::Ready => None,
+            Self::Withdrawn => Some("backup_expired"),
+            Self::Reclaimed => Some("backup_reclaimed"),
+        }
+    }
+    pub fn from_marker(marker: Option<&str>) -> Option<Self> {
+        match marker {
+            None => Some(Self::Ready),
+            Some("backup_expired") => Some(Self::Withdrawn),
+            Some("backup_reclaimed") => Some(Self::Reclaimed),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HistoryKind {
+    Job,
+    Playback,
+    Processing,
+}
+/// Adapters gather references while holding their writer transaction. A terminal
+/// row's age never overrides a viewing barrier, preparation or unreclaimed cache.
+pub fn prune_history(
+    kind: HistoryKind,
+    phase: &str,
+    timestamp: i64,
+    cutoff: i64,
+    referenced: bool,
+    cache_cleaned: bool,
+) -> bool {
+    timestamp < cutoff
+        && !referenced
+        && match kind {
+            HistoryKind::Job => matches!(phase, "completed" | "failed" | "cancelled"),
+            HistoryKind::Playback => {
+                matches!(phase, "ended" | "stopped" | "superseded" | "invalidated")
+            }
+            HistoryKind::Processing => {
+                cache_cleaned && matches!(phase, "completed" | "failed" | "cancelled")
+            }
+        }
+}
+
+/// The shipped 0058 migration remains unchanged. This is its reference contract
+/// for conformance fixtures and any future forward repair.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LegacyOwnership {
+    Retain,
+    DetachAndDelete,
+}
+pub fn legacy_ownership(
+    legacy: bool,
+    synthetic_device_identity: bool,
+    device_count: usize,
+    invitation_reference: bool,
+) -> LegacyOwnership {
+    if legacy && synthetic_device_identity && device_count == 1 && !invitation_reference {
+        LegacyOwnership::DetachAndDelete
+    } else {
+        LegacyOwnership::Retain
+    }
+}
+
+/// A revision-bound dispatch batch is committed atomically with its jobs. A
+/// blocked first candidate preserves the old cursor instead of skipping work.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CursorUpdate {
+    Preserve,
+    Clear,
+    Advance(String),
+}
+pub fn dispatch_cursor(
+    expected_revision: i64,
+    current_revision: i64,
+    more: bool,
+    last_dispatched: Option<&str>,
+) -> Option<CursorUpdate> {
+    if expected_revision != current_revision {
+        return None;
+    }
+    Some(if !more {
+        CursorUpdate::Clear
+    } else {
+        last_dispatched
+            .map(|s| CursorUpdate::Advance(s.to_owned()))
+            .unwrap_or(CursorUpdate::Preserve)
+    })
+}
+
+/// Shared authority-withdrawal inventory consumed by both restore adapters.
+/// SQL mechanics are declarative adapter data, not executed by this core.
+pub const RESTORE_AUTHORITY: &str = include_str!("../../../scripts/restore-authority.json");
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct RestoreProgress {
+    pub snapshot_verified: bool,
+    pub history_rotated: bool,
+    pub authority_withdrawn: bool,
+    pub baseline_captured: bool,
+    pub database_durable: bool,
+}
+impl RestoreProgress {
+    pub fn publishable(self, has_identity: bool) -> bool {
+        self.snapshot_verified
+            && self.database_durable
+            && (!has_identity
+                || (self.history_rotated && self.authority_withdrawn && self.baseline_captured))
+    }
+}
+pub fn capture_baseline(current_epoch: &str, baseline_epoch: Option<&str>, captured: bool) -> bool {
+    !captured && baseline_epoch == Some(current_epoch)
+}
+
+/// Reference policy for migration0037's conservative smart-collection revision
+/// contract. Storage triggers remain authoritative and are checked separately.
+pub fn smart_collection_invalidated(topic: &str, resource: &str, profile: Option<&str>) -> bool {
+    matches!(
+        topic,
+        "catalog" | "metadata" | "libraries" | "sources" | "devices" | "profiles"
+    ) || (topic == "viewing" && profile == Some(resource))
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AutomaticBackup {
+    Ignore,
+    RemoveAbandoned,
+    RetainCandidate,
+}
+pub fn automatic_backup(
+    owned: bool,
+    automatic_name: bool,
+    partial: bool,
+    age_seconds: u64,
+    manifest_valid: bool,
+    retention_enabled: bool,
+) -> AutomaticBackup {
+    if !owned || !automatic_name {
+        AutomaticBackup::Ignore
+    } else if partial {
+        if age_seconds > 86400 {
+            AutomaticBackup::RemoveAbandoned
+        } else {
+            AutomaticBackup::Ignore
+        }
+    } else if retention_enabled && manifest_valid {
+        AutomaticBackup::RetainCandidate
+    } else {
+        AutomaticBackup::Ignore
+    }
+}
+pub fn retain_backup_rank(newest_first_rank: usize, keep: usize) -> bool {
+    newest_first_rank < keep
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PreparationFileDependency<'a> {
+    pub revision: &'a str,
+    pub available: bool,
+    pub library: &'a str,
+    pub edition: Option<&'a str>,
+}
+pub fn preparation_file_invalidated(
+    before: &PreparationFileDependency<'_>,
+    after: &PreparationFileDependency<'_>,
+    references_file: bool,
+) -> bool {
+    references_file && before != after
+}
+
+/// A schedule retains no authority of its own: every dispatch reobserves the
+/// requester and task-specific capabilities within the writer transaction.
+pub fn schedule_admitted(
+    task: &str,
+    current_owner: bool,
+    library_scope: bool,
+    sources_manage: bool,
+    catalog_write: bool,
+    processing_request: bool,
+) -> bool {
+    current_owner
+        && library_scope
+        && sources_manage
+        && match task {
+            "scan" => true,
+            "metadata_refresh" => catalog_write,
+            "preview" => processing_request,
+            _ => false,
+        }
+}
+/// Per-candidate observations made under the dispatch writer transaction.
+/// Existing/invalid/unauthorized candidates are consumed, but queue pressure
+/// must retain the first undispatched identity for the next tick.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum DispatchCandidate {
+    Queue,
+    Skip,
+    Full,
+}
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct DispatchBatch {
+    pub last: Option<String>,
+    pub more: bool,
+    pub blocked: bool,
+    pub queued: Vec<String>,
+}
+impl DispatchBatch {
+    pub fn new(more: bool) -> Self {
+        Self {
+            last: None,
+            more,
+            blocked: false,
+            queued: Vec::new(),
+        }
+    }
+    /// Returns the exact insert effect. The caller commits it in the same
+    /// transaction as `cursor`; rollback discards both effects and progress.
+    pub fn candidate(&mut self, id: &str, observation: DispatchCandidate) -> bool {
+        if self.blocked {
+            return false;
+        }
+        if observation == DispatchCandidate::Full {
+            self.more = true;
+            self.blocked = true;
+            return false;
+        }
+        self.last = Some(id.to_owned());
+        if observation == DispatchCandidate::Queue {
+            self.queued.push(id.to_owned());
+            true
+        } else {
+            false
+        }
+    }
+    pub fn cursor(&self, expected: i64, current: i64) -> Option<CursorUpdate> {
+        dispatch_cursor(expected, current, self.more, self.last.as_deref())
+    }
+}

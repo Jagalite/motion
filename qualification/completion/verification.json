@@ -1,0 +1,223 @@
+{
+  "as_of_utc": "2026-11-02T09:04:41.522166+00:00",
+  "base_revision": "6edaa2d59822bdba1a1eb2c20843588a6fd7d22b",
+  "audit_ids": 73,
+  "runtime": "Linux x86_64; Rust 1.98.0 candidate / Rust 1.95.0 released baseline; FFmpeg 7.1.5; debug profile without debug symbols; incremental disabled",
+  "candidate": {
+    "playscale": {
+      "path": "playscale",
+      "bytes": 133912672,
+      "sha256": "a76a2172dd4ad9538f2bdd3b8964676661846330b328d8409b727476508bd3d6"
+    },
+    "motion-ui-host": {
+      "path": "motion-ui-host",
+      "bytes": 32434288,
+      "sha256": "78570a43b535af58167cd1c1a86988db4c5b53b10ff2eaa8c5f9900f39c2681f"
+    }
+  },
+  "baseline": {
+    "revision": "52491bf3e6ef323a33dd546687129bdb3b51d4d1",
+    "binary": "playscale",
+    "binary_sha256": "11419e29abfe76a1a6d016755e48dc7b6003e63f13d0fc69f2ca012d107ab825",
+    "binary_bytes": 35962464,
+    "compiler": "rustc 1.95.0 (59807616e 2026-04-14)",
+    "profile": "dev unoptimized debug0 incremental0 jobs2",
+    "source_inventory": "source-inventory.json",
+    "build_log": "build.log",
+    "build_exit": 0,
+    "candidate_binary_sha256": "a76a2172dd4ad9538f2bdd3b8964676661846330b328d8409b727476508bd3d6",
+    "captured_utc": "2026-11-02T05:36:02Z"
+  },
+  "checks": {
+    "fast": {
+      "status": "passed",
+      "passed": 899,
+      "failed": 0,
+      "ignored": 0
+    },
+    "clippy": {
+      "status": "passed",
+      "allowed_lints": [
+        "clippy::too_many_arguments",
+        "clippy::result_large_err"
+      ]
+    },
+    "format": {
+      "status": "passed"
+    },
+    "node": {
+      "status": "passed",
+      "passed": 203,
+      "failed": 0,
+      "skipped": 0
+    },
+    "integration": {
+      "status": "passed",
+      "checks": 16
+    },
+    "upgrade_restore": {
+      "status": "passed"
+    },
+    "live_media": {
+      "status": "passed",
+      "delivery": 11,
+      "playback": 40,
+      "failed": 0,
+      "ignored": 0
+    },
+    "full": {
+      "status": "passed",
+      "delivery_model_passed": 6,
+      "access_model_passed": 7,
+      "downloads_model": {
+        "termination": "GraphExhausted",
+        "states": 4765164,
+        "transitions": 76242624,
+        "skipped_checks": 0,
+        "seconds": 2305.34
+      },
+      "remaining": "native macOS arm64 package; authorized remote CI",
+      "initial_terminal": "exit 1: original media fixture failures subsequently fixed/passed, downloads SIGKILL; access/delivery/timeline/work models passed",
+      "representation_fix": {
+        "scope": "downloads_model.rs only; no production/dependency/domain/bound changes",
+        "review": "independent source review found no semantic blocker; strong interner retention remains a runtime consideration",
+        "parity": {
+          "depth": 5,
+          "states": 2453,
+          "transitions": 8768,
+          "termination": "DepthBound",
+          "skipped_checks": 0
+        },
+        "full_bounds": {
+          "states": 12000000,
+          "transitions": 200000000,
+          "depth": 100
+        },
+        "per_edge": "assert complete successor equality with original model; allocation-free exhaustive 21-field value comparison"
+      },
+      "shared_v1": {
+        "status": "passed",
+        "tests": 75,
+        "elapsed_seconds": 6306.2,
+        "ci_budget_seconds": 5400,
+        "budget_met": false,
+        "downloads_states": 4765164,
+        "downloads_transitions": 76242624,
+        "downloads_seconds": 3765.71
+      },
+      "cache_optimization": {
+        "commit": "5e73ec4f6c7428f41be3ca1c3cdf6033275201a0",
+        "source_sha256": "74d5b6d3c69b2c30c5a6a135167b64c07b56d3b0dabf8012556a892c7e659efc",
+        "profile": "unchanged unoptimized debug",
+        "scope": "test-only exact two-entry cache, borrowed intern lookup and allocation-free 21-field equality",
+        "independent_review": "no semantic blocker; every field, exact cache key, retained values, codecs and original bounds checked",
+        "targeted_passed": 8,
+        "full_exhaustive_filtered_in_targeted_run": true
+      },
+      "passed": 77,
+      "failed": 0,
+      "ignored": 0,
+      "elapsed_seconds": 4837.5,
+      "ci_budget_seconds": 5400,
+      "local_budget_met": true,
+      "remote_ci": "not run",
+      "children_peak_rss_bytes": 2668851200,
+      "sampled_aggregate_peak_rss_bytes": 2791112704,
+      "minimum_available_bytes": 2648027136,
+      "graphs": {
+        "access": [
+          674980,
+          12731599
+        ],
+        "delivery_playhead": [
+          2611,
+          107505
+        ],
+        "delivery_window": [
+          329040,
+          9193372
+        ],
+        "delivery_lifecycle": [
+          586804,
+          32957279
+        ],
+        "downloads": [
+          4765164,
+          76242624
+        ],
+        "timeline_viewing": [
+          1890681,
+          52877296
+        ],
+        "work": [
+          576828,
+          15254640
+        ]
+      },
+      "graph_termination": "GraphExhausted, zero skipped checks; representation prefix separately DepthBound"
+    },
+    "native_package": {
+      "status": "blocked",
+      "reason": "Official builder requires native macOS arm64; current Linux x86_64",
+      "portable_helpers_passed": 17
+    }
+  },
+  "log_receipts": {
+    "fast": {
+      "name": "motion-fast-tier-final.log",
+      "sha256": "55fce40115de4b02eefad7dc3f0f4a2f489fd04cf40df424786cc42bd021b249",
+      "complete": true
+    },
+    "clippy": {
+      "name": "motion-clippy-budget-model-final.log",
+      "sha256": "8a497ebb5b20f15895315b43aadc012a467eb627de38b4785266449c7970fa49",
+      "complete": true
+    },
+    "node": {
+      "name": "motion-node-final.log",
+      "sha256": "de4b85669410c39e34a2f9af733dd9c7034a49cff784de5a18e2cdcf09bf0478",
+      "complete": true
+    },
+    "integration": {
+      "name": "motion-integration-final.log",
+      "sha256": "28e00037bff506be14f9c90a26dc61a8f3330480cd9d6c8b83b0362357e0a7ed",
+      "complete": true
+    },
+    "upgrade_restore": {
+      "name": "motion-upgrade-final.log",
+      "sha256": "ab859681b8a5d4cd53a49e3518e60cb48d9fd3732008fac7c4d1e25f62a0c1cc",
+      "complete": true
+    },
+    "live_media": {
+      "name": "motion-playback-fixed.log",
+      "sha256": "a9f432d0203feec56fac47f25f568a42fab6e59291f5dad024219924f489e40d",
+      "complete": true
+    },
+    "full_initial": {
+      "name": "motion-full-tier.log",
+      "sha256": "022d91f3ff89860c6bee513673b84db0e3ce0db931b2545f2b38cddfa9ff0905",
+      "complete": true
+    },
+    "full_shared_v1": {
+      "name": "motion-full-tier-final.log",
+      "sha256": "4e603188c327ce42ab9d4342e8582784fe7b161d57799c2573fc5025a0d1a22d",
+      "complete": true
+    },
+    "full": {
+      "name": "motion-full-tier-budget.log",
+      "sha256": "e2079a50657223c9502c8d025a587b619ba1665508d2d45cfda785e8567d6dbb",
+      "complete": true
+    },
+    "full_resources": {
+      "name": "motion-full-tier-budget.resources.jsonl",
+      "sha256": "fb3c67880178d6cdc504b0c7c10fdd23ee5e98b07871e4d0b93c764cf59c3bce",
+      "complete": true
+    }
+  },
+  "implementation_commits": [
+    "297da71650b2d37d0c1d72e54ea40fd265358eaf",
+    "a1aaf3134b412f3fa54574639ad8f6aa054c9f6c",
+    "92c77319ee4b9e282140ed63cd4d24ff9c2a2ca5",
+    "5e73ec4f6c7428f41be3ca1c3cdf6033275201a0"
+  ]
+}

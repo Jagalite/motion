@@ -10,7 +10,7 @@ use axum::{
     routing::{get, post},
 };
 use playscale_core::{
-    access::{self, Idempotent, Permission},
+    access::{self, Idempotent},
     jobs::{self, Input, Job, transition},
 };
 use serde_json::{Value, json};
@@ -112,13 +112,7 @@ async fn control(
     let mut tx = begin_write(&app.db).await?;
     let principal = caller.reauthorize(&mut tx, None).await?;
     let old = row(&mut tx, &id, &principal).await?;
-    let permission = if old.kind == "backup" {
-        Permission::SystemAdmin
-    } else if old.kind == "metadata" {
-        Permission::CatalogWrite
-    } else {
-        Permission::ProcessingRequest
-    };
+    let permission = jobs::control_permission(&old.kind);
     if !principal.allows(permission) {
         return Err(access::AccessError::Forbidden(permission).into());
     }

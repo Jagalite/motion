@@ -267,7 +267,8 @@ pub(crate) async fn publish_refresh_in(
             continue;
         }
         // The observation must still describe this file at this binding.
-        let current: Option<(String, String, String, String, i64, String, bool, bool)> = sqlx::query_as(
+        type CurrentBinding = (String, String, String, String, i64, String, bool, bool);
+        let current: Option<CurrentBinding> = sqlx::query_as(
             "SELECT e.item_id,f.relative_path,l.root,l.root_identity,l.binding_revision,f.revision,l.enabled,f.available FROM media_files f JOIN libraries l ON l.id=f.library_id JOIN editions e ON e.id=f.edition_id WHERE f.id=?",
         )
         .bind(file)

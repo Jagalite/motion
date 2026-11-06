@@ -757,10 +757,356 @@ impl ModelCodec for Downloads {
     }
 }
 
+// The exhaustive graph used to clone strings and event vectors into every
+// visited World. Share equal immutable components without changing a single
+// state fact, input, transition, property, or external codec byte. Rc's Eq/Hash
+// compare VALUES, not allocation addresses: pool population is not model state.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct SharedWorld {
+    view: std::rc::Rc<View>,
+    timeline_revision: u64,
+    next_sequence: u64,
+    pruned: u64,
+    recorded: std::rc::Rc<Vec<Recorded>>,
+    lineage: std::rc::Rc<Option<Lineage>>,
+    download: std::rc::Rc<Option<DownloadIdentity>>,
+    base: u64,
+    log: std::rc::Rc<Vec<offline::OfflineEvent>>,
+    base_epoch: Option<u8>,
+    first: std::rc::Rc<Option<OfflineEvent>>,
+    other_viewing: bool,
+    other_manual: bool,
+    online: u8,
+    manual: u8,
+    edits: u8,
+    epoch: u8,
+    restores: u8,
+    restored_base: (u64, u64),
+    viewing_since_restore: bool,
+    manual_since_restore: bool,
+}
+
+struct Intern<T>(std::cell::RefCell<std::collections::HashSet<std::rc::Rc<T>>>);
+impl<T> Default for Intern<T> {
+    fn default() -> Self {
+        Self(std::cell::RefCell::new(std::collections::HashSet::new()))
+    }
+}
+impl<T: Clone + Eq + std::hash::Hash> Intern<T> {
+    fn share(&self, value: &T) -> std::rc::Rc<T> {
+        let mut values = self.0.borrow_mut();
+        if let Some(existing) = values.get(value) {
+            return existing.clone();
+        }
+        let value = std::rc::Rc::new(value.clone());
+        values.insert(value.clone());
+        value
+    }
+}
+#[derive(Default)]
+struct SharedDownloads {
+    // Two exact-value cached Worlds, never part of semantic state. Any callback
+    // ordering/cold decode remains valid through the lossless unpack fallback.
+    raw: std::cell::RefCell<Vec<(SharedWorld, std::rc::Rc<World>)>>,
+    view: Intern<View>,
+    recorded: Intern<Vec<Recorded>>,
+    lineage: Intern<Option<Lineage>>,
+    download: Intern<Option<DownloadIdentity>>,
+    log: Intern<Vec<offline::OfflineEvent>>,
+    first: Intern<Option<OfflineEvent>>,
+}
+impl SharedDownloads {
+    fn pack(&self, world: World) -> SharedWorld {
+        self.pack_ref(&world)
+    }
+    fn raw(&self, state: &SharedWorld) -> std::rc::Rc<World> {
+        {
+            let mut cache = self.raw.borrow_mut();
+            if let Some(index) = cache.iter().position(|(key, _)| key == state) {
+                let entry = cache.remove(index);
+                let world = entry.1.clone();
+                cache.push(entry);
+                return world;
+            }
+        }
+        let world = std::rc::Rc::new(state.unpack());
+        self.remember(state.clone(), world.clone());
+        world
+    }
+    fn remember(&self, state: SharedWorld, world: std::rc::Rc<World>) {
+        let mut cache = self.raw.borrow_mut();
+        cache.retain(|(key, _)| key != &state);
+        if cache.len() == 2 {
+            cache.remove(0);
+        }
+        cache.push((state, world));
+    }
+    fn pack_ref(&self, world: &World) -> SharedWorld {
+        SharedWorld {
+            view: self.view.share(&world.view),
+            timeline_revision: world.timeline_revision,
+            next_sequence: world.next_sequence,
+            pruned: world.pruned,
+            recorded: self.recorded.share(&world.recorded),
+            lineage: self.lineage.share(&world.lineage),
+            download: self.download.share(&world.download),
+            base: world.base,
+            log: self.log.share(&world.log),
+            base_epoch: world.base_epoch,
+            first: self.first.share(&world.first),
+            other_viewing: world.other_viewing,
+            other_manual: world.other_manual,
+            online: world.online,
+            manual: world.manual,
+            edits: world.edits,
+            epoch: world.epoch,
+            restores: world.restores,
+            restored_base: world.restored_base,
+            viewing_since_restore: world.viewing_since_restore,
+            manual_since_restore: world.manual_since_restore,
+        }
+    }
+}
+impl PartialEq<World> for SharedWorld {
+    fn eq(&self, world: &World) -> bool {
+        let World {
+            view,
+            timeline_revision,
+            next_sequence,
+            pruned,
+            recorded,
+            lineage,
+            download,
+            base,
+            log,
+            base_epoch,
+            first,
+            other_viewing,
+            other_manual,
+            online,
+            manual,
+            edits,
+            epoch,
+            restores,
+            restored_base,
+            viewing_since_restore,
+            manual_since_restore,
+        } = world;
+        self.view.as_ref() == view
+            && &self.timeline_revision == timeline_revision
+            && &self.next_sequence == next_sequence
+            && &self.pruned == pruned
+            && self.recorded.as_ref() == recorded
+            && self.lineage.as_ref() == lineage
+            && self.download.as_ref() == download
+            && &self.base == base
+            && self.log.as_ref() == log
+            && &self.base_epoch == base_epoch
+            && self.first.as_ref() == first
+            && &self.other_viewing == other_viewing
+            && &self.other_manual == other_manual
+            && &self.online == online
+            && &self.manual == manual
+            && &self.edits == edits
+            && &self.epoch == epoch
+            && &self.restores == restores
+            && &self.restored_base == restored_base
+            && &self.viewing_since_restore == viewing_since_restore
+            && &self.manual_since_restore == manual_since_restore
+    }
+}
+impl SharedWorld {
+    fn unpack(&self) -> World {
+        let world = World {
+            view: (*self.view).clone(),
+            timeline_revision: self.timeline_revision,
+            next_sequence: self.next_sequence,
+            pruned: self.pruned,
+            recorded: (*self.recorded).clone(),
+            lineage: (*self.lineage).clone(),
+            download: (*self.download).clone(),
+            base: self.base,
+            log: (*self.log).clone(),
+            base_epoch: self.base_epoch,
+            first: (*self.first).clone(),
+            other_viewing: self.other_viewing,
+            other_manual: self.other_manual,
+            online: self.online,
+            manual: self.manual,
+            edits: self.edits,
+            epoch: self.epoch,
+            restores: self.restores,
+            restored_base: self.restored_base,
+            viewing_since_restore: self.viewing_since_restore,
+            manual_since_restore: self.manual_since_restore,
+        };
+        assert!(self == &world);
+        world
+    }
+}
+impl Model for SharedDownloads {
+    type State = SharedWorld;
+    type Input = Input;
+    type Output = <Downloads as Model>::Output;
+    fn metadata(&self) -> ModelMetadata {
+        Downloads.metadata()
+    }
+    fn initial_state(&self) -> Result<SharedWorld, ModelError> {
+        Ok(self.pack(Downloads.initial_state()?))
+    }
+    fn step(
+        &self,
+        before: &SharedWorld,
+        input: &Input,
+    ) -> Result<Transition<SharedWorld, Self::Output>, ModelError> {
+        let transition = Downloads.step(&self.raw(before), input)?;
+        let next = self.pack_ref(&transition.state);
+        // Checked for EVERY explored edge, not just a hand-picked sample.
+        assert_eq!(next, transition.state, "lossless graph representation");
+        self.remember(next.clone(), std::rc::Rc::new(transition.state));
+        Ok(Transition {
+            state: next,
+            outputs: transition.outputs,
+            disposition: transition.disposition,
+        })
+    }
+    fn check_state(&self, state: &SharedWorld) -> Result<Vec<Check>, ModelError> {
+        Downloads.check_state(&self.raw(state))
+    }
+    fn check_transition(
+        &self,
+        before: &SharedWorld,
+        input: &Input,
+        t: &TransitionRef<'_, SharedWorld, Self::Output>,
+    ) -> Result<Vec<Check>, ModelError> {
+        Downloads.check_transition(
+            &self.raw(before),
+            input,
+            &TransitionRef {
+                state: &self.raw(t.state),
+                outputs: t.outputs,
+                disposition: t.disposition,
+            },
+        )
+    }
+}
+impl Enumerate for SharedDownloads {
+    fn inputs(&self, state: &SharedWorld) -> Result<Vec<Input>, ModelError> {
+        Downloads.inputs(&self.raw(state))
+    }
+}
+impl ModelCodec for SharedDownloads {
+    fn encode_state(&self, state: &SharedWorld) -> Result<Vec<u8>, ModelError> {
+        Downloads.encode_state(&self.raw(state))
+    }
+    fn decode_state(&self, bytes: &[u8]) -> Result<SharedWorld, ModelError> {
+        Ok(self.pack(Downloads.decode_state(bytes)?))
+    }
+    fn encode_input(&self, input: &Input) -> Result<Vec<u8>, ModelError> {
+        Downloads.encode_input(input)
+    }
+    fn decode_input(&self, bytes: &[u8]) -> Result<Input, ModelError> {
+        Downloads.decode_input(bytes)
+    }
+    fn encode_output(&self, output: &Self::Output) -> Result<Vec<u8>, ModelError> {
+        Downloads.encode_output(output)
+    }
+}
+
+#[test]
+fn shared_graph_representation_preserves_states_edges_checks_and_codec() {
+    use std::collections::HashSet;
+    let shared = SharedDownloads::default();
+    let independent = SharedDownloads::default();
+    let initial = Downloads.initial_state().unwrap();
+    let mut seen = HashSet::from([initial.clone()]);
+    let mut frontier = vec![initial];
+    // Reference breadth-first prefix: all inputs, no filtering or symmetry reduction.
+    for _ in 0..5 {
+        let mut next_frontier = vec![];
+        for world in frontier {
+            let packed = shared.pack(world.clone());
+            assert_eq!(packed.unpack(), world);
+            assert_eq!(packed, independent.pack(world.clone()));
+            assert_eq!(
+                shared.encode_state(&packed).unwrap(),
+                Downloads.encode_state(&world).unwrap()
+            );
+            assert_eq!(
+                shared
+                    .decode_state(&Downloads.encode_state(&world).unwrap())
+                    .unwrap(),
+                packed
+            );
+            assert_eq!(
+                shared.check_state(&packed).unwrap(),
+                Downloads.check_state(&world).unwrap()
+            );
+            assert_eq!(
+                shared.inputs(&packed).unwrap(),
+                Downloads.inputs(&world).unwrap()
+            );
+            for input in Downloads.inputs(&world).unwrap() {
+                let plain = Downloads.step(&world, &input).unwrap();
+                let compressed = shared.step(&packed, &input).unwrap();
+                assert_eq!(compressed.state.unpack(), plain.state);
+                assert_eq!(compressed.outputs, plain.outputs);
+                assert_eq!(compressed.disposition, plain.disposition);
+                let input_bytes = shared.encode_input(&input).unwrap();
+                assert_eq!(input_bytes, Downloads.encode_input(&input).unwrap());
+                assert_eq!(shared.decode_input(&input_bytes).unwrap(), input);
+                for output in &plain.outputs {
+                    assert_eq!(
+                        shared.encode_output(output).unwrap(),
+                        Downloads.encode_output(output).unwrap()
+                    );
+                }
+                assert_eq!(
+                    shared
+                        .check_transition(&packed, &input, &compressed.as_ref())
+                        .unwrap(),
+                    Downloads
+                        .check_transition(&world, &input, &plain.as_ref())
+                        .unwrap()
+                );
+                if seen.insert(plain.state.clone()) {
+                    next_frontier.push(plain.state);
+                }
+            }
+        }
+        frontier = next_frontier;
+    }
+    println!(
+        "Lossless shared graph prefix: {} reference states; World {} bytes, SharedWorld {} bytes (plus shared interned components)",
+        seen.len(),
+        std::mem::size_of::<World>(),
+        std::mem::size_of::<SharedWorld>()
+    );
+    assert!(seen.len() > 1000);
+    // Compare the actual enumerator's visited-state hashing/deduplication,
+    // transition counts, failure and termination on the identical depth prefix.
+    let config = stateless::explore::SearchConfig {
+        max_states: 100_000,
+        max_transitions: 1_000_000,
+        max_depth: 5,
+    };
+    let plain = stateless::explore::enumerate(&Downloads, config.clone()).unwrap();
+    let packed = stateless::explore::enumerate(&shared, config).unwrap();
+    assert_eq!(plain.states, packed.states);
+    assert_eq!(plain.transitions, packed.transitions);
+    assert_eq!(plain.termination, packed.termination);
+    assert_eq!(plain.skipped_checks, packed.skipped_checks);
+    assert!(plain.failure.is_none() && packed.failure.is_none());
+    println!(
+        "Enumerator parity: {} states / {} transitions / {:?}; skipped {}",
+        plain.states, plain.transitions, plain.termination, plain.skipped_checks
+    );
+}
+
 #[test]
 fn offline_reconciliation_exhausts_bounded_interleavings() {
     let report = stateless::explore::enumerate(
-        &Downloads,
+        &SharedDownloads::default(),
         stateless::explore::SearchConfig {
             max_states: 12_000_000,
             max_transitions: 200_000_000,
@@ -938,4 +1284,193 @@ fn viewing_written_after_the_restore_wins_over_kept_progress() {
             .iter()
             .any(|c| matches!(c.status, stateless::CheckStatus::Failed(_)))
     );
+}
+
+#[test]
+fn cache_is_transparent_to_cold_and_reordered_callbacks() {
+    let model = SharedDownloads::default();
+    let mut states = vec![Downloads.initial_state().unwrap()];
+    for input in [
+        Input::Download,
+        Input::Play(Position::Partial),
+        Input::SyncLost,
+        Input::Restore,
+        Input::Reapply,
+        Input::Sync,
+    ] {
+        states.push(
+            Downloads
+                .step(states.last().unwrap(), &input)
+                .unwrap()
+                .state,
+        );
+    }
+    for before in states.iter().rev() {
+        for input in Downloads.inputs(before).unwrap() {
+            let plain = Downloads.step(before, &input).unwrap();
+            let packed_before = model.pack(before.clone());
+            let packed_after = model.pack(plain.state.clone());
+            model.raw.borrow_mut().clear();
+            let transition = Transition {
+                state: packed_after.clone(),
+                outputs: plain.outputs.clone(),
+                disposition: plain.disposition.clone(),
+            };
+            assert_eq!(
+                model
+                    .check_transition(&packed_before, &input, &transition.as_ref())
+                    .unwrap(),
+                Downloads
+                    .check_transition(before, &input, &plain.as_ref())
+                    .unwrap()
+            );
+            assert!(model.raw.borrow().len() <= 2);
+            // Force evictions before reusing either end; exact fallback required.
+            for other in &states {
+                model.check_state(&model.pack(other.clone())).unwrap();
+            }
+            assert_eq!(*model.raw(&packed_after), plain.state);
+            assert_eq!(*model.raw(&packed_before), *before);
+            assert!(model.raw.borrow().len() <= 2);
+            model.raw.borrow_mut().clear();
+            assert_eq!(
+                model.step(&packed_before, &input).unwrap().state.unpack(),
+                plain.state
+            );
+        }
+    }
+}
+
+#[test]
+fn direct_equality_detects_each_world_field() {
+    let model = SharedDownloads::default();
+    let baseline = Downloads.initial_state().unwrap();
+    let packed = model.pack(baseline.clone());
+    assert!(packed == baseline);
+    let mut observed = Downloads.step(&baseline, &Input::Download).unwrap().state;
+    observed = Downloads
+        .step(&observed, &Input::Play(Position::Partial))
+        .unwrap()
+        .state;
+    observed = Downloads.step(&observed, &Input::SyncLost).unwrap().state;
+    let mut variants = vec![];
+    {
+        let mut w = baseline.clone();
+        w.view.revision += 1;
+        variants.push(("view", w));
+    }
+    {
+        let mut w = baseline.clone();
+        w.timeline_revision += 1;
+        variants.push(("timeline_revision", w));
+    }
+    {
+        let mut w = baseline.clone();
+        w.next_sequence += 1;
+        variants.push(("next_sequence", w));
+    }
+    {
+        let mut w = baseline.clone();
+        w.pruned += 1;
+        variants.push(("pruned", w));
+    }
+    {
+        let mut w = baseline.clone();
+        w.recorded = observed.recorded.clone();
+        variants.push(("recorded", w));
+    }
+    {
+        let mut w = baseline.clone();
+        w.lineage = Some(Lineage {
+            base_viewing_revision: 1,
+            base_manual_epoch: 2,
+            produced_revision: 3,
+        });
+        variants.push(("lineage", w));
+    }
+    {
+        let mut w = baseline.clone();
+        w.download = observed.download.clone();
+        variants.push(("download", w));
+    }
+    {
+        let mut w = baseline.clone();
+        w.base += 1;
+        variants.push(("base", w));
+    }
+    {
+        let mut w = baseline.clone();
+        w.log = observed.log.clone();
+        variants.push(("log", w));
+    }
+    {
+        let mut w = baseline.clone();
+        w.base_epoch = Some(1);
+        variants.push(("base_epoch", w));
+    }
+    {
+        let mut w = baseline.clone();
+        w.first = observed.first.clone();
+        variants.push(("first", w));
+    }
+    {
+        let mut w = baseline.clone();
+        w.other_viewing = !w.other_viewing;
+        variants.push(("other_viewing", w));
+    }
+    {
+        let mut w = baseline.clone();
+        w.other_manual = !w.other_manual;
+        variants.push(("other_manual", w));
+    }
+    {
+        let mut w = baseline.clone();
+        w.online += 1;
+        variants.push(("online", w));
+    }
+    {
+        let mut w = baseline.clone();
+        w.manual += 1;
+        variants.push(("manual", w));
+    }
+    {
+        let mut w = baseline.clone();
+        w.edits += 1;
+        variants.push(("edits", w));
+    }
+    {
+        let mut w = baseline.clone();
+        w.epoch += 1;
+        variants.push(("epoch", w));
+    }
+    {
+        let mut w = baseline.clone();
+        w.restores += 1;
+        variants.push(("restores", w));
+    }
+    {
+        let mut w = baseline.clone();
+        w.restored_base = (1, 2);
+        variants.push(("restored_base", w));
+    }
+    {
+        let mut w = baseline.clone();
+        w.viewing_since_restore = !w.viewing_since_restore;
+        variants.push(("viewing_since_restore", w));
+    }
+    {
+        let mut w = baseline.clone();
+        w.manual_since_restore = !w.manual_since_restore;
+        variants.push(("manual_since_restore", w));
+    }
+    for (field, changed) in variants {
+        assert_ne!(baseline, changed, "fixture for {field}");
+        assert_eq!(
+            packed == changed,
+            packed.unpack() == changed,
+            "field {field}"
+        );
+        assert!(packed != changed, "field {field}");
+        assert!(model.pack(changed.clone()) == changed);
+    }
 }

@@ -79,6 +79,136 @@ pub fn decide(mode: Mode, candidates: &[Candidate], selected: Option<usize>) -> 
     }
 }
 
+/// Client-facing codec tags for the browser capability probe.
+fn video_tag(codec: &str) -> Option<&'static str> {
+    Some(match codec {
+        "h264" => "avc1",
+        "hevc" | "h265" => "hvc1",
+        "vp9" => "vp09",
+        "av1" => "av01",
+        "vp8" => "vp8",
+        _ => return None,
+    })
+}
+fn audio_tag(codec: &str) -> Option<&'static str> {
+    Some(match codec {
+        "aac" => "mp4a",
+        "opus" => "opus",
+        "mp3" => "mp3",
+        "flac" => "flac",
+        "vorbis" => "vorbis",
+        _ => return None,
+    })
+}
+/// Codecs no supported browser decodes natively.
+fn never_browser(video: &str, audio: Option<&str>) -> bool {
+    matches!(
+        video,
+        "mpeg2video" | "mpeg1video" | "mpeg4" | "msmpeg4v3" | "prores" | "dnxhd" | "vc1" | "wmv3"
+    ) || audio.is_some_and(|a| {
+        matches!(
+            a,
+            "ac3" | "eac3" | "dts" | "truehd" | "mlp" | "wmav2" | "pcm_s24le"
+        )
+    })
+}
+
+/// Browser capability interpretation from observed streams and advertised codecs.
+pub fn browser_support(
+    video: Option<&str>,
+    audio: Option<&str>,
+    hdr: bool,
+    require_sdr: bool,
+    hdr_supported: bool,
+    container: Option<&str>,
+    video_codecs: &[String],
+    audio_codecs: &[String],
+) -> Support {
+    let Some(video) = video else {
+        return Support::Unknown;
+    };
+    if hdr && (require_sdr || !hdr_supported) || never_browser(video, audio) {
+        return Support::Unsupported;
+    }
+    let listed =
+        |tag: Option<&str>, list: &[String]| tag.is_some_and(|t| list.iter().any(|c| c == t));
+    if listed(video_tag(video), video_codecs)
+        && audio.is_none_or(|a| listed(audio_tag(a), audio_codecs))
+        && matches!(container, Some("mp4" | "m4v" | "mov" | "webm"))
+    {
+        Support::Supported
+    } else {
+        Support::Unknown
+    }
+}
+
+pub fn legacy_processable(
+    duration: Option<f64>,
+    profile: Option<&crate::processing::VideoProfileFacts>,
+    video: Option<(Option<u32>, Option<u32>, Option<&str>)>,
+) -> bool {
+    crate::processing::video_source_eligible(
+        crate::processing::SourceContract::Legacy,
+        if profile.is_some() {
+            "video_profile"
+        } else {
+            "h264720p"
+        },
+        video,
+    ) && duration
+        .is_some_and(|d| d.is_finite() && d > 0.0 && profile.is_none_or(|p| p.admits_duration(d)))
+}
+
+pub fn within_average_budget(bytes: i64, duration: Option<f64>, limit: u64) -> bool {
+    duration.is_some_and(|seconds| {
+        seconds.is_finite()
+            && seconds > 0.0
+            && bytes >= 0
+            && bytes as f64 * 8.0 / seconds <= limit as f64
+    })
+}
+
+/// Completed local-job provenance, distinct from an imported recipe label.
+pub struct LegacyProvenance<'a> {
+    pub registration_source: &'a str,
+    pub external_id: &'a str,
+    pub file: &'a str,
+    pub file_revision: &'a str,
+    pub source_file: &'a str,
+    pub source_revision: &'a str,
+    pub job_id: &'a str,
+    pub job_source_file: &'a str,
+    pub job_source_revision: &'a str,
+    pub phase: &'a str,
+    pub expired: bool,
+}
+pub fn local_output_contract(
+    p: &LegacyProvenance<'_>,
+    file: &str,
+    revision: &str,
+    source: &str,
+    source_revision: &str,
+) -> bool {
+    p.registration_source == "playscale"
+        && p.external_id == p.job_id
+        && p.phase == "completed"
+        && !p.expired
+        && p.file == file
+        && p.file_revision == revision
+        && p.source_file == source
+        && p.source_revision == source_revision
+        && p.job_source_file == source
+        && p.job_source_revision == source_revision
+}
+pub fn legacy_recipe_matches(
+    recipe: Option<&str>,
+    profile: Option<&serde_json::Value>,
+    wanted_recipe: &str,
+    wanted_profile: Option<&serde_json::Value>,
+) -> bool {
+    recipe == Some(wanted_recipe) && profile == wanted_profile
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

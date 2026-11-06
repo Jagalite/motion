@@ -1,5 +1,7 @@
 # State-machine refactor progress
 
+> Historical focused-slice ledger inherited from the branch baseline. Current coverage of all 73 IDs, local commits, executed aggregate gates and remaining limitations are tracked in [the completion matrix](STATE_MACHINE_COMPLETION_MATRIX.md). The original observations below are preserved rather than relabeled as current execution.
+
 This is a working ledger for the [audit](STATE_BOUNDARY_AUDIT.md) and [plan](STATE_MACHINE_REFACTOR_PLAN.md). A finding remains open until the production boundary, model properties, and appropriate adapter verification are complete. The audit contains 73 entries; work not listed below remains open.
 
 - **I01 — scan recovery:** implemented in production core and both callers. Focused execution passed: 184 core unit tests, four demand-model tests (170,069 states, 1,233,628 transitions, graph exhausted, no skipped checks), five job-model tests, and ten scan integration tests including transactional rollback. The model bounds are at most three demands, barrier four, four attempts, one restart and one direct request; exhaustion is covered by core unit tests. Changes remain uncommitted.

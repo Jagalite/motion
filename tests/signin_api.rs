@@ -1697,13 +1697,18 @@ async fn invite_only_registration_completes_exactly_the_bound_invitation() {
     assert!(f.drain(previous).await.is_empty());
     let user = f.user(&["catalog:read", "playback:request"]).await;
     let previous = f.mail.messages.lock().await.len();
+    let invitation_input = json!({"user_id":user["id"],"user_revision":user["revision"],"ttl_seconds":3600,
+        "profile_ids":["default"],"permissions":["catalog:read"],"policy":user["policy"],"email":NEWCOMER});
+    let auth = bearer(OPERATOR);
     let invitation = f
-        .operator(
+        .call(
             "POST",
             "/api/v2/auth/invitations",
-            Some(json!({"user_id":user["id"],"user_revision":user["revision"],"ttl_seconds":3600,
-                "profile_ids":["default"],"permissions":["catalog:read"],"policy":user["policy"],"email":NEWCOMER})),
-            None,
+            Some(invitation_input.clone()),
+            &[
+                ("authorization", auth.as_str()),
+                ("idempotency-key", "registered-invitation-replay"),
+            ],
         )
         .await;
     assert_eq!(
@@ -1721,6 +1726,15 @@ async fn invite_only_registration_completes_exactly_the_bound_invitation() {
         None,
         "the invitation email carries no secret"
     );
+    // More than a full page of newer invitations with a rotated issuer must
+    // not hide the older still-current invitation for this exact recipient.
+    for index in 0..70 {
+        sqlx::query("INSERT INTO access_invitations(id,code_hash,user_id,user_revision,issuer_id,issuer_revision,issuer_credential_hash,profile_ids,permissions,policy,created_at,expires_at,email) SELECT ?,?,user_id,user_revision,issuer_id,issuer_revision,'rotated-key',profile_ids,permissions,policy,created_at+1,expires_at,email FROM access_invitations WHERE id=?")
+            .bind(format!("ineligible-{index:03}"))
+            .bind(format!("ineligible-hash-{index:03}"))
+            .bind(invitation.body["id"].as_str().unwrap())
+            .execute(&f.app.db).await.unwrap();
+    }
     let (id, cookie, code) = f.registered_code(NEWCOMER, "Ignored name").await;
     let finished = f.email_finish(&id, &cookie, &code).await;
     assert_eq!(
@@ -1748,7 +1762,41 @@ async fn invite_only_registration_completes_exactly_the_bound_invitation() {
     let listed = f
         .operator("GET", "/api/v2/auth/invitations", None, None)
         .await;
-    assert_eq!(listed.body["items"][0]["status"], "registered");
+    let registered = listed.body["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["id"] == invitation.body["id"]);
+    // List pagination need not include the historical invite; durable state
+    // still records the exact chosen invitation, never one of the stale rows.
+    if let Some(registered) = registered {
+        assert_eq!(registered["status"], "registered");
+    }
+    let chosen: Option<String> =
+        sqlx::query_scalar("SELECT identity_id FROM access_invitations WHERE id=?")
+            .bind(invitation.body["id"].as_str().unwrap())
+            .fetch_one(&f.app.db)
+            .await
+            .unwrap();
+    assert!(chosen.is_some());
+    let replay = f
+        .call(
+            "POST",
+            "/api/v2/auth/invitations",
+            Some(invitation_input),
+            &[
+                ("authorization", auth.as_str()),
+                ("idempotency-key", "registered-invitation-replay"),
+            ],
+        )
+        .await;
+    assert_eq!(replay.status, StatusCode::CONFLICT, "{}", replay.body);
+    assert!(
+        replay
+            .body
+            .get("code")
+            .is_some_and(|code| code != &invitation.body["code"])
+    );
     // Device redemption of the same invitation is a competing, refused claim.
     let redeemed = f
         .call(
@@ -2016,6 +2064,12 @@ async fn direct_delivery_signs_tests_confirms_receipt_and_diagnoses_dns() {
         )
         .await;
     assert_eq!(wrong.body["code"], "invalid_code");
+    // Confirmation on the final allowed attempt is still a durable receipt.
+    sqlx::query("UPDATE signin_mail_tests SET attempts=4 WHERE id=?")
+        .bind(test)
+        .execute(&f.app.db)
+        .await
+        .unwrap();
     let confirmed = f
         .operator(
             "POST",
@@ -2025,6 +2079,21 @@ async fn direct_delivery_signs_tests_confirms_receipt_and_diagnoses_dns() {
         )
         .await;
     assert_eq!(confirmed.status, StatusCode::OK, "{}", confirmed.body);
+    sqlx::query("UPDATE signin_mail_tests SET expires_at=0 WHERE id=?")
+        .bind(test)
+        .execute(&f.app.db)
+        .await
+        .unwrap();
+    let replay = f
+        .operator(
+            "POST",
+            &format!("/api/v2/admin/auth/email/tests/{test}/confirm"),
+            Some(json!({"code":"00000000"})),
+            None,
+        )
+        .await;
+    assert_eq!(replay.status, StatusCode::OK, "{}", replay.body);
+    assert_eq!(replay.body, confirmed.body);
     let email = f
         .operator("GET", "/api/v2/admin/auth/email", None, None)
         .await;
@@ -2142,7 +2211,17 @@ async fn missing_mail_payload_keeps_recovered_delivery_uncertainty() {
                 .await
                 .unwrap()
         );
-        let row: (String, bool, i64, Option<String>, Option<i64>, Option<i64>, Option<String>, Option<String>) = sqlx::query_as("SELECT phase,ambiguous,attempts,lease_token,lease_attempt,lease_until,payload,last_error FROM signin_outbox WHERE owner_id=?")
+        type MailObservation = (
+            String,
+            bool,
+            i64,
+            Option<String>,
+            Option<i64>,
+            Option<i64>,
+            Option<String>,
+            Option<String>,
+        );
+        let row: MailObservation = sqlx::query_as("SELECT phase,ambiguous,attempts,lease_token,lease_attempt,lease_until,payload,last_error FROM signin_outbox WHERE owner_id=?")
             .bind(&owner).fetch_one(&f.app.db).await.unwrap();
         assert_eq!(
             row,

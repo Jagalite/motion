@@ -657,6 +657,25 @@ fn progress_from_before_a_restore_is_reapplied_or_discarded_by_choice() {
             .resolve_restore(RestoreChoice::Reapply, "server:restore", &[unknown])
             .is_err()
     );
+    for field in 0..4 {
+        let mut invalid = restored.clone();
+        match field {
+            0 => invalid.source_revision = "changed-source".into(),
+            1 => invalid.timeline_revision = "2".into(),
+            2 => invalid.base_viewing_revision = "-1".into(),
+            _ => invalid.base_manual_epoch = "invalid".into(),
+        }
+        assert!(
+            store
+                .resolve_restore(RestoreChoice::Reapply, "server:restore", &[invalid])
+                .is_err()
+        );
+        assert_eq!(
+            store.events().unwrap(),
+            log,
+            "refusal preserves the durable history"
+        );
+    }
     let kept = store
         .resolve_restore(
             RestoreChoice::Reapply,
@@ -979,5 +998,126 @@ fn an_existing_compacted_log_learns_its_confirmed_epoch_before_a_restore() {
     assert_eq!(
         store.events().unwrap().base_viewing_epoch.as_deref(),
         Some("server:restore")
+    );
+}
+
+#[test]
+fn paused_at_duration_checkpoint_survives_compaction_restart_and_rebase() {
+    use playscale_core::{
+        offline::Acknowledgement,
+        timeline_viewing::{ResumePolicy, resume_position},
+    };
+    for (status, position, expected) in [
+        ("paused", 100_000, 100_000),
+        ("paused", 99_999, 99_999),
+        ("paused", 0, 0),
+        ("ended", 100_000, 0),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("cache");
+        let media = b"checkpoint boundary";
+        let mut store = Store::open(&root, &scope()).unwrap();
+        stage(&root, "d1", media);
+        store.publish(entry("d1", media)).unwrap();
+        let mut observation = event(&entry("d1", media).identity, 1);
+        observation.status = status.into();
+        observation.position_ms = position;
+        let before = resume_position(
+            ResumePolicy::Offline,
+            Some(position),
+            status == "ended",
+            Some(100_000),
+        );
+        std::fs::write(
+            root.join("events.json"),
+            serde_json::to_vec(&EventLog {
+                base_sequence: 0,
+                base_viewing_epoch: None,
+                events: vec![observation],
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        let log = store
+            .acknowledge_results(
+                &[Acknowledgement {
+                    event_id: "e1".into(),
+                    consumed: true,
+                }],
+                2,
+            )
+            .unwrap();
+        assert!(log.events.is_empty());
+        drop(store);
+        let mut store = Store::open(&root, &scope()).unwrap();
+        let checkpoint = store.manifest().downloads[0].resume_position_ms;
+        assert_eq!(
+            resume_position(ResumePolicy::Offline, checkpoint, false, Some(100_000)),
+            before
+        );
+        assert_eq!(before, expected);
+        store
+            .rebase("d1", "2", "0", "server:restore", Some(expected))
+            .unwrap();
+        assert_eq!(
+            store.manifest().downloads[0]
+                .resume_position_ms
+                .unwrap_or(0),
+            expected
+        );
+    }
+}
+
+#[test]
+fn failed_checkpoint_persistence_does_not_compact_the_event_log() {
+    use playscale_core::offline::Acknowledgement;
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("cache");
+    let media = b"checkpoint failure";
+    let mut store = Store::open(&root, &scope()).unwrap();
+    stage(&root, "d1", media);
+    store.publish(entry("d1", media)).unwrap();
+    let mut observation = event(&entry("d1", media).identity, 1);
+    observation.position_ms = 100_000;
+    observation.status = "paused".into();
+    let original = EventLog {
+        base_sequence: 0,
+        base_viewing_epoch: None,
+        events: vec![observation],
+    };
+    let bytes = serde_json::to_vec(&original).unwrap();
+    std::fs::write(root.join("events.json"), &bytes).unwrap();
+    // Make the atomic manifest rename fail without relying on OS permission
+    // interpretation. The event file must remain byte-for-byte intact.
+    std::fs::rename(root.join("manifest.json"), root.join("saved-manifest.json")).unwrap();
+    std::fs::create_dir(root.join("manifest.json")).unwrap();
+    assert!(
+        store
+            .acknowledge_results(
+                &[Acknowledgement {
+                    event_id: "e1".into(),
+                    consumed: true
+                }],
+                2
+            )
+            .is_err()
+    );
+    assert_eq!(std::fs::read(root.join("events.json")).unwrap(), bytes);
+    assert_eq!(store.manifest().downloads[0].resume_position_ms, None);
+    std::fs::remove_dir(root.join("manifest.json")).unwrap();
+    std::fs::rename(root.join("saved-manifest.json"), root.join("manifest.json")).unwrap();
+    let retried = store
+        .acknowledge_results(
+            &[Acknowledgement {
+                event_id: "e1".into(),
+                consumed: true,
+            }],
+            2,
+        )
+        .unwrap();
+    assert!(retried.events.is_empty());
+    assert_eq!(
+        store.manifest().downloads[0].resume_position_ms,
+        Some(100_000)
     );
 }

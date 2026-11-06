@@ -953,3 +953,161 @@ mod tests {
         assert!(consumed("history_only", Some("viewing_newer")));
     }
 }
+
+/// Domain identity validation shared by cache admission and restore rebasing.
+/// Digest, path and storage-format validation deliberately stay in the host.
+pub fn valid_download_identity(identity: &DownloadIdentity) -> bool {
+    identifier(&identity.download_id)
+        && identifier(&identity.timeline_id)
+        && sequence(&identity.timeline_revision).is_some()
+        && sequence(&identity.base_viewing_revision).is_some()
+        && sequence(&identity.base_manual_epoch).is_some()
+        && identity.viewing_epoch.as_deref().is_none_or(viewing_epoch)
+        && !identity.source_revision.is_empty()
+        && identity.source_revision.len() <= 256
+}
+
+/// A restore pin can rebase only an identity this cache actually holds.
+pub fn restored_pin_admitted(
+    current: &str,
+    pin: &DownloadIdentity,
+    held: Option<&DownloadIdentity>,
+) -> bool {
+    viewing_epoch(current)
+        && valid_download_identity(pin)
+        && pin.viewing_epoch.as_deref() == Some(current)
+        && held.is_some_and(|held| {
+            pin.download_id == held.download_id
+                && pin.timeline_id == held.timeline_id
+                && pin.timeline_revision == held.timeline_revision
+                && pin.source_revision == held.source_revision
+        })
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CachePublication {
+    Removed,
+    AlreadyPublished,
+    Publish,
+    VerifyRecovery,
+    RetryTransfer,
+}
+pub fn cache_publication(
+    removed: bool,
+    exact_published: bool,
+    staged: bool,
+    blob: bool,
+    sides: bool,
+) -> CachePublication {
+    if removed {
+        CachePublication::Removed
+    } else if exact_published {
+        CachePublication::AlreadyPublished
+    } else if staged {
+        CachePublication::Publish
+    } else if blob && sides {
+        CachePublication::VerifyRecovery
+    } else {
+        CachePublication::RetryTransfer
+    }
+}
+/// Release decisions always use the post-manifest-commit references.
+pub fn release_blob(manifest_committed: bool, referenced: bool) -> bool {
+    manifest_committed && !referenced
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
+pub enum LocalPlayback {
+    #[default]
+    Closed,
+    Opening(String),
+    Open {
+        download: String,
+        ticket: String,
+    },
+}
+impl LocalPlayback {
+    pub fn begin(&self, download: &str) -> Self {
+        Self::Opening(download.to_owned())
+    }
+    pub fn snapshot(&self, download: &str, ticket: &str, verified: bool) -> Self {
+        if self != &Self::Opening(download.to_owned()) {
+            return self.clone();
+        }
+        if verified {
+            Self::Open {
+                download: download.to_owned(),
+                ticket: ticket.to_owned(),
+            }
+        } else {
+            Self::Closed
+        }
+    }
+    pub fn retire(&self, ticket: &str) -> Self {
+        if self.admits(ticket) {
+            Self::Closed
+        } else {
+            self.clone()
+        }
+    }
+    pub fn admits(&self, ticket: &str) -> bool {
+        matches!(self, Self::Open { ticket: active, .. } if active == ticket)
+    }
+}
+/// Content identity used by publication and reference release. Descriptive
+/// metadata and viewing checkpoints deliberately do not republish media.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct CacheBlob {
+    pub digest: String,
+    pub size: u64,
+}
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct CacheEntryIdentity {
+    pub download: String,
+    pub media: CacheBlob,
+    pub artwork: Option<(CacheBlob, String)>,
+    pub subtitles: Option<CacheBlob>,
+}
+impl CacheEntryIdentity {
+    pub fn blobs(&self) -> impl Iterator<Item = &str> {
+        std::iter::once(self.media.digest.as_str())
+            .chain(self.artwork.as_ref().map(|(a, _)| a.digest.as_str()))
+            .chain(self.subtitles.as_ref().map(|s| s.digest.as_str()))
+    }
+    pub fn publication(
+        &self,
+        published: &[Self],
+        removals: &[String],
+        staged: bool,
+        blob: bool,
+        sides: bool,
+    ) -> CachePublication {
+        cache_publication(
+            removals.contains(&self.download),
+            published.contains(self),
+            staged,
+            blob,
+            sides,
+        )
+    }
+}
+/// Exact, deduplicated deletion effects, evaluated only after the durable
+/// manifest replacement. Unrelated orphan blobs are intentionally excluded:
+/// their ready demands may still recover them in the current agent pass.
+pub fn cache_releases(
+    previous: &[CacheEntryIdentity],
+    committed: &[CacheEntryIdentity],
+) -> Vec<String> {
+    let retained: std::collections::BTreeSet<_> = committed
+        .iter()
+        .flat_map(CacheEntryIdentity::blobs)
+        .collect();
+    previous
+        .iter()
+        .flat_map(CacheEntryIdentity::blobs)
+        .filter(|digest| !retained.contains(digest))
+        .map(str::to_owned)
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}

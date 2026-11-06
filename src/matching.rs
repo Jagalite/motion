@@ -3,7 +3,7 @@
 //! and applies an accepted identification in the same writer transaction.
 use crate::{App, curation, new_id, now};
 use playscale_core::matching::{
-    self, Attachment, Candidate, Decision, MatchError, MatchState, Proposal, ProposalAction, Status,
+    self, Attachment, Candidate, Decision, MatchError, MatchState, Proposal, Status,
 };
 use serde::Serialize;
 use sqlx::{Sqlite, SqliteConnection, SqlitePool, Transaction};
@@ -135,47 +135,20 @@ async fn local_candidates(
         .and_then(|s| s.to_str())
         .unwrap_or(relative_path);
     let parsed = matching::parse_name(stem);
-    let wanted = matching::normalize_title(&parsed.title);
-    if wanted.is_empty() {
-        return Ok(vec![]);
-    }
     let items: Vec<(String, String)> = sqlx::query_as(
         "SELECT id,title FROM items WHERE id<>? AND id NOT IN (SELECT alias_id FROM item_aliases) ORDER BY id",
-    )
-    .bind(own_item)
-    .fetch_all(&mut *conn)
-    .await?;
-    let mut out = Vec::new();
+    ).bind(own_item).fetch_all(&mut *conn).await?;
+    let mut facts = Vec::new();
     for (id, title) in items {
-        if matching::normalize_title(&title) != wanted {
+        if !matching::local_candidate_title(&parsed, &title) {
             continue;
         }
-        let year: Option<i64> = sqlx::query_scalar(
-            "SELECT json_extract(document_json,'$.values.release_year') FROM metadata_documents WHERE item_id=? AND json_extract(document_json,'$.values.release_year') IS NOT NULL ORDER BY source='local' DESC,source LIMIT 1",
-        )
-        .bind(&id)
-        .fetch_optional(&mut *conn)
-        .await?
-        .flatten();
-        let mut reasons = vec!["title".to_string()];
-        match (parsed.year, year) {
-            (Some(a), Some(b)) if i64::from(a) == b => reasons.push("year".into()),
-            (Some(_), Some(_)) => continue,
-            _ => {}
-        }
-        out.push(Candidate {
-            id: format!("local:{id}"),
-            item_id: Some(id),
-            title,
-            external_id: None,
-            reason_codes: reasons,
-        });
-        if out.len() == matching::MAX_CANDIDATES {
-            break;
-        }
+        let years: Vec<(String, i64)> = sqlx::query_as("SELECT source,json_extract(document_json,'$.values.release_year') FROM metadata_documents WHERE item_id=? AND json_extract(document_json,'$.values.release_year') IS NOT NULL")
+            .bind(&id).fetch_all(&mut *conn).await?;
+        facts.push(matching::LocalCandidateFacts { id, title, years });
     }
     let _ = file_id;
-    Ok(out)
+    Ok(matching::local_candidates(&parsed, facts))
 }
 
 /// Raise or refresh the undecided proposal for a file's current revision.
@@ -200,48 +173,23 @@ pub(crate) async fn propose_in_transaction(
     .fetch_one(&mut **tx)
     .await?;
     let candidates = local_candidates(tx, file_id, &path, &item).await?;
-    // An open proposal for an older file revision becomes stale first.
-    let open: Option<Row> = sqlx::query_as(&format!(
-        "SELECT {COLUMNS} WHERE file_id=? AND status IN ('pending','review','deferred')"
-    ))
-    .bind(file_id)
-    .fetch_optional(&mut **tx)
-    .await?;
-    if let Some(row) = open {
-        let current = decode(row)?;
-        if current.file_revision != revision {
-            let stale = matching::refresh(&current, Some(&revision), current.candidates.clone())?;
-            store(tx, &stale, false).await?;
-        }
+    let rows: Vec<Row> =
+        sqlx::query_as(&format!("SELECT {COLUMNS} WHERE file_id=? ORDER BY rowid"))
+            .bind(file_id)
+            .fetch_all(&mut **tx)
+            .await?;
+    let history = rows
+        .into_iter()
+        .map(decode)
+        .collect::<Result<Vec<_>, _>>()?;
+    let (updates, proposal, insert) =
+        matching::reconcile_history(&history, file_id, &revision, candidates, new_id())?;
+    for update in updates {
+        store(tx, &update, false).await?;
     }
-    let latest: Option<Row> = sqlx::query_as(&format!(
-        // The open proposal wins; otherwise insertion order. Proposals are never
-        // deleted, so rowid is monotonic; wall-clock timestamps are not.
-        "SELECT {COLUMNS} WHERE file_id=? ORDER BY status IN ('pending','review','deferred') DESC,rowid DESC LIMIT 1"
-    ))
-    .bind(file_id)
-    .fetch_optional(&mut **tx)
-    .await?;
-    let latest = latest.map(decode).transpose()?;
-    let proposal = match (
-        matching::proposal_action(latest.as_ref(), &revision),
-        latest,
-    ) {
-        // A decision for this exact file revision stands until explicitly reopened.
-        (ProposalAction::Keep, Some(decided)) => decided,
-        (ProposalAction::Refresh, Some(current)) => {
-            let next = matching::refresh(&current, Some(&revision), candidates)?;
-            if next != current {
-                store(tx, &next, false).await?;
-            }
-            next
-        }
-        _ => {
-            let fresh = matching::propose(new_id(), file_id.into(), revision, candidates)?;
-            store(tx, &fresh, true).await?;
-            fresh
-        }
-    };
+    if insert {
+        store(tx, &proposal, true).await?;
+    }
     Ok(proposal)
 }
 
@@ -422,17 +370,14 @@ pub async fn reopen(
         .bind(&proposal.file_id)
         .fetch_optional(&mut *tx)
         .await?;
-    let next = matching::reopen(&proposal, expected_revision, current.as_deref())?;
     // Only one undecided proposal per file may exist.
-    let open: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM match_proposals WHERE file_id=? AND status IN ('pending','review','deferred')",
+    let open: Vec<String> = sqlx::query_scalar(
+        "SELECT id FROM match_proposals WHERE file_id=? AND status IN ('pending','review','deferred')",
     )
     .bind(&proposal.file_id)
-    .fetch_one(&mut *tx)
+    .fetch_all(&mut *tx)
     .await?;
-    if open > 0 {
-        return Err(MatchingError::Rejected(MatchError::StaleProposal));
-    }
+    let next = matching::reopen_with_open(&proposal, expected_revision, current.as_deref(), &open)?;
     // The replaced decision is preserved as an immutable receipt.
     sqlx::query("INSERT INTO catalog_receipts VALUES (?,?,?,?)")
         .bind(new_id())

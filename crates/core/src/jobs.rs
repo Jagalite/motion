@@ -1,3 +1,13 @@
+/// Authorization for control is derived from the persisted job kind, never
+/// from request fields or a historical receipt.
+pub fn control_permission(kind: &str) -> crate::access::Permission {
+    match kind {
+        "backup" => crate::access::Permission::SystemAdmin,
+        "metadata" => crate::access::Permission::CatalogWrite,
+        _ => crate::access::Permission::ProcessingRequest,
+    }
+}
+
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -134,5 +144,21 @@ impl Job {
     }
     pub fn retryable(&self) -> bool {
         matches!(self.phase, Phase::Failed | Phase::Cancelled) && self.attempt < u32::MAX
+    }
+}
+
+#[cfg(test)]
+mod control_permission_tests {
+    #[test]
+    fn persisted_kind_selects_control_authority() {
+        use crate::access::Permission;
+        for (kind, expected) in [
+            ("backup", Permission::SystemAdmin),
+            ("metadata", Permission::CatalogWrite),
+            ("processing", Permission::ProcessingRequest),
+            ("preview", Permission::ProcessingRequest),
+        ] {
+            assert_eq!(super::control_permission(kind), expected);
+        }
     }
 }

@@ -253,12 +253,16 @@ async fn capture_restore_baseline(db: &SqlitePool) -> anyhow::Result<()> {
         return Ok(());
     }
     let mut tx = begin_write(db).await?;
-    let pending: Option<String> = sqlx::query_scalar(
-        "SELECT b.restore_epoch FROM restore_baseline_epoch b JOIN server_identity s ON s.restore_epoch=b.restore_epoch WHERE b.singleton=1 AND b.captured=0",
-    )
-    .fetch_optional(&mut *tx)
-    .await?;
-    if pending.is_some() {
+    let pending: Option<(String, Option<String>, Option<bool>)> = sqlx::query_as(
+        "SELECT s.restore_epoch,b.restore_epoch,b.captured FROM server_identity s LEFT JOIN restore_baseline_epoch b ON b.singleton=s.singleton WHERE s.singleton=1")
+        .fetch_optional(&mut *tx).await?;
+    if pending.as_ref().is_some_and(|(current, epoch, captured)| {
+        playscale_core::maintenance::capture_baseline(
+            current,
+            epoch.as_deref(),
+            captured.unwrap_or(false),
+        )
+    }) {
         sqlx::query("DELETE FROM restore_baselines")
             .execute(&mut *tx)
             .await?;
@@ -740,6 +744,10 @@ pub async fn restore_into(backup: &Path, destination: &Path) -> anyhow::Result<R
         integrity == "ok" && dangling.is_empty(),
         "restored database failed integrity checks"
     );
+    let mut progress = playscale_core::maintenance::RestoreProgress {
+        snapshot_verified: true,
+        ..Default::default()
+    };
     let has_identity: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM sqlite_schema WHERE type='table' AND name='server_identity'",
     )
@@ -766,24 +774,16 @@ pub async fn restore_into(backup: &Path, destination: &Path) -> anyhow::Result<R
             .execute(&mut *tx).await?;
         // A snapshot cannot prove post-snapshot revocations. Withdraw saved
         // authority atomically with the new restore history and baseline.
-        for statement in [
-            "DELETE FROM access_invitations",
-            "DELETE FROM signin_outbox",
-            "DELETE FROM signin_mail_tests",
-            "DELETE FROM signin_transactions",
-            "DELETE FROM signin_requests",
-            "DELETE FROM signin_proofs",
-            "UPDATE signin_families SET revoked=1,revision=revision+1",
-            "DELETE FROM content_tickets",
-            "DELETE FROM pairings",
-            "DELETE FROM idempotency_records",
-            "DELETE FROM credentials",
-            "UPDATE devices SET revoked=1",
-        ] {
-            sqlx::query(statement).execute(&mut *tx).await?;
+        let withdrawal: Vec<(String, String)> =
+            serde_json::from_str(playscale_core::maintenance::RESTORE_AUTHORITY)?;
+        for (_, statement) in withdrawal {
+            sqlx::query(&statement).execute(&mut *tx).await?;
         }
         tx.commit().await?;
+        progress.history_rotated = true;
+        progress.authority_withdrawn = true;
         capture_restore_baseline(&restored).await?;
+        progress.baseline_captured = true;
         Some(epoch)
     } else {
         None
@@ -810,6 +810,11 @@ pub async fn restore_into(backup: &Path, destination: &Path) -> anyhow::Result<R
         .await?;
     restored.close().await;
     tokio::fs::File::open(&staging).await?.sync_all().await?;
+    progress.database_durable = true;
+    anyhow::ensure!(
+        progress.publishable(has_identity > 0),
+        "restore publication contract incomplete"
+    );
     // A hard link publishes atomically without replacing a concurrent destination.
     tokio::fs::hard_link(&staging, destination).await?;
     tokio::fs::remove_file(&staging).await?;

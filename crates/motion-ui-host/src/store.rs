@@ -136,6 +136,29 @@ fn blobs_of(entry: &CachedDownload) -> impl Iterator<Item = String> + '_ {
         .chain(entry.subtitles.as_ref().map(|s| s.sha256.clone()))
 }
 
+fn cache_identity(entry: &CachedDownload) -> offline::CacheEntryIdentity {
+    offline::CacheEntryIdentity {
+        download: entry.identity.download_id.clone(),
+        media: offline::CacheBlob {
+            digest: entry.sha256.clone(),
+            size: entry.size,
+        },
+        artwork: entry.artwork.as_ref().map(|a| {
+            (
+                offline::CacheBlob {
+                    digest: a.sha256.clone(),
+                    size: a.size,
+                },
+                a.content_type.clone(),
+            )
+        }),
+        subtitles: entry.subtitles.as_ref().map(|a| offline::CacheBlob {
+            digest: a.sha256.clone(),
+            size: a.size,
+        }),
+    }
+}
+
 /// The staging file name for a download's transfer.
 pub fn staging_name(download_id: &str) -> anyhow::Result<String> {
     ensure!(
@@ -460,13 +483,10 @@ impl Store {
         );
         let staged = staging_name(&id)?;
         let sides = side_files(&entry)?;
-        if self.manifest.downloads.iter().any(|d| {
-            d.identity.download_id == id
-                && d.sha256 == entry.sha256
-                && d.size == entry.size
-                && d.artwork == entry.artwork
-                && d.subtitles == entry.subtitles
-        }) {
+        let previous: Vec<_> = self.manifest.downloads.iter().map(cache_identity).collect();
+        if cache_identity(&entry).publication(&previous, &self.removals, true, false, false)
+            == offline::CachePublication::AlreadyPublished
+        {
             let _ = self.staging.remove_file(&staged);
             for (name, _, _) in &sides {
                 let _ = self.staging.remove_file(name);
@@ -519,12 +539,6 @@ impl Store {
             Err(e) => return Err(e.into()),
         }
         let mut next = self.manifest.clone();
-        let replaced: Vec<String> = next
-            .downloads
-            .iter()
-            .filter(|d| d.identity.download_id == id)
-            .flat_map(blobs_of)
-            .collect();
         next.downloads.retain(|d| d.identity.download_id != id);
         ensure!(
             next.downloads.len() < MAX_DOWNLOADS,
@@ -539,6 +553,8 @@ impl Store {
         {
             last.metadata = None;
         }
+        let committed: Vec<_> = next.downloads.iter().map(cache_identity).collect();
+        let replaced = offline::cache_releases(&previous, &committed);
         self.write_manifest(next)?;
         // Only bytes this publication superseded; other unreferenced blobs
         // may still be recovered by their own ready demand (see `collect`).
@@ -563,15 +579,12 @@ impl Store {
             }
         }
         let mut next = self.manifest.clone();
-        let blobs: Vec<String> = next
-            .downloads
-            .iter()
-            .filter(|d| d.identity.download_id == download_id)
-            .flat_map(blobs_of)
-            .collect();
+        let previous: Vec<_> = next.downloads.iter().map(cache_identity).collect();
         next.downloads
             .retain(|d| d.identity.download_id != download_id);
         let removed = next.downloads.len() != self.manifest.downloads.len();
+        let committed: Vec<_> = next.downloads.iter().map(cache_identity).collect();
+        let blobs = offline::cache_releases(&previous, &committed);
         if removed {
             self.write_manifest(next)?;
         }
@@ -592,7 +605,7 @@ impl Store {
     /// Delete one blob a write just stopped referencing, unless another
     /// entry still shares it.
     fn release(&self, sha256: &str) -> anyhow::Result<()> {
-        if self.referenced(sha256) {
+        if !offline::release_blob(true, self.referenced(sha256)) {
             return Ok(());
         }
         match self.blobs.remove_file(sha256) {
@@ -659,19 +672,14 @@ impl Store {
             ),
             RestoreChoice::Reapply => {
                 for pin in pins {
-                    let entry = self
+                    let held = self
                         .manifest
                         .downloads
                         .iter()
                         .find(|d| d.identity.download_id == pin.download_id)
-                        .context("a pin names a download this cache does not hold")?;
+                        .map(|d| &d.identity);
                     ensure!(
-                        pin.viewing_epoch.as_deref() == Some(current)
-                            && pin.timeline_id == entry.identity.timeline_id
-                            && pin.timeline_revision == entry.identity.timeline_revision
-                            && pin.source_revision == entry.identity.source_revision
-                            && offline::sequence(&pin.base_viewing_revision).is_some()
-                            && offline::sequence(&pin.base_manual_epoch).is_some(),
+                        offline::restored_pin_admitted(current, pin, held),
                         "a pin does not describe this cache's download under the current history"
                     );
                 }
@@ -724,13 +732,41 @@ impl Store {
     /// Compact the events the server acknowledged through `through` (its
     /// `next_device_sequence - 1`). An acknowledgement beyond anything this
     /// log wrote is refused and erases nothing.
-    pub fn acknowledge(&self, through: u64) -> anyhow::Result<EventLog> {
+    pub fn acknowledge(&mut self, through: u64) -> anyhow::Result<EventLog> {
         let log = self.events()?;
         let Some((base_sequence, events)) =
             offline::compact(log.base_sequence, &log.events, through)
         else {
             bail!("the server acknowledged sequences this device never wrote");
         };
+        // The offline host resumes from the newest retained event; keep that
+        // checkpoint in the manifest before compaction removes the events.
+        // The causal base is unchanged: only a rebase after reading the
+        // server may move it.
+        let mut next = self.manifest.clone();
+        let mut changed = false;
+        for entry in &mut next.downloads {
+            let latest = log.events.iter().rev().find(|e| {
+                e.media.download_id == entry.identity.download_id
+                    && offline::sequence(&e.device_sequence).is_some_and(|s| s <= through)
+            });
+            if let Some(e) = latest {
+                let position = playscale_core::timeline_viewing::resume_position(
+                    playscale_core::timeline_viewing::ResumePolicy::Offline,
+                    Some(e.position_ms),
+                    e.status == "ended",
+                    Some(entry.duration_ms),
+                );
+                let resume = (position > 0).then_some(position);
+                if entry.resume_position_ms != resume {
+                    entry.resume_position_ms = resume;
+                    changed = true;
+                }
+            }
+        }
+        if changed {
+            self.write_manifest(next)?;
+        }
         let next = EventLog {
             base_viewing_epoch: offline::compacted_epoch(
                 log.base_viewing_epoch.as_deref(),
@@ -766,30 +802,6 @@ impl Store {
             results,
             next_device_sequence,
         );
-        // The offline host resumes from the newest retained event; keep that
-        // checkpoint in the manifest before compaction removes the events.
-        // The causal base is unchanged: only a rebase after reading the
-        // server may move it.
-        let mut next = self.manifest.clone();
-        let mut changed = false;
-        for entry in &mut next.downloads {
-            let latest = log.events.iter().rev().find(|e| {
-                e.media.download_id == entry.identity.download_id
-                    && offline::sequence(&e.device_sequence).is_some_and(|s| s <= through)
-            });
-            if let Some(e) = latest {
-                let resume = (e.status != "ended" && e.position_ms < entry.duration_ms)
-                    .then_some(e.position_ms)
-                    .filter(|p| *p > 0);
-                if entry.resume_position_ms != resume {
-                    entry.resume_position_ms = resume;
-                    changed = true;
-                }
-            }
-        }
-        if changed {
-            self.write_manifest(next)?;
-        }
         self.acknowledge(through)
     }
 
@@ -818,7 +830,9 @@ impl Store {
         let sides_ready = sides.iter().all(|(name, sha256, _)| {
             self.staging.metadata(name).is_ok() || self.blobs.metadata(sha256).is_ok()
         });
-        if staged_exists || !blob_exists || !sides_ready {
+        if offline::cache_publication(false, false, staged_exists, blob_exists, sides_ready)
+            != offline::CachePublication::VerifyRecovery
+        {
             return Ok(false);
         }
         let mut blob = self.blobs.open(&entry.sha256)?;
@@ -912,7 +926,13 @@ impl Store {
                 &serde_json::to_vec(&log)?,
             )?;
         }
-        let resume = resume_position_ms.filter(|p| *p < entry.duration_ms);
+        let position = playscale_core::timeline_viewing::resume_position(
+            playscale_core::timeline_viewing::ResumePolicy::Offline,
+            resume_position_ms,
+            false, // The caller supplies the server's already-selected resume point.
+            Some(entry.duration_ms),
+        );
+        let resume = (position > 0).then_some(position);
         if entry.identity.base_viewing_revision == viewing_revision
             && entry.identity.base_manual_epoch == manual_epoch
             && entry.identity.viewing_epoch.as_deref() == Some(viewing_epoch)

@@ -73,24 +73,44 @@ pub(crate) async fn file_facts(
     conn: &mut sqlx::SqliteConnection,
     file_id: &str,
 ) -> Result<Option<FileFacts>, Problem> {
-    let revision: Option<String> =
-        sqlx::query_scalar("SELECT revision FROM media_files WHERE id=? AND available=1")
+    let row: Option<(String, bool)> =
+        sqlx::query_as("SELECT revision,generated FROM media_files WHERE id=? AND available=1")
             .bind(file_id)
             .fetch_optional(&mut *conn)
             .await?;
-    let Some(revision) = revision else {
+    let Some((revision, generated)) = row else {
         return Ok(None);
     };
-    // A generated rendition lives in the managed output store, which is no
-    // logical library: it is in the libraries of the source it renders, while
-    // its registration still matches both current revisions. A stale or
-    // orphaned rendition is in no library and so readable by no grant.
-    let library_ids = sqlx::query_scalar::<_, String>(
-        "SELECT ls.library_id FROM library_sources ls JOIN media_files f ON f.library_id=ls.source_id WHERE f.id=? AND f.generated=0 \
-         UNION SELECT ls.library_id FROM renditions r JOIN media_files g ON g.id=r.file_id AND g.revision=r.file_revision \
-         JOIN media_files s ON s.id=r.source_file_id AND s.revision=r.source_revision AND s.generated=0 \
-         JOIN library_sources ls ON ls.source_id=s.library_id WHERE r.file_id=? AND g.generated=1"
-    ).bind(file_id).bind(file_id).fetch_all(conn).await?.into_iter().collect();
+    // Observe direct memberships and registered lineage without deciding which
+    // revision combinations confer authority in SQL.
+    let direct: Vec<String> = sqlx::query_scalar(
+        "SELECT ls.library_id FROM library_sources ls JOIN media_files f ON f.library_id=ls.source_id WHERE f.id=?")
+        .bind(file_id).fetch_all(&mut *conn).await?;
+    type Lineage = (String, String, Option<String>, Option<bool>, Option<String>);
+    let rows: Vec<Lineage> = sqlx::query_as(
+        "SELECT r.file_revision,r.source_revision,s.revision,s.generated,ls.library_id FROM renditions r \
+         LEFT JOIN media_files s ON s.id=r.source_file_id LEFT JOIN library_sources ls ON ls.source_id=s.library_id WHERE r.file_id=?")
+        .bind(file_id).fetch_all(conn).await?;
+    let lineage: Vec<_> = rows
+        .into_iter()
+        .map(
+            |(
+                registered_output_revision,
+                registered_source_revision,
+                current_source_revision,
+                source_generated,
+                library,
+            )| playscale_core::renditions::LineageMembership {
+                registered_output_revision,
+                registered_source_revision,
+                current_source_revision,
+                source_generated,
+                library,
+            },
+        )
+        .collect();
+    let library_ids =
+        playscale_core::renditions::library_scope(generated, &revision, direct, &lineage);
     Ok(Some(FileFacts {
         library_ids,
         revision,
@@ -472,4 +492,60 @@ pub async fn file_content(
         }
         problem
     })
+}
+
+#[cfg(test)]
+mod lineage_tests {
+    use super::*;
+    #[tokio::test]
+    async fn lineage_policy_matches_join_scope_for_stale_orphaned_and_generated_sources() {
+        use sqlx::Connection;
+        let mut conn = sqlx::SqliteConnection::connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::raw_sql("CREATE TABLE media_files(id TEXT PRIMARY KEY,revision TEXT,available INTEGER,generated INTEGER,library_id TEXT); CREATE TABLE library_sources(library_id TEXT,source_id TEXT); CREATE TABLE renditions(file_id TEXT,file_revision TEXT,source_file_id TEXT,source_revision TEXT);").execute(&mut conn).await.unwrap();
+        sqlx::raw_sql("INSERT INTO library_sources VALUES ('direct','output-root'),('source-a','source-root'),('source-b','source-root');").execute(&mut conn).await.unwrap();
+        for mask in 0..64 {
+            sqlx::raw_sql("DELETE FROM media_files; DELETE FROM renditions;")
+                .execute(&mut conn)
+                .await
+                .unwrap();
+            let generated = mask & 1 != 0;
+            let output_current = mask & 2 != 0;
+            let source_current = mask & 4 != 0;
+            let source_generated = mask & 8 != 0;
+            let source_present = mask & 16 != 0;
+            let registered = mask & 32 != 0;
+            sqlx::query("INSERT INTO media_files VALUES ('out','r',1,?,'output-root')")
+                .bind(generated)
+                .execute(&mut conn)
+                .await
+                .unwrap();
+            if source_present {
+                sqlx::query("INSERT INTO media_files VALUES ('src',?,1,?,'source-root')")
+                    .bind(if source_current { "s" } else { "new" })
+                    .bind(source_generated)
+                    .execute(&mut conn)
+                    .await
+                    .unwrap();
+            }
+            if registered {
+                sqlx::query("INSERT INTO renditions VALUES ('out',?,'src','s')")
+                    .bind(if output_current { "r" } else { "stale" })
+                    .execute(&mut conn)
+                    .await
+                    .unwrap();
+            }
+            let old:std::collections::BTreeSet<String>=sqlx::query_scalar::<_,String>("SELECT ls.library_id FROM library_sources ls JOIN media_files f ON f.library_id=ls.source_id WHERE f.id='out' AND f.generated=0 UNION SELECT ls.library_id FROM renditions r JOIN media_files g ON g.id=r.file_id AND g.revision=r.file_revision JOIN media_files s ON s.id=r.source_file_id AND s.revision=r.source_revision AND s.generated=0 JOIN library_sources ls ON ls.source_id=s.library_id WHERE r.file_id='out' AND g.generated=1").fetch_all(&mut conn).await.unwrap().into_iter().collect();
+            assert_eq!(
+                file_facts(&mut conn, "out")
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .library_ids,
+                old,
+                "mask {mask}"
+            );
+        }
+    }
 }

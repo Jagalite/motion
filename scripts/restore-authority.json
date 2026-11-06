@@ -1,0 +1,15 @@
+[
+ ["access_invitations", "DELETE FROM access_invitations"],
+ ["signin_outbox", "DELETE FROM signin_outbox"],
+ ["signin_mail_tests", "DELETE FROM signin_mail_tests"],
+ ["signin_transactions", "DELETE FROM signin_transactions"],
+ ["signin_requests", "DELETE FROM signin_requests"],
+ ["signin_proofs", "DELETE FROM signin_proofs"],
+ ["signin_families", "UPDATE signin_families SET revoked=1,revision=revision+1"],
+ ["content_tickets", "DELETE FROM content_tickets"],
+ ["pairings", "DELETE FROM pairings"],
+ ["idempotency_records", "DELETE FROM idempotency_records"],
+ ["catalog_review_plans", "DELETE FROM catalog_review_plans"],
+ ["credentials", "DELETE FROM credentials"],
+ ["devices", "UPDATE devices SET revoked=1"]
+]

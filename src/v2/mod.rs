@@ -119,7 +119,7 @@ pub struct Runtime {
     pub(crate) renders: std::sync::Arc<tokio::sync::Semaphore>,
     pub settings: ApiSettings,
     buckets: Mutex<HashMap<String, (f64, Instant)>>,
-    /// Hash and deadline of the one-use desktop bootstrap secret.
+    /// Hash and monotonic issuance time of the one-use desktop bootstrap secret.
     bootstrap: Mutex<Option<(String, Instant)>>,
     pub mode: AccessMode,
     /// Changes on every process start; distinct from the database restore epoch.
@@ -152,10 +152,7 @@ impl Runtime {
     /// Accept a desktop bootstrap secret for `BOOTSTRAP_SECONDS`, once.
     pub fn set_bootstrap(&self, secret: &str) -> anyhow::Result<()> {
         anyhow::ensure!(secret.len() >= 32, "bootstrap secret is too short");
-        *self.bootstrap.lock().unwrap() = Some((
-            auth::token_hash(secret),
-            Instant::now() + std::time::Duration::from_secs(BOOTSTRAP_SECONDS),
-        ));
+        *self.bootstrap.lock().unwrap() = Some((auth::token_hash(secret), Instant::now()));
         Ok(())
     }
 
@@ -163,16 +160,25 @@ impl Runtime {
     /// Any presentation, right or wrong, after the deadline clears it.
     pub(crate) fn take_bootstrap(&self, secret: &str) -> bool {
         let mut slot = self.bootstrap.lock().unwrap();
-        match slot.as_ref() {
-            Some((_, deadline)) if Instant::now() >= *deadline => {
+        let presented = auth::token_hash(secret);
+        let (expected, elapsed) = slot.as_ref().map_or((None, 0), |(hash, issued)| {
+            (Some(hash.as_str()), issued.elapsed().as_secs())
+        });
+        match playscale_core::access::admit_bootstrap(
+            expected,
+            &presented,
+            elapsed,
+            BOOTSTRAP_SECONDS,
+        ) {
+            playscale_core::access::BootstrapAdmission::Keep => false,
+            playscale_core::access::BootstrapAdmission::Expire => {
                 *slot = None;
                 false
             }
-            Some((hash, _)) if *hash == auth::token_hash(secret) => {
+            playscale_core::access::BootstrapAdmission::ReserveAndBurn => {
                 *slot = None;
                 true
             }
-            _ => false,
         }
     }
 

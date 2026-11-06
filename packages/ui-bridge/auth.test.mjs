@@ -4,7 +4,7 @@ import {readFileSync} from 'node:fs';
 import {test} from 'node:test';
 import {runInNewContext} from 'node:vm';
 
-const source = readFileSync(new URL('./auth.js', import.meta.url), 'utf8');
+const source = readFileSync(new URL('./mutation.mjs', import.meta.url), 'utf8').replaceAll('export ', '') + '\n' + readFileSync(new URL('./auth.js', import.meta.url), 'utf8');
 class Element {
   constructor(tag) {
     this.tagName = tag;
@@ -269,7 +269,7 @@ test('OIDC callback transaction query shows terminal status and follows signed-i
 });
 
 const settle = () => new Promise(resolve => setTimeout(resolve, 0));
-async function submit(form) { form.events.submit({preventDefault() {}}); for (let i = 0; i < 5; i++) await settle(); }
+async function submit(form) { await form.events.submit({preventDefault() {}}); for (let i = 0; i < 5; i++) await settle(); }
 const forms = root => root.ofTag('form');
 const inputs = root => root.ofTag('input');
 
@@ -459,3 +459,17 @@ test('owner setup is offered only on a server without users and approves no devi
     assert.equal(other.byText('First run: create the Owner'), undefined, state);
   }
 });
+
+for (const [status, code, retain] of [[401, null, true], [403, null, true], [404, null, true],
+  [409, 'idempotency_key_reused', true], [409, 'idempotent_replay_unavailable', true], [412, 'revision_conflict', false]]) {
+  test(`auth unknown then ${status}/${code} preserves unresolved intent`, async () => {
+    const calls = [];
+    const client = harness(async (_, options) => {
+      calls.push(options.headers['Idempotency-Key']);
+      return response(calls.length === 2 ? status : 503, {code});
+    });
+    for (let i = 0; i < 3; i++) await assert.rejects(client.mutation(new Element('div'), 'PUT', '/users/u1', {name: 'N'}, {revision: '3'}));
+    assert.equal(calls[0], calls[1]);
+    assert.equal(calls[0] === calls[2], retain);
+  });
+}

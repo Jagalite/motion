@@ -455,9 +455,50 @@ async fn announce(
 /// viewing state names, if that session is on this delivery, otherwise the
 /// newest. Timestamps have one-second precision, so a tie between a
 /// superseded and a replacing session is broken by that recorded fact.
-pub const AUTHORITATIVE_VIEWING: &str = "SELECT vs.id,vs.revision,vs.status,vs.position_ms,vs.updated_at FROM viewing_sessions vs \
-    LEFT JOIN timeline_viewing tv ON tv.profile_id=vs.profile_id AND tv.timeline_id=vs.timeline_id AND tv.session_id=vs.id \
-    WHERE vs.delivery_id=? ORDER BY tv.session_id IS NULL, vs.updated_at DESC, vs.revision DESC, vs.id DESC LIMIT 1";
+pub async fn authoritative_viewing(
+    conn: &mut sqlx::SqliteConnection,
+    delivery: &str,
+) -> Result<Option<(String, i64, String, i64, i64)>, sqlx::Error> {
+    use playscale_core::playback_monitor::{ViewingAuthority, prefer_viewing};
+    // SQL observes membership; core selects authority, including every tie.
+    let mut rows = sqlx::query_as::<_, (String, i64, String, i64, i64, bool)>(
+        "SELECT vs.id,vs.revision,vs.status,vs.position_ms,vs.updated_at,tv.session_id IS NOT NULL FROM viewing_sessions vs \
+         LEFT JOIN timeline_viewing tv ON tv.profile_id=vs.profile_id AND tv.timeline_id=vs.timeline_id AND tv.session_id=vs.id \
+         WHERE vs.delivery_id=?")
+        .bind(delivery).fetch(conn);
+    let authority = |r: &(String, i64, String, i64, i64, bool)| (r.5, r.4, r.1);
+    let mut selected: Option<(String, i64, String, i64, i64, bool)> = None;
+    // Stream one SQLite statement: constant memory and a consistent read.
+    while let Some(row) = std::future::poll_fn(|cx| rows.as_mut().poll_next(cx)).await {
+        let row = row?;
+        let better = selected.as_ref().is_none_or(|prior| {
+            let (current, updated_at, revision) = authority(&row);
+            let (pcurrent, pupdated, prevision) = authority(prior);
+            prefer_viewing(
+                ViewingAuthority {
+                    current,
+                    updated_at,
+                    revision,
+                    id: &row.0,
+                },
+                ViewingAuthority {
+                    current: pcurrent,
+                    updated_at: pupdated,
+                    revision: prevision,
+                    id: &prior.0,
+                },
+            )
+        });
+        if better {
+            selected = Some(row);
+        }
+    }
+    Ok(
+        selected.map(|(id, revision, status, position, updated, _)| {
+            (id, revision, status, position, updated)
+        }),
+    )
+}
 
 /// A live delivery as a flush sees it.
 pub struct Live {
@@ -478,10 +519,7 @@ pub async fn flush(db: &sqlx::SqlitePool, live: &[Live]) -> Result<(), sqlx::Err
     }
     let mut conn = db.acquire().await?;
     for session in live {
-        let row: Option<(String, i64, String, i64, i64)> = sqlx::query_as(AUTHORITATIVE_VIEWING)
-            .bind(&session.id)
-            .fetch_optional(&mut *conn)
-            .await?;
+        let row = authoritative_viewing(&mut conn, &session.id).await?;
         if let Some((id, revision, status, position, updated)) = row
             && let Some(status) = Viewing::parse(&status)
         {
@@ -595,6 +633,80 @@ pub async fn prune(db: &sqlx::SqlitePool) -> Result<(), sqlx::Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn sqlite_authority_loader_preserves_current_and_all_ties() {
+        use sqlx::Connection;
+        let mut conn = sqlx::SqliteConnection::connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::raw_sql("CREATE TABLE viewing_sessions(id TEXT,revision INTEGER,status TEXT,position_ms INTEGER,updated_at INTEGER,profile_id TEXT,timeline_id TEXT,delivery_id TEXT); CREATE TABLE timeline_viewing(profile_id TEXT,timeline_id TEXT,session_id TEXT);").execute(&mut conn).await.unwrap();
+        assert!(
+            authoritative_viewing(&mut conn, "d")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        for (id, revision, updated, delivery) in [
+            ("a", 1, 10, "d"),
+            ("b", 2, 10, "d"),
+            ("c", 2, 10, "d"),
+            ("z", 99, 99, "other"),
+        ] {
+            sqlx::query("INSERT INTO viewing_sessions VALUES (?,?,'paused',42,?,'p','t',?)")
+                .bind(id)
+                .bind(revision)
+                .bind(updated)
+                .bind(delivery)
+                .execute(&mut conn)
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            authoritative_viewing(&mut conn, "d")
+                .await
+                .unwrap()
+                .unwrap()
+                .0,
+            "c"
+        );
+        sqlx::query("INSERT INTO timeline_viewing VALUES ('p','t','a')")
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        assert_eq!(
+            authoritative_viewing(&mut conn, "d")
+                .await
+                .unwrap()
+                .unwrap()
+                .0,
+            "a"
+        );
+        sqlx::query("UPDATE timeline_viewing SET session_id='z'")
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        assert_eq!(
+            authoritative_viewing(&mut conn, "d")
+                .await
+                .unwrap()
+                .unwrap()
+                .0,
+            "c"
+        );
+        sqlx::query("UPDATE viewing_sessions SET updated_at=11 WHERE id='b'")
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        assert_eq!(
+            authoritative_viewing(&mut conn, "d")
+                .await
+                .unwrap()
+                .unwrap()
+                .0,
+            "b"
+        );
+    }
 
     #[test]
     fn classifies_networks_without_exposing_addresses() {

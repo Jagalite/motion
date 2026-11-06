@@ -168,6 +168,101 @@ pub enum Observation {
     Withdrawn,
 }
 
+/// Typed owner observations; adapters read rows, core decides whether their
+/// purpose, history, redemption and deadlines still admit delivery.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OwnerObservation<'a> {
+    Missing,
+    Challenge {
+        purpose: crate::signin::Purpose,
+        pending: bool,
+        server_epoch: &'a str,
+        epoch: &'a str,
+    },
+    Invitation {
+        revoked: bool,
+        device_claimed: bool,
+        identity_claimed: bool,
+        expires_at: i64,
+    },
+    Test {
+        expires_at: i64,
+    },
+    AccountNotice,
+}
+
+pub fn owner_eligible(
+    m: &Message,
+    owner: OwnerObservation<'_>,
+    server_epoch: &str,
+    now: i64,
+) -> bool {
+    match (m.purpose, owner) {
+        (
+            Purpose::SigninCode | Purpose::RegistrationCode,
+            OwnerObservation::Challenge {
+                purpose,
+                pending,
+                server_epoch: observed_server,
+                epoch,
+            },
+        ) => {
+            pending
+                && observed_server == server_epoch
+                && epoch == m.epoch
+                && ((m.purpose == Purpose::RegistrationCode)
+                    == (purpose == crate::signin::Purpose::Register))
+        }
+        (
+            Purpose::Invitation,
+            OwnerObservation::Invitation {
+                revoked,
+                device_claimed,
+                identity_claimed,
+                expires_at,
+            },
+        ) => !revoked && !device_claimed && !identity_claimed && now < expires_at,
+        (Purpose::Test, OwnerObservation::Test { expires_at }) => now < expires_at,
+        (Purpose::AccountNotice, OwnerObservation::AccountNotice) => true,
+        _ => false,
+    }
+}
+
+pub fn configuration_admits(purpose: Purpose, enabled: bool) -> bool {
+    enabled || purpose == Purpose::Test
+}
+
+/// Once writing the terminator starts, partial writes/flush errors cannot
+/// establish non-delivery. Preserve uncertainty instead of retrying as a
+/// definitely unsubmitted message.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SubmissionProgress {
+    BeforeTerminator,
+    TerminatorStarted,
+}
+
+pub fn interrupted_submission(progress: SubmissionProgress) -> Observation {
+    match progress {
+        SubmissionProgress::BeforeTerminator => Observation::Temporary(Stage::Message),
+        SubmissionProgress::TerminatorStarted => Observation::Ambiguous,
+    }
+}
+
+/// Reserve a margin for recording the observation before another worker can
+/// reclaim the lease. This is a bound on the whole effect, including DNS and
+/// the pre-transmission database check, not a fresh bound for every route.
+pub fn attempt_budget_seconds(m: &Message, now: i64) -> u64 {
+    m.lease.as_ref().map_or(0, |lease| {
+        // A backward wall-clock observation must not enlarge the configured
+        // whole-attempt duration beyond its original lease budget.
+        lease
+            .until
+            .saturating_sub(now)
+            .saturating_sub(60)
+            .clamp(0, LEASE_SECONDS - 60) as u64
+    })
+}
+
 /// Every durable fact deciding whether a message may still be attempted.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Message {
@@ -445,6 +540,119 @@ pub fn try_next_route(outcome: Observation) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn owner_observations_are_purpose_and_history_bound() {
+        let mut m = message();
+        for purpose in [
+            Purpose::SigninCode,
+            Purpose::RegistrationCode,
+            Purpose::Invitation,
+            Purpose::Test,
+            Purpose::AccountNotice,
+        ] {
+            m.purpose = purpose;
+            assert!(!owner_eligible(&m, OwnerObservation::Missing, "server", 10));
+            assert_eq!(
+                configuration_admits(purpose, false),
+                purpose == Purpose::Test
+            );
+            assert!(configuration_admits(purpose, true));
+            for pending in [false, true] {
+                for server_epoch in ["server", "old"] {
+                    for epoch in [m.epoch.as_str(), "old"] {
+                        assert_eq!(
+                            owner_eligible(
+                                &m,
+                                OwnerObservation::Challenge {
+                                    purpose: if m.purpose == Purpose::RegistrationCode {
+                                        crate::signin::Purpose::Register
+                                    } else {
+                                        crate::signin::Purpose::Login
+                                    },
+                                    pending,
+                                    server_epoch,
+                                    epoch
+                                },
+                                "server",
+                                10
+                            ),
+                            matches!(purpose, Purpose::SigninCode | Purpose::RegistrationCode)
+                                && pending
+                                && server_epoch == "server"
+                                && epoch == m.epoch
+                        );
+                    }
+                }
+            }
+            for revoked in [false, true] {
+                for device_claimed in [false, true] {
+                    for identity_claimed in [false, true] {
+                        for expires_at in [9, 10, 11] {
+                            assert_eq!(
+                                owner_eligible(
+                                    &m,
+                                    OwnerObservation::Invitation {
+                                        revoked,
+                                        device_claimed,
+                                        identity_claimed,
+                                        expires_at
+                                    },
+                                    "server",
+                                    10
+                                ),
+                                purpose == Purpose::Invitation
+                                    && !revoked
+                                    && !device_claimed
+                                    && !identity_claimed
+                                    && expires_at > 10
+                            );
+                        }
+                    }
+                }
+            }
+            for expires_at in [9, 10, 11] {
+                assert_eq!(
+                    owner_eligible(&m, OwnerObservation::Test { expires_at }, "server", 10),
+                    purpose == Purpose::Test && expires_at > 10
+                );
+            }
+            assert_eq!(
+                owner_eligible(&m, OwnerObservation::AccountNotice, "server", 10),
+                purpose == Purpose::AccountNotice
+            );
+        }
+    }
+
+    #[test]
+    fn interruption_and_whole_attempt_budget_preserve_uncertainty() {
+        assert_eq!(
+            interrupted_submission(SubmissionProgress::BeforeTerminator),
+            Observation::Temporary(Stage::Message)
+        );
+        assert_eq!(
+            interrupted_submission(SubmissionProgress::TerminatorStarted),
+            Observation::Ambiguous
+        );
+        let mut m = message();
+        assert_eq!(attempt_budget_seconds(&m, 0), 0);
+        m.lease = Some(Lease {
+            attempt: 1,
+            token: "lease".into(),
+            until: 600,
+        });
+        for (now, expected) in [
+            (i64::MIN, 540),
+            (-3600, 540),
+            (0, 540),
+            (539, 1),
+            (540, 0),
+            (600, 0),
+            (i64::MAX, 0),
+        ] {
+            assert_eq!(attempt_budget_seconds(&m, now), expected);
+        }
+    }
 
     fn message() -> Message {
         Message {

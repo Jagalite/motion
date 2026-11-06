@@ -415,32 +415,39 @@ async fn redact(
     let items = strings(body.get("item_ids"), "");
     if !items.is_empty() {
         let visible = visible_items(conn, scope, &items).await?;
-        body["item_ids"] = items
-            .into_iter()
-            .filter(|id| visible.contains(id))
-            .collect::<Vec<_>>()
-            .into();
+        body["item_ids"] = org::disclose_items(&items, &visible).into();
     }
-    let timelines = strings(body.get("entries"), "timeline_id");
-    if !timelines.is_empty() {
-        let visible = visible_timelines(conn, scope, &timelines.iter().collect()).await?;
-        let entries: Vec<serde_json::Value> = body["entries"]
-            .as_array()
-            .cloned()
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|e| {
-                e["timeline_id"]
-                    .as_str()
-                    .is_some_and(|t| visible.contains(t))
+    if let Some(stored_entries) = body.get("entries").and_then(|v| v.as_array()) {
+        let entries: Vec<Entry> = stored_entries
+            .iter()
+            .filter_map(|e| {
+                Some(Entry {
+                    entry_id: e["entry_id"].as_str()?.to_owned(),
+                    timeline_id: e["timeline_id"].as_str()?.to_owned(),
+                })
             })
             .collect();
-        if let Some(current) = body.get("current_entry_id").and_then(|c| c.as_str())
-            && !entries.iter().any(|e| e["entry_id"] == current)
-        {
-            body["current_entry_id"] = serde_json::Value::Null;
+        let hidden = hidden_entries(conn, scope, &entries).await?;
+        let disclosed = org::disclose_entries(
+            &entries,
+            body.get("current_entry_id").and_then(|v| v.as_str()),
+            &hidden,
+        );
+        let keep: BTreeSet<_> = disclosed
+            .entries
+            .iter()
+            .map(|e| e.entry_id.as_str())
+            .collect();
+        let visible: Vec<_> = stored_entries
+            .iter()
+            .filter(|e| e["entry_id"].as_str().is_some_and(|id| keep.contains(id)))
+            .cloned()
+            .collect();
+        if body.get("current_entry_id").is_some() {
+            body["current_entry_id"] =
+                serde_json::to_value(disclosed.current).map_err(Problem::internal)?;
         }
-        body["entries"] = entries.into();
+        body["entries"] = visible.into();
     }
     Ok(())
 }
@@ -898,9 +905,9 @@ fn entries_in(entries: Vec<EntryBody>) -> Result<Vec<Entry>, Problem> {
 }
 
 fn entries_out(entries: &[Entry], hidden: &BTreeSet<String>) -> Vec<EntryBody> {
-    entries
-        .iter()
-        .filter(|e| !hidden.contains(&e.entry_id))
+    org::disclose_entries(entries, None, hidden)
+        .entries
+        .into_iter()
         .map(|e| EntryBody {
             entry_id: e.entry_id.clone(),
             timeline_id: e.timeline_id.clone(),
@@ -1088,13 +1095,14 @@ async fn queue_body(
     q: org::Queue,
 ) -> Result<(QueueBody, u64), Problem> {
     let hidden = hidden_entries(conn, scope, &q.entries).await?;
+    let disclosure = org::disclose_entries(&q.entries, q.current.as_deref(), &hidden);
     Ok((
         QueueBody {
             id,
             revision: q.revision.to_string(),
             profile_id,
             entries: entries_out(&q.entries, &hidden),
-            current_entry_id: q.current.filter(|c| !hidden.contains(c)),
+            current_entry_id: disclosure.current,
             repeat: q.repeat,
             shuffle_seed: q.shuffle_seed.map(|s| s.to_string()),
         },
