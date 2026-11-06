@@ -1,4 +1,5 @@
-"""Reject machine-specific paths, private configuration and private Git identities."""
+"""Reject private source content; optionally enforce public Git identities."""
+import argparse
 import fnmatch
 from pathlib import Path
 import re
@@ -39,7 +40,7 @@ def history_exceptions(path=HISTORY_EXCEPTIONS):
 def identity_failures(root, exceptions=None):
     exceptions = history_exceptions() if exceptions is None else exceptions
     # Check the history being published (everything reachable from HEAD), not
-    # unrelated local branches; CI must check out full history for this to be complete.
+    # unrelated local branches. Strict callers need full history for a complete scan.
     log = subprocess.check_output(['git', 'log', 'HEAD', '--format=%H%x00%ae%x00%ce'], cwd=root).decode()
     failures = []
     for line in log.splitlines():
@@ -71,14 +72,20 @@ def source_failures(root, names):
     return failures
 
 
-def check(root):
+def check(root, *, check_history=True):
     names = subprocess.check_output(['git', 'ls-files', '-z'], cwd=root).decode().split('\0')
     failures = source_failures(root, filter(None, names))
-    failures.extend(identity_failures(root))
+    if check_history:
+        failures.extend(identity_failures(root))
     if failures:
         raise SystemExit('\n'.join(failures))
-    print('Publication privacy checks passed for tracked source and Git identities.')
+    scope = 'tracked source and Git identities' if check_history else 'tracked source'
+    print(f'Publication privacy checks passed for {scope}.')
 
 
 if __name__ == '__main__':
-    check(Path(__file__).resolve().parents[1])
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--source-only', action='store_true',
+                        help='Scan tracked source without restricting commit email identities')
+    args = parser.parse_args()
+    check(Path(__file__).resolve().parents[1], check_history=not args.source_only)

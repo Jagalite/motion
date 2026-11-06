@@ -9,13 +9,12 @@ permissions:
 
 jobs:
   macos-arm64:
-    runs-on: macos-14
+    runs-on: macos-15
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
         with:
-          # As in licenses.yml: check the pushed head, not GitHub's synthetic
-          # merge commit, with the full history the identity check reads.
+          # As in licenses.yml: check the pushed head, not the synthetic merge.
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
           fetch-depth: 0
       - uses: actions/setup-node@v4
@@ -39,7 +38,7 @@ jobs:
           brew install pkg-config
       - name: Test integration adapters
         run: |
-          python3 scripts/check_publication.py
+          python3 scripts/check_publication.py --source-only
           node --test scripts/test_demuxe_integration.mjs
           python3 scripts/test_packaging.py
           cargo test --locked -p playscale --lib config::tests

@@ -229,5 +229,8 @@ contains your local paths; keep that output private.
 
 Release packaging removes archive owner metadata, remaps Rust compiler paths,
 and rejects private machine paths or tailnet hostnames in the assembled app.
-Run `python3 scripts/check_publication.py` before publishing source; the CI notice
-workflow also runs this check. Upstream license and author notices are retained.
+Run `python3 scripts/check_publication.py` before publishing source to check both
+tracked source and commit-email identities. CI uses `--source-only`: private
+configuration, machine paths and tailnet hostnames still fail, while commit email
+addresses are not restricted. Dependency license checks and upstream license and
+author notices are retained.

@@ -45,7 +45,7 @@ env:
 jobs:
   heavy-tests:
     name: Heavy tests (Stateless models, live FFmpeg delivery)
-    runs-on: macos-14
+    runs-on: macos-15
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
@@ -73,7 +73,7 @@ jobs:
 
   integration:
     name: Real-process integration, upgrade and restore
-    runs-on: macos-14
+    runs-on: macos-15
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4

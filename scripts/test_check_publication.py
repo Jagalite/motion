@@ -1,4 +1,6 @@
-"""Git identity rules of the publication privacy check, against disposable repositories."""
+"""Publication source and optional Git identity checks against disposable repositories."""
+import contextlib
+import io
 import os
 import pathlib
 import subprocess
@@ -71,6 +73,46 @@ class Identities(unittest.TestCase):
 
     def test_checked_in_exceptions_parse(self):
         self.assertTrue(check_publication.history_exceptions())
+
+    def track(self, name, content='example'):
+        path = self.repo / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content)
+        subprocess.run(['git', 'add', '--', name], cwd=self.repo, check=True)
+
+    def test_source_only_allows_private_identity_without_printing_it(self):
+        commit(self.repo, PRIVATE, PRIVATE, 'private')
+        self.track('README.md')
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            check_publication.check(self.repo, check_history=False)
+        self.assertIn('passed for tracked source.', output.getvalue())
+        self.assertNotIn(PRIVATE[1], output.getvalue())
+        with self.assertRaises(SystemExit):
+            check_publication.check(self.repo)
+
+    def test_source_only_still_rejects_private_configuration(self):
+        for name in ('.env', '.env.production', 'config.json', 'admin-token',
+                     '.npmrc', '.netrc', '.pypirc', 'settings.local.json'):
+            with self.subTest(name=name):
+                self.track(name)
+                with self.assertRaisesRegex(SystemExit, 'private configuration'):
+                    check_publication.check(self.repo, check_history=False)
+                subprocess.run(['git', 'rm', '-q', '-f', '--', name], cwd=self.repo, check=True)
+
+    def test_source_only_still_rejects_machine_paths_and_private_hosts(self):
+        cases = [('/' + 'Users/example/project', 'absolute developer-machine path'),
+                 ('example.private' + '.ts.net', 'private tailnet hostname')]
+        for content, reason in cases:
+            with self.subTest(reason=reason):
+                self.track('README.md', content)
+                with self.assertRaisesRegex(SystemExit, reason):
+                    check_publication.check(self.repo, check_history=False)
+
+    def test_source_only_allows_documented_examples(self):
+        self.track('.env.example', 'SERVER=your-server.your-tailnet' + '.ts.net')
+        with contextlib.redirect_stdout(io.StringIO()):
+            check_publication.check(self.repo, check_history=False)
 
 
 if __name__ == '__main__':
