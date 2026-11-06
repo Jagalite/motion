@@ -1,5 +1,7 @@
 //! Live HLS delivery against real FFmpeg/FFprobe from PATH. Skips (with a message)
 //! when either tool is missing.
+#[path = "support/audio_fixture.rs"]
+mod audio_fixture;
 #[path = "support/service_router.rs"]
 mod service_router;
 
@@ -1051,6 +1053,7 @@ async fn copy_routes_start_at_keyframes_and_keep_source_video() {
     // The AC-3 file is converted from its start, where B-frame decode times are
     // negative: a shifted output would fail the keyframe verification.
     for (name, audio) in [("aac.mkv", "aac"), ("ac3.mkv", "ac3")] {
+        let audio = audio_fixture::audio_fixture(f.dir.path(), audio, 48000, 440);
         let status = Command::new("ffmpeg")
             .args([
                 "-v",
@@ -1059,10 +1062,8 @@ async fn copy_routes_start_at_keyframes_and_keep_source_video() {
                 "lavfi",
                 "-i",
                 "testsrc2=size=320x240:rate=24",
-                "-f",
-                "lavfi",
                 "-i",
-                "sine=frequency=440:sample_rate=48000",
+                audio.to_str().unwrap(),
                 "-t",
                 "60",
                 // Main profile with B-frames: negative decode times at the start
@@ -1081,8 +1082,8 @@ async fn copy_routes_start_at_keyframes_and_keep_source_video() {
                 "-sc_threshold",
                 "0",
                 "-c:a",
-                audio,
-                // Normalize encoder priming in the fixture, not production eligibility.
+                "copy",
+                // Keep the raw audio packet timeline explicitly zero-based.
                 "-bsf:a",
                 "setts=pts=PTS-STARTPTS:dts=DTS-STARTDTS",
             ])
@@ -1362,6 +1363,7 @@ async fn text_subtitles_are_served_as_webvtt_sidecars() {
         "1\n00:00:01,000 --> 00:00:03,000\nFirst cue\n\n2\n00:00:40,500 --> 00:00:42,000\nLater cue\n",
     )
     .unwrap();
+    let audio = audio_fixture::audio_fixture(f.dir.path(), "aac", 48000, 440);
     let status = Command::new("ffmpeg")
         .args([
             "-v",
@@ -1370,10 +1372,8 @@ async fn text_subtitles_are_served_as_webvtt_sidecars() {
             "lavfi",
             "-i",
             "testsrc2=size=320x240:rate=24",
-            "-f",
-            "lavfi",
             "-i",
-            "sine=frequency=440:sample_rate=48000",
+            audio.to_str().unwrap(),
         ])
         .arg("-i")
         .arg(&srt)
@@ -1391,7 +1391,7 @@ async fn text_subtitles_are_served_as_webvtt_sidecars() {
             "-preset",
             "ultrafast",
             "-c:a",
-            "aac",
+            "copy",
             "-c:s",
             "srt",
             // A container that starts at 5 s: cues and video are both relative
@@ -1702,6 +1702,7 @@ async fn copy_route_refuses_open_gop_segments() {
     let f = Fixture::with_options(Default::default(), false, true).await;
     // The same encode with closed and open GOPs: the closed one is the control
     // that the fixture can publish every copied segment.
+    let audio = audio_fixture::audio_fixture(f.dir.path(), "aac", 48000, 440);
     for (name, gop) in [("closed.mkv", "open-gop=0"), ("open.mkv", "open-gop=1")] {
         let status = Command::new("ffmpeg")
             .args([
@@ -1711,10 +1712,8 @@ async fn copy_route_refuses_open_gop_segments() {
                 "lavfi",
                 "-i",
                 "testsrc2=size=320x240:rate=24",
-                "-f",
-                "lavfi",
                 "-i",
-                "sine=frequency=440:sample_rate=48000",
+                audio.to_str().unwrap(),
                 "-t",
                 "40",
                 "-c:v",
@@ -1732,8 +1731,8 @@ async fn copy_route_refuses_open_gop_segments() {
                 "-x264-params",
                 gop,
                 "-c:a",
-                "aac",
-                // Normalize encoder priming in the fixture, not production eligibility.
+                "copy",
+                // Keep the raw audio packet timeline explicitly zero-based.
                 "-bsf:a",
                 "setts=pts=PTS-STARTPTS:dts=DTS-STARTDTS",
             ])

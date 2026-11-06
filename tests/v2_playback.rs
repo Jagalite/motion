@@ -5,6 +5,9 @@
 //! crates/core/src/delivery.rs and crates/core/src/viewing.rs. These tests
 //! check that the adapter supplies the right observations, enforces the
 //! decisions and executes the effects (bytes, segments, durable progress).
+#[path = "support/audio_fixture.rs"]
+mod audio_fixture;
+
 use axum::{
     body::Body,
     http::{HeaderMap, Request, StatusCode},
@@ -3055,6 +3058,8 @@ fn assert_zero_stream_starts(path: &Path) {
 }
 
 fn copyable_mkv(f: &Fixture, name: &str, level: &str) {
+    let aac = audio_fixture::audio_fixture(f.dir.path(), "aac", 44100, 440);
+    let ac3 = audio_fixture::audio_fixture(f.dir.path(), "ac3", 48000, 880);
     f.media(
         name,
         &[
@@ -3062,14 +3067,10 @@ fn copyable_mkv(f: &Fixture, name: &str, level: &str) {
             "lavfi",
             "-i",
             "testsrc2=size=320x240:rate=24",
-            "-f",
-            "lavfi",
             "-i",
-            "sine=frequency=440:sample_rate=44100",
-            "-f",
-            "lavfi",
+            aac.to_str().unwrap(),
             "-i",
-            "sine=frequency=880:sample_rate=48000",
+            ac3.to_str().unwrap(),
             "-t",
             "60",
             "-map",
@@ -3092,10 +3093,8 @@ fn copyable_mkv(f: &Fixture, name: &str, level: &str) {
             "48",
             "-sc_threshold",
             "0",
-            "-c:a:0",
-            "aac",
-            "-c:a:1",
-            "ac3",
+            "-c:a",
+            "copy",
             "-bsf:a",
             "setts=pts=PTS-STARTPTS:dts=DTS-STARTDTS",
         ],
@@ -6017,6 +6016,7 @@ async fn copied_manifests_declare_the_source_rate() {
     let f = Fixture::with_copy_routes(true).await;
     // Noise: about 18 Mb/s of H.264 and AAC in Matroska (every stream starts at
     // zero), so the original is copyable.
+    let aac = audio_fixture::audio_fixture(f.dir.path(), "aac", 44100, 440);
     f.media(
         "noise.mkv",
         &[
@@ -6024,10 +6024,8 @@ async fn copied_manifests_declare_the_source_rate() {
             "lavfi",
             "-i",
             "nullsrc=size=640x360:rate=24,geq=random(1)*255:128:128",
-            "-f",
-            "lavfi",
             "-i",
-            "sine=frequency=440:sample_rate=44100",
+            aac.to_str().unwrap(),
             "-t",
             "10",
             "-c:v",
@@ -6037,7 +6035,7 @@ async fn copied_manifests_declare_the_source_rate() {
             "-g",
             "48",
             "-c:a",
-            "aac",
+            "copy",
             "-bsf:a",
             "setts=pts=PTS-STARTPTS:dts=DTS-STARTDTS",
         ],
