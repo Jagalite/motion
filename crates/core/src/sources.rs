@@ -146,6 +146,106 @@ pub fn overlapping<'a>(candidate: &str, registered: &[&'a str]) -> Option<&'a st
         .find(|r| *r != candidate && (inside(candidate, r) || inside(r, candidate)))
 }
 
+/// Existing durable ownership and filesystem identity for the exact root.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExistingRoot<'a> {
+    pub id: &'a str,
+    pub identity: &'a str,
+    pub managed: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OwnershipRequirement {
+    /// A source-only registration may reuse either existing ownership kind.
+    ExistingKind,
+    /// Legacy registration requires the existing ownership kind to agree.
+    Exact(bool),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Registration {
+    Create,
+    Reuse { id: Id },
+    RelocationRequired,
+    OwnershipConflict,
+}
+
+/// Decide exact-root registration from facts observed under the writer. Root
+/// overlap is independently validated by the source-only caller; legacy root
+/// registration retains its historical overlap behavior.
+pub fn registration(
+    proposed_identity: &str,
+    ownership: OwnershipRequirement,
+    existing: Option<ExistingRoot<'_>>,
+) -> Registration {
+    match existing {
+        None => Registration::Create,
+        Some(root) if root.identity != proposed_identity => Registration::RelocationRequired,
+        Some(root) if matches!(ownership, OwnershipRequirement::Exact(kind) if kind != root.managed) => {
+            Registration::OwnershipConflict
+        }
+        Some(root) => Registration::Reuse {
+            id: root.id.to_owned(),
+        },
+    }
+}
+
+#[cfg(test)]
+mod registration_tests {
+    use super::*;
+
+    #[test]
+    fn exact_root_reuse_preserves_identity_and_ownership_policy() {
+        for managed in [false, true] {
+            let existing = ExistingRoot {
+                id: "source",
+                identity: "device:1",
+                managed,
+            };
+            assert_eq!(
+                registration(
+                    "device:1",
+                    OwnershipRequirement::ExistingKind,
+                    Some(existing.clone())
+                ),
+                Registration::Reuse {
+                    id: "source".into()
+                }
+            );
+            assert_eq!(
+                registration(
+                    "device:1",
+                    OwnershipRequirement::Exact(managed),
+                    Some(existing.clone())
+                ),
+                Registration::Reuse {
+                    id: "source".into()
+                }
+            );
+            assert_eq!(
+                registration(
+                    "device:1",
+                    OwnershipRequirement::Exact(!managed),
+                    Some(existing.clone())
+                ),
+                Registration::OwnershipConflict
+            );
+            assert_eq!(
+                registration(
+                    "device:2",
+                    OwnershipRequirement::Exact(!managed),
+                    Some(existing)
+                ),
+                Registration::RelocationRequired
+            );
+        }
+        assert_eq!(
+            registration("device:1", OwnershipRequirement::Exact(false), None),
+            Registration::Create
+        );
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Availability {
@@ -374,4 +474,146 @@ pub fn relocation_commit(
         }
     }
     Ok(())
+}
+
+/// Lifecycle effects decided from durable observations under the writer lock.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Removal {
+    Busy,
+    Delete,
+    DisableAndWithdraw,
+}
+
+pub fn source_removal(
+    memberships: bool,
+    active_work: bool,
+    retained_files: bool,
+    demands: bool,
+) -> Removal {
+    if memberships || active_work {
+        Removal::Busy
+    } else if retained_files || demands {
+        Removal::DisableAndWithdraw
+    } else {
+        Removal::Delete
+    }
+}
+
+/// Scope changes may not invalidate observations being gathered by active work;
+/// library removal may not orphan pending scan demand receipts.
+pub fn source_scope_mutable(active_work: bool) -> bool {
+    !active_work
+}
+pub fn library_removable(pending_demands: bool) -> bool {
+    !pending_demands
+}
+
+#[cfg(test)]
+mod lifecycle_tests {
+    use super::*;
+    #[test]
+    fn lifecycle_matrix_and_re_registration() {
+        for bits in 0..16 {
+            let (members, active, files, demands) =
+                (bits & 1 != 0, bits & 2 != 0, bits & 4 != 0, bits & 8 != 0);
+            let effect = source_removal(members, active, files, demands);
+            assert_eq!(effect == Removal::Busy, members || active);
+            assert_eq!(
+                effect == Removal::Delete,
+                !members && !active && !files && !demands
+            );
+            assert_eq!(source_scope_mutable(active), !active);
+            assert_eq!(library_removable(demands), !demands);
+        }
+        // Completed work still owns retained content/history. Removing a membership
+        // permits withdrawal, never deletion of that retained registration.
+        assert_eq!(source_removal(true, true, true, true), Removal::Busy);
+        assert_eq!(
+            source_removal(false, false, true, true),
+            Removal::DisableAndWithdraw
+        );
+        let existing = ExistingRoot {
+            id: "source",
+            identity: "volume",
+            managed: false,
+        };
+        assert_eq!(
+            registration("volume", OwnershipRequirement::ExistingKind, Some(existing)),
+            Registration::Reuse {
+                id: "source".into()
+            }
+        );
+        assert_eq!(source_removal(false, false, false, false), Removal::Delete);
+        assert_eq!(
+            registration("volume", OwnershipRequirement::ExistingKind, None),
+            Registration::Create
+        );
+    }
+}
+
+/// Relocation requires every enabled available occurrence, or every occurrence
+/// of a disabled source, except explicitly excluded paths.
+pub fn relocation_file_required(
+    enabled: bool,
+    available: bool,
+    path: &str,
+    exclusions: &[String],
+) -> bool {
+    (!enabled || available) && !excluded(path, exclusions)
+}
+pub fn relocation_complete(
+    plan: &RelocationPlan,
+    enabled: bool,
+    files: &[(Id, String, bool)],
+    exclusions: &[String],
+) -> bool {
+    let required: BTreeSet<&str> = files
+        .iter()
+        .filter(|(_, path, available)| {
+            relocation_file_required(enabled, *available, path, exclusions)
+        })
+        .map(|(id, ..)| id.as_str())
+        .collect();
+    let verified: BTreeSet<&str> = plan.verified.iter().map(|(id, _)| id.as_str()).collect();
+    let excluded_ids: BTreeSet<&str> = files
+        .iter()
+        .filter(|(_, path, _)| excluded(path, exclusions))
+        .map(|(id, ..)| id.as_str())
+        .collect();
+    required == verified
+        && verified.len() == plan.verified.len()
+        && excluded_ids == plan.out_of_scope.iter().map(String::as_str).collect()
+        && excluded_ids.len() == plan.out_of_scope.len()
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RelocationEnvelopeError {
+    ForeignActor,
+    Expired,
+    ForeignSource,
+    HistoryChanged,
+}
+pub fn relocation_envelope(
+    authority: crate::catalog::ReviewedAuthority<'_>,
+    source: &str,
+    current_actor: &str,
+    requested_source: &str,
+    current_history: &str,
+    now: i64,
+) -> Result<(), RelocationEnvelopeError> {
+    crate::catalog::review_admission(authority, current_actor, current_history, now).map_err(
+        |error| match error {
+            crate::catalog::ReviewAdmissionError::ForeignActor => {
+                RelocationEnvelopeError::ForeignActor
+            }
+            crate::catalog::ReviewAdmissionError::Expired => RelocationEnvelopeError::Expired,
+            crate::catalog::ReviewAdmissionError::HistoryChanged => {
+                RelocationEnvelopeError::HistoryChanged
+            }
+        },
+    )?;
+    if source != requested_source {
+        Err(RelocationEnvelopeError::ForeignSource)
+    } else {
+        Ok(())
+    }
 }

@@ -4,16 +4,22 @@
 focused regression tests with `node --test packages/ui-bridge/bridge.test.mjs`.
 Run presentation tests with `cargo test -p motion-ui`.
 
-Pending idempotency keys belong to the request's operation, precondition and
-body. They survive uncertain responses, form edits and reloads in the same tab
+Pending idempotency keys belong to the server history, principal, request's
+operation, precondition and body. They survive uncertain responses, form edits and reloads in the same tab
 using session storage, with an in-memory fallback when storage is unavailable.
-Success or a definite rejection retires the key. Duplicate submissions of one
+The intent is marked unresolved before sending, so interruption during a request
+also survives reload. Success or a receipt-aware definitive rejection retires
+the key. After an unknown outcome, authentication/visibility refusals and receipt
+conflicts preserve it; an exact domain conflict can settle it. Authentication
+forms keep secret-bearing bodies and retry state in memory only, without a reload
+recovery promise. The production mutation policy shares conformance fixtures
+with the terminal implementation. Duplicate submissions of one
 form are suppressed while its request or pairing flow is active. Pairing keeps
 the claimed credential only in memory and retries session exchange without
 claiming again after a successful claim.
 
-These are client transport lifecycle rules, so they remain in the browser
-adapter. Authorization, match-decision validity, durable idempotency and job
+These are client transport lifecycle rules, so pure JavaScript production
+policies/coordinators own their decisions, with browser adapters executing effects. Authorization, match-decision validity, durable idempotency and job
 transitions remain server/core responsibilities; disabling or hiding a form is
 not an authorization boundary. The tests execute the production bridge with
 controlled responses and storage. They cover retry identity, rejection classes,
@@ -99,3 +105,22 @@ selection, prepared renditions and cross-runtime outbox replay remain open. See
 that document's gap list. The separate `motion-ui-host` supplies offline cache
 views through `OfflinePresentationReader`; see `crates/motion-ui-host/README.md`
 for the port and its limits.
+
+## State-machine boundary qualification
+
+`mutation.mjs` is shared by both form adapters. `viewing.mjs` owns the common
+manual/session authority evidence for watched marks and viewing starts while
+preserving their distinct intent conditions. `replacement.mjs` owns cross-source
+replacement decisions with exact operation/delivery identities, lease failure,
+page retirement, ambiguous rebind, read-back and swap inputs. Its bounded test
+explores 19,607 transitions through five subsequent inputs after preparation;
+it does not model every browser scheduling detail. An old-binding read-back after
+an unanswered PUT never allows predecessor resumption.
+
+The desktop pass uses `download-reconciliation.mjs` for complete-inventory,
+owner-scoped removal, reporting, recovery, collection and rebase ordering.
+Filesystem persistence and API calls remain in `downloads.mjs`; durable removal
+intent is written before local removal or tombstone settlement. Model tests do
+not prove filesystem durability; the adapter regressions exercise those failure
+paths separately. Tests requiring the real cache binary must be run with
+`MOTION_UI_HOST_BINARY`; a skipped test is not qualification.

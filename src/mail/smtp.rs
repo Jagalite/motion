@@ -25,8 +25,8 @@ use tokio_rustls::{
 pub const MAX_REPLY_LINE: usize = 2048;
 pub const MAX_REPLY_LINES: usize = 64;
 pub const MAX_REPLY_BYTES: usize = 32 * 1024;
-// Worst case per route: 8 + 8 × 20 + 40 + 40 = 248 s. The attempt starts no
-// new route after `direct::ROUTE_CUTOFF`, keeping it inside `mail::LEASE_SECONDS`.
+// Per-operation deadlines complement the outbox whole-attempt deadline, which
+// includes DNS, all failover routes and the pre-content authority check.
 pub const CONNECT: Duration = Duration::from_secs(8);
 pub const COMMAND: Duration = Duration::from_secs(20);
 pub const FINAL_REPLY: Duration = Duration::from_secs(40);
@@ -282,17 +282,34 @@ where
         return failure;
     }
     let payload = dot_stuff(session.message);
-    let written = timeout_at(Instant::now() + FINAL_REPLY, async {
-        conn.io.get_mut().write_all(&payload).await?;
-        conn.io.get_mut().flush().await
-    })
-    .await;
-    // The terminator is the final bytes written. If writing failed, the server
-    // cannot have received a complete message.
-    if !matches!(written, Ok(Ok(()))) {
+    // Keep the terminator separate: a body failure is known not accepted,
+    // whereas a terminator write or flush failure may follow delivery.
+    let deadline = Instant::now() + FINAL_REPLY;
+    let body_len = payload.len() - 3;
+    if !matches!(
+        timeout_at(deadline, conn.io.get_mut().write_all(&payload[..body_len])).await,
+        Ok(Ok(()))
+    ) {
         return outcome(
-            Observation::Temporary(Stage::Message),
-            "message write failed",
+            playscale_core::mail::interrupted_submission(
+                playscale_core::mail::SubmissionProgress::BeforeTerminator,
+            ),
+            "message body write failed",
+        );
+    }
+    if !matches!(
+        timeout_at(deadline, async {
+            conn.io.get_mut().write_all(&payload[body_len..]).await?;
+            conn.io.get_mut().flush().await
+        })
+        .await,
+        Ok(Ok(()))
+    ) {
+        return outcome(
+            playscale_core::mail::interrupted_submission(
+                playscale_core::mail::SubmissionProgress::TerminatorStarted,
+            ),
+            "message terminator or flush failed",
         );
     }
     match read_reply(&mut conn.io, Instant::now() + FINAL_REPLY).await {
@@ -514,6 +531,87 @@ pub async fn probe(route_host: &str, address: SocketAddr, helo: &str, tls: &Tls)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct FlushFailure {
+        replies: &'static [u8],
+        written: Vec<u8>,
+        fail_body: bool,
+    }
+    impl AsyncRead for FlushFailure {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            let count = self.replies.len().min(buf.remaining());
+            buf.put_slice(&self.replies[..count]);
+            self.replies = &self.replies[count..];
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+    impl AsyncWrite for FlushFailure {
+        fn poll_write(
+            mut self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+            bytes: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            if self.fail_body && bytes.starts_with(b"body") {
+                return std::task::Poll::Ready(Err(std::io::ErrorKind::BrokenPipe.into()));
+            }
+            self.written.extend_from_slice(bytes);
+            std::task::Poll::Ready(Ok(bytes.len()))
+        }
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(if self.written.ends_with(b"\r\n.\r\n") {
+                Err(std::io::ErrorKind::BrokenPipe.into())
+            } else {
+                Ok(())
+            })
+        }
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+    #[tokio::test]
+    async fn flush_after_terminator_is_ambiguous_but_body_failure_is_not() {
+        for fail_body in [false, true] {
+            let mut conn = Conn {
+                io: BufReader::new(FlushFailure {
+                    replies: b"250 ok\r\n250 ok\r\n354 data\r\n",
+                    written: vec![],
+                    fail_body,
+                }),
+            };
+            let session = Session {
+                route_host: "localhost",
+                address: "127.0.0.1:25".parse().unwrap(),
+                helo: "localhost",
+                mail_from: "a@example.test",
+                rcpt_to: "b@example.test",
+                tls: &Tls::LoopbackPlaintext,
+                message: b"body",
+            };
+            let result = transact(&mut conn, &session, async { true }).await;
+            assert_eq!(
+                result.observation,
+                if fail_body {
+                    Observation::Temporary(Stage::Message)
+                } else {
+                    Observation::Ambiguous
+                }
+            );
+            assert_eq!(
+                conn.io.get_ref().written.ends_with(b"\r\n.\r\n"),
+                !fail_body
+            );
+        }
+    }
 
     async fn parse(input: &[u8]) -> Result<Reply, ReadError> {
         let mut reader = BufReader::new(input);

@@ -240,6 +240,58 @@ pub struct Entry {
     pub timeline_id: Id,
 }
 
+/// Current catalog/reference observations. Missing, retired and foreign-owned
+/// records are distinct facts, not an adapter-provided acceptance boolean.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum Reference {
+    Missing,
+    Work { retired: bool },
+    Timeline,
+    SavedFilter { profile: String },
+}
+
+pub fn reference_admitted(profile: &str, reference: &Reference) -> bool {
+    match reference {
+        Reference::Missing => false,
+        Reference::Work { retired } => !retired,
+        Reference::Timeline => true,
+        Reference::SavedFilter { profile: owner } => owner == profile,
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EntryDisclosure {
+    pub entries: Vec<Entry>,
+    pub current: Option<String>,
+}
+
+/// Visibility is reobserved for every read/replay. Removing a hidden entry from
+/// a response never mutates the stored queue or transfers its current pointer
+/// to another occurrence of the same timeline.
+pub fn disclose_entries(
+    entries: &[Entry],
+    current: Option<&str>,
+    hidden: &BTreeSet<String>,
+) -> EntryDisclosure {
+    let entries: Vec<_> = entries
+        .iter()
+        .filter(|e| !hidden.contains(&e.entry_id))
+        .cloned()
+        .collect();
+    let current = current
+        .filter(|id| entries.iter().any(|e| e.entry_id == *id))
+        .map(str::to_owned);
+    EntryDisclosure { entries, current }
+}
+
+pub fn disclose_items(items: &[String], visible: &BTreeSet<String>) -> Vec<String> {
+    items
+        .iter()
+        .filter(|id| visible.contains(*id))
+        .cloned()
+        .collect()
+}
+
 /// Playlists and queues keep explicit entry IDs so the same timeline may
 /// appear twice and edits address one occurrence.
 pub fn validate_entries(entries: &[Entry]) -> Result<(), OrganizationError> {

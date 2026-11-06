@@ -489,49 +489,33 @@ pub async fn put_preferences(
     body: Result<Json<PreferenceUpdate>, axum::extract::rejection::JsonRejection>,
 ) -> Result<Json<PreferenceState>, ApiError> {
     let mut body = json(body)?;
-    if body.expected_revision < 0
-        || body.expected_revision == i64::MAX
-        || !matches!(
-            body.preferences.subtitle_mode.as_str(),
-            "off" | "always" | "foreign_audio"
-        )
-        || !matches!(
-            body.preferences.quality.as_str(),
-            "auto" | "original" | "convert"
-        )
-        || !crate::playback::valid_recipe(&body.preferences.conversion_recipe)
-        || body.preferences.max_bitrate_bps == Some(0)
-    {
-        return Err(ApiError::bad("Invalid preference revision or mode"));
+    if body.expected_revision < 0 || body.expected_revision == i64::MAX {
+        return Err(ApiError::bad("Invalid preference revision"));
     }
-    for languages in [
-        &mut body.preferences.audio_languages,
-        &mut body.preferences.subtitle_languages,
-    ] {
-        if languages.len() > 10
-            || languages
-                .iter()
-                .any(|v| !playscale_core::viewing::valid_language(v))
-        {
-            return Err(ApiError::bad("Expected at most ten bounded language tags"));
-        }
-        for value in languages.iter_mut() {
-            *value = value.to_ascii_lowercase();
-        }
-        let unique: std::collections::BTreeSet<_> = languages.iter().collect();
-        if unique.len() != languages.len() {
-            return Err(ApiError::bad("Language tags must be unique"));
-        }
-    }
+    let preferences = &body.preferences;
+    let [audio, subtitle] = playscale_core::playback_session::normalize_preferences(
+        playscale_core::playback_session::PreferenceApi::Legacy,
+        playscale_core::playback_session::PreferenceInput {
+            subtitle_mode: &preferences.subtitle_mode,
+            quality: &preferences.quality,
+            conversion_recipe: &preferences.conversion_recipe,
+            completion_percent: preferences.completion_percent,
+            max_bitrate_bps: preferences.max_bitrate_bps,
+            audio_languages: &preferences.audio_languages,
+            subtitle_languages: &preferences.subtitle_languages,
+        },
+    )
+    .map_err(ApiError::bad)?;
+    body.preferences.audio_languages = audio;
+    body.preferences.subtitle_languages = subtitle;
     let _guard = app.jobs.lock().await;
     let current = prefs(&app, &p).await?;
-    if playscale_core::revision::advance(current.revision, body.expected_revision).is_err() {
-        return Err(conflict("preferences_revision_conflict"));
-    }
+    let next_revision = playscale_core::revision::advance(current.revision, body.expected_revision)
+        .map_err(|_| conflict("preferences_revision_conflict"))?;
     // Compare-and-set on the revision read above: v2 writers do not take
     // `app.jobs`, so a concurrent write must turn this into a conflict.
     let written = sqlx::query("INSERT INTO playback_preferences(profile_id,revision,document_json) VALUES (?,?,?) ON CONFLICT(profile_id) DO UPDATE SET revision=excluded.revision,document_json=excluded.document_json WHERE playback_preferences.revision=?")
-        .bind(&p).bind(current.revision+1).bind(serde_json::to_string(&body.preferences).map_err(ApiError::internal)?).bind(current.revision).execute(&app.db).await?;
+        .bind(&p).bind(next_revision).bind(serde_json::to_string(&body.preferences).map_err(ApiError::internal)?).bind(current.revision).execute(&app.db).await?;
     if written.rows_affected() != 1 {
         return Err(conflict("preferences_revision_conflict"));
     }

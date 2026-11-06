@@ -860,15 +860,18 @@ impl UiQueryFacade for Queries {
                 .ok_or(UiError::Unavailable)?;
             let position = viewing["position_ms"].as_u64().unwrap_or(0);
             let (audio_source, audio_tracks) = self.audio_tracks(timeline_id).await;
-            // A watched title, or one stopped in its final second, starts over.
-            let finished = viewing["watched"].as_bool().unwrap_or(false)
-                || duration_ms.is_some_and(|d| position.saturating_add(1000) >= d);
+            let resume_ms = playscale_core::timeline_viewing::resume_position(
+                playscale_core::timeline_viewing::ResumePolicy::Online,
+                Some(position),
+                viewing["watched"].as_bool().unwrap_or(false),
+                duration_ms,
+            );
             Ok(PlayerView {
                 item_id,
                 title: text(&work, "title"),
                 timeline_id: timeline_id.into(),
                 duration_ms,
-                resume_ms: if finished { 0 } else { position },
+                resume_ms,
                 viewing_revision: text(&viewing, "revision"),
                 viewing_manual_epoch: text(&viewing, "manual_epoch"),
                 audio_tracks,

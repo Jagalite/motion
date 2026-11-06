@@ -256,18 +256,41 @@ async fn recovery_merges_an_interrupted_attempt_into_its_queued_follow_up() {
     let late = scans::request(&f.app, &library, None, true, false)
         .await
         .unwrap();
-    assert_eq!(f.jobs(&a).await.len(), 2);
+    let before = f.jobs(&a).await;
+    assert_eq!(before.len(), 2);
+    let retained = before[1].0.clone();
     db::recover(&f.app.db).await.unwrap();
     let jobs = f.jobs(&a).await;
     assert_eq!(
         jobs.iter().map(|(_, p)| p.as_str()).collect::<Vec<_>>(),
         ["cancelled", "queued"]
     );
+    assert_eq!(jobs[0].0, before[0].0);
+    assert_eq!(jobs[1].0, retained);
+    assert_eq!(db::get_job(&f.app.db, &retained).await.unwrap().attempt, 0);
+    assert!(
+        db::get_job(&f.app.db, &before[0].0)
+            .await
+            .unwrap()
+            .started_barrier
+            .is_none()
+    );
+    let recovered = recovery_snapshot(&f.app.db).await;
+    db::recover(&f.app.db).await.unwrap();
+    assert_eq!(
+        recovery_snapshot(&f.app.db).await,
+        recovered,
+        "duplicate recovery is durable no-op"
+    );
     // Both demands are still pending and will be served by the queued attempt.
     let stop = CancellationToken::new();
     let worker = tokio::spawn(scan::worker(f.app.clone(), stop.clone()));
-    assert_eq!(f.settle(&early.id).await.status, DemandStatus::Complete);
-    assert_eq!(f.settle(&late.id).await.status, DemandStatus::Complete);
+    let early = f.settle(&early.id).await;
+    let late = f.settle(&late.id).await;
+    assert_eq!(early.status, DemandStatus::Complete);
+    assert_eq!(late.status, DemandStatus::Complete);
+    assert_eq!(early.sources[0].job_id.as_deref(), Some(retained.as_str()));
+    assert_eq!(late.sources[0].job_id.as_deref(), Some(retained.as_str()));
     stop.cancel();
     worker.await.unwrap().unwrap();
 }
@@ -332,7 +355,7 @@ async fn recovery_keeps_direct_ownership_when_merging_attempts() {
     let a = f.source("a").await;
     let library = f.library(std::slice::from_ref(&a)).await;
     // A direct (v1) attempt is running when a demand queues a follow-up.
-    let direct = db::enqueue(&f.app, &a).await.unwrap();
+    let direct = db::enqueue_mode(&f.app, &a, true).await.unwrap();
     sqlx::query("UPDATE jobs SET phase='running',attempt=1,started_barrier=0 WHERE id=?")
         .bind(&direct.id)
         .execute(&f.app.db)
@@ -341,10 +364,32 @@ async fn recovery_keeps_direct_ownership_when_merging_attempts() {
     let demand = scans::request(&f.app, &library, None, false, false)
         .await
         .unwrap();
+    let queued: String =
+        sqlx::query_scalar("SELECT id FROM jobs WHERE library_id=? AND phase='queued'")
+            .bind(&a)
+            .fetch_one(&f.app.db)
+            .await
+            .unwrap();
+    sqlx::query("UPDATE jobs SET attempt=5 WHERE id=?")
+        .bind(&queued)
+        .execute(&f.app.db)
+        .await
+        .unwrap();
     db::recover(&f.app.db).await.unwrap();
+    let state: (i64, bool, bool, Option<i64>) = sqlx::query_as(
+        "SELECT attempt,full_scan,direct_request,started_barrier FROM jobs WHERE id=?",
+    )
+    .bind(&queued)
+    .fetch_one(&f.app.db)
+    .await
+    .unwrap();
+    assert_eq!(state, (5, true, true, None));
+    assert_eq!(db::get_job(&f.app.db, &direct.id).await.unwrap().attempt, 1);
     // Cancelling the demand must not cancel the direct requester's work.
     scans::cancel(&f.app, &demand.id).await.unwrap();
     let jobs = f.jobs(&a).await;
+    assert_eq!(jobs[0].0, direct.id);
+    assert_eq!(jobs[1].0, queued);
     assert_eq!(
         jobs.iter().map(|(_, p)| p.as_str()).collect::<Vec<_>>(),
         ["cancelled", "queued"]
@@ -425,4 +470,123 @@ async fn a_filesystem_change_requests_a_scan_that_publishes_it() {
     stop.cancel();
     scanner.await.unwrap().unwrap();
     watcher.await.unwrap().unwrap();
+}
+
+// Include revision/event observations: partial recovery must not leak trigger
+// effects, and duplicate recovery must not manufacture new acknowledgements.
+type RecoveryJob = (String, String, i64, bool, bool, Option<i64>, i64);
+
+#[derive(Debug, PartialEq, Eq)]
+struct RecoverySnapshot {
+    jobs: Vec<RecoveryJob>,
+    demands: Vec<(String, i64, String)>,
+    barriers: Vec<(String, i64)>,
+    events: i64,
+}
+
+async fn recovery_snapshot(db: &sqlx::SqlitePool) -> RecoverySnapshot {
+    let jobs = sqlx::query_as("SELECT id,phase,attempt,full_scan,direct_request,started_barrier,revision FROM jobs ORDER BY id")
+        .fetch_all(db).await.unwrap();
+    let demands = sqlx::query_as("SELECT id,barrier,status FROM scan_demands ORDER BY id")
+        .fetch_all(db)
+        .await
+        .unwrap();
+    let barriers = sqlx::query_as("SELECT id,scan_barrier FROM libraries ORDER BY id")
+        .fetch_all(db)
+        .await
+        .unwrap();
+    let events = sqlx::query_scalar("SELECT count(*) FROM change_events")
+        .fetch_one(db)
+        .await
+        .unwrap();
+    RecoverySnapshot {
+        jobs,
+        demands,
+        barriers,
+        events,
+    }
+}
+
+#[tokio::test]
+async fn recovery_rolls_back_merged_ownership_when_reset_fails() {
+    let f = Fixture::new().await;
+    let source = f.source("rollback").await;
+    let library = f.library(std::slice::from_ref(&source)).await;
+    let direct = db::enqueue_mode(&f.app, &source, true).await.unwrap();
+    sqlx::query("UPDATE jobs SET phase='running',attempt=1,started_barrier=0 WHERE id=?")
+        .bind(&direct.id)
+        .execute(&f.app.db)
+        .await
+        .unwrap();
+    let demand = scans::request(&f.app, &library, None, false, false)
+        .await
+        .unwrap();
+    sqlx::query("CREATE TRIGGER fail_recovery_reset BEFORE UPDATE OF phase ON jobs WHEN OLD.phase='running' BEGIN SELECT RAISE(ABORT,'recovery reset fault'); END")
+        .execute(&f.app.db).await.unwrap();
+    let before = recovery_snapshot(&f.app.db).await;
+    assert!(db::recover(&f.app.db).await.is_err());
+    assert_eq!(
+        recovery_snapshot(&f.app.db).await,
+        before,
+        "merge, barrier and trigger effects must roll back together"
+    );
+    sqlx::query("DROP TRIGGER fail_recovery_reset")
+        .execute(&f.app.db)
+        .await
+        .unwrap();
+    db::recover(&f.app.db).await.unwrap();
+    scans::cancel(&f.app, &demand.id).await.unwrap();
+    let retained: (String, bool, bool) = sqlx::query_as(
+        "SELECT phase,full_scan,direct_request FROM jobs WHERE library_id=? AND id<>?",
+    )
+    .bind(&source)
+    .bind(&direct.id)
+    .fetch_one(&f.app.db)
+    .await
+    .unwrap();
+    assert_eq!(retained, ("queued".into(), true, true));
+}
+
+#[tokio::test]
+async fn recovery_reconciliation_failure_rolls_back_interrupted_state() {
+    let f = Fixture::new().await;
+    let source = f.source("reconcile").await;
+    let library = f.library(std::slice::from_ref(&source)).await;
+    scans::request(&f.app, &library, None, true, false)
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE jobs SET phase='cancelling',attempt=2,started_barrier=1 WHERE library_id=?",
+    )
+    .bind(&source)
+    .execute(&f.app.db)
+    .await
+    .unwrap();
+    sqlx::query("CREATE TRIGGER fail_recovery_follow_up BEFORE INSERT ON jobs BEGIN SELECT RAISE(ABORT,'recovery follow-up fault'); END")
+        .execute(&f.app.db).await.unwrap();
+    let before = recovery_snapshot(&f.app.db).await;
+    assert!(db::recover(&f.app.db).await.is_err());
+    assert_eq!(recovery_snapshot(&f.app.db).await, before);
+    sqlx::query("DROP TRIGGER fail_recovery_follow_up")
+        .execute(&f.app.db)
+        .await
+        .unwrap();
+    db::recover(&f.app.db).await.unwrap();
+    let after = recovery_snapshot(&f.app.db).await;
+    assert_eq!(after.jobs.len(), 2);
+    let interrupted = after.jobs.iter().find(|r| r.0 == before.jobs[0].0).unwrap();
+    assert_eq!(
+        (interrupted.1.as_str(), interrupted.2, interrupted.5),
+        ("cancelled", 2, None)
+    );
+    let queued = after.jobs.iter().find(|r| r.0 != interrupted.0).unwrap();
+    assert_eq!(
+        (queued.1.as_str(), queued.2, queued.3, queued.4, queued.5),
+        ("queued", 0, true, false, None)
+    );
+    assert_eq!(
+        after.demands, before.demands,
+        "recovery does not answer pending demands"
+    );
+    assert_eq!(after.barriers, before.barriers);
 }

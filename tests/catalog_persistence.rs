@@ -802,6 +802,62 @@ async fn timeline_repair_retracts_only_untouched_empty_cut_and_retries_atomicall
     assert_eq!(retained, 5.0);
 }
 
+#[tokio::test]
+async fn timeline_repair_preserves_backfill_with_changed_timestamp() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db.sqlite");
+    let old = db::connect_with(&path, &migrator(dir.path(), 9, None).await)
+        .await
+        .unwrap();
+    legacy_fixture(&old).await;
+    sqlx::query("INSERT INTO editions(id,item_id,label) VALUES ('empty-cut','empty','Empty')")
+        .execute(&old)
+        .await
+        .unwrap();
+    sqlx::migrate!("./migrations").run(&old).await.unwrap();
+    let before: (i64, i64, i64) = sqlx::query_as("UPDATE timeline_viewing SET updated_at=updated_at+1 WHERE timeline_id='empty-cut' RETURNING revision,position_ms,updated_at")
+        .fetch_one(&old).await.unwrap();
+    assert_eq!(before.0, 0);
+    old.close().await;
+    let pool = db::connect(&path).await.unwrap();
+    let after: (i64, i64, i64) = sqlx::query_as("SELECT revision,position_ms,updated_at FROM timeline_viewing WHERE timeline_id='empty-cut'")
+        .fetch_one(&pool).await.unwrap();
+    assert_eq!(after, before);
+}
+
+#[tokio::test]
+async fn metadata_generation_migration_preserves_old_documents() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db.sqlite");
+    let old = db::connect_with(&path, &migrator(dir.path(), 65, None).await)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO items(id,title,kind) VALUES ('historical','Original','video')")
+        .execute(&old)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO item_origins VALUES ('historical','Original')")
+        .execute(&old)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO metadata_documents VALUES ('historical','local',7,NULL,'{\"values\":{},\"tags\":[],\"excluded_tags\":[]}',3)").execute(&old).await.unwrap();
+    old.close().await;
+    let db = db::connect(&path).await.unwrap();
+    let row: (i64, i64) = sqlx::query_as("SELECT g.generation,d.revision FROM metadata_resource_generations g JOIN metadata_documents d ON d.item_id=g.item_id WHERE g.item_id='historical'").fetch_one(&db).await.unwrap();
+    assert_eq!(row, (1, 7));
+    sqlx::query("DELETE FROM metadata_documents WHERE item_id='historical'")
+        .execute(&db)
+        .await
+        .unwrap();
+    let next: i64 = sqlx::query_scalar(
+        "SELECT generation FROM metadata_resource_generations WHERE item_id='historical'",
+    )
+    .fetch_one(&db)
+    .await
+    .unwrap();
+    assert_eq!(next, 2);
+}
+
 /// A restore captures each timeline's viewing as restored, under the new
 /// history, in the same transaction that starts it: kept offline progress
 /// is pinned to this baseline (completion 5C).
@@ -971,4 +1027,161 @@ async fn restore_withdraws_saved_authority_without_changing_the_backup() {
         .await
         .unwrap();
     assert_eq!(still_saved, 2);
+}
+
+#[tokio::test]
+async fn split_review_fences_independent_occurrence_revision() {
+    let (_dir, app) = catalog_fixture().await;
+    let before = snapshot(&app.db, &["dup"]).await;
+    let plan = curation::preview_split(
+        &app.db,
+        &SplitRequest {
+            item: "dup".into(),
+            versions: vec!["fd3".into()],
+            new_title: "split".into(),
+            expected_revision: before["dup"].work.revision,
+        },
+    )
+    .await
+    .unwrap();
+    assert!(plan.occurrence_moves.iter().any(|m| m.id == "fd3"));
+    sqlx::query("UPDATE media_files SET revision='changed-since-review' WHERE id='fd3'")
+        .execute(&app.db)
+        .await
+        .unwrap();
+    assert!(matches!(
+        curation::commit_split(&app, &plan).await,
+        Err(curation::CurationError::Rejected(
+            IdentityError::StaleRevision(_)
+        ))
+    ));
+    let owner: String = sqlx::query_scalar(
+        "SELECT e.item_id FROM media_files f JOIN editions e ON e.id=f.edition_id WHERE f.id='fd3'",
+    )
+    .fetch_one(&app.db)
+    .await
+    .unwrap();
+    assert_eq!(
+        owner, "dup",
+        "stale occurrence plan has no ownership effects"
+    );
+}
+
+#[tokio::test]
+async fn split_does_not_steal_replaced_occurrence_bound_by_retained_version() {
+    let (_dir, app) = catalog_fixture().await;
+    // fd1 remains pinned at rd by a retained version, but its current bytes
+    // match the moving encode. It is not a free identical-content copy.
+    sqlx::query("UPDATE media_files SET revision='re' WHERE id='fd1'")
+        .execute(&app.db)
+        .await
+        .unwrap();
+    let before = snapshot(&app.db, &["dup"]).await;
+    let plan = curation::preview_split(
+        &app.db,
+        &SplitRequest {
+            item: "dup".into(),
+            versions: vec!["fd3".into()],
+            new_title: "split".into(),
+            expected_revision: before["dup"].work.revision,
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        plan.occurrence_moves
+            .iter()
+            .map(|m| m.id.as_str())
+            .collect::<Vec<_>>(),
+        ["fd3"]
+    );
+    curation::commit_split(&app, &plan).await.unwrap();
+    let owner: String = sqlx::query_scalar(
+        "SELECT e.item_id FROM media_files f JOIN editions e ON e.id=f.edition_id WHERE f.id='fd1'",
+    )
+    .fetch_one(&app.db)
+    .await
+    .unwrap();
+    assert_eq!(owner, "dup");
+    assert_consistent(&app.db).await;
+}
+
+#[tokio::test]
+async fn oversized_review_documents_are_bounded_without_weakening_audit_receipts() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = db::connect(&dir.path().join("db.sqlite")).await.unwrap();
+    let too_large = sqlx::query("INSERT INTO catalog_review_plans VALUES ('large','principal',100,CAST(zeroblob(8388609) AS TEXT))")
+        .execute(&db).await;
+    assert!(too_large.is_err());
+    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM catalog_review_plans")
+        .fetch_one(&db)
+        .await
+        .unwrap();
+    assert_eq!(count, 0);
+    sqlx::query("INSERT INTO catalog_receipts VALUES ('audit','catalog:split',1,'{}')")
+        .execute(&db)
+        .await
+        .unwrap();
+    assert!(
+        sqlx::query("DELETE FROM catalog_receipts WHERE id='audit'")
+            .execute(&db)
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn restore_withdraws_pending_review_references_but_retains_committed_receipts() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("pending.sqlite");
+    let live = db::connect(&path).await.unwrap();
+    let old_history: String =
+        sqlx::query_scalar("SELECT server_id || ':' || restore_epoch FROM server_identity")
+            .fetch_one(&live)
+            .await
+            .unwrap();
+    sqlx::query(
+        "INSERT INTO catalog_review_plans VALUES ('pending','operator',9223372036854775807,'{}')",
+    )
+    .execute(&live)
+    .await
+    .unwrap();
+    sqlx::query("INSERT INTO catalog_receipts VALUES ('committed','catalog:merge',1,'{}')")
+        .execute(&live)
+        .await
+        .unwrap();
+    live.close().await;
+    let destination = dir.path().join("restored/pending.sqlite");
+    db::restore_into(&path, &destination).await.unwrap();
+    let restored = db::connect(&destination).await.unwrap();
+    let pending: i64 = sqlx::query_scalar("SELECT count(*) FROM catalog_review_plans")
+        .fetch_one(&restored)
+        .await
+        .unwrap();
+    let retained: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM catalog_receipts WHERE id='committed'")
+            .fetch_one(&restored)
+            .await
+            .unwrap();
+    assert_eq!(pending, 0);
+    assert_eq!(retained, 1);
+    let current: String =
+        sqlx::query_scalar("SELECT server_id || ':' || restore_epoch FROM server_identity")
+            .fetch_one(&restored)
+            .await
+            .unwrap();
+    assert_ne!(old_history, current);
+    assert_eq!(
+        playscale_core::catalog::review_admission(
+            playscale_core::catalog::ReviewedAuthority {
+                principal: "operator",
+                history: &old_history,
+                expires: i64::MAX,
+            },
+            "operator",
+            &current,
+            1
+        ),
+        Err(playscale_core::catalog::ReviewAdmissionError::HistoryChanged)
+    );
 }

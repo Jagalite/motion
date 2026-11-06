@@ -231,3 +231,47 @@ pub fn decide(intent: &Intent, current: &Current<'_>) -> Result<Outcome, Error> 
         Policy::Closed => Err(Error::Closed),
     }
 }
+
+/// Counters are observed under the activation/request writer transaction.
+pub const DAILY_ACTIVATIONS: i64 = 100;
+pub const PENDING_REQUESTS: i64 = 1000;
+pub fn capacity_available(policy: Policy, count: i64) -> bool {
+    count >= 0
+        && count
+            < if policy == Policy::Open {
+                DAILY_ACTIVATIONS
+            } else {
+                PENDING_REQUESTS
+            }
+}
+pub fn invitation_address_matches(recorded: Option<&str>, verified: &str) -> bool {
+    recorded == Some(verified)
+}
+
+#[cfg(test)]
+mod capacity_contract_tests {
+    use super::*;
+    #[test]
+    fn production_capacity_edges_and_exact_recipient() {
+        for policy in [
+            Policy::Closed,
+            Policy::ApprovalRequired,
+            Policy::InviteOnly,
+            Policy::Open,
+        ] {
+            let max = if policy == Policy::Open { 100 } else { 1000 };
+            for count in [-1, 0, max - 1, max, max + 1, i64::MAX] {
+                assert_eq!(capacity_available(policy, count), (0..max).contains(&count));
+            }
+        }
+        assert!(invitation_address_matches(
+            Some("a@example.test"),
+            "a@example.test"
+        ));
+        assert!(!invitation_address_matches(None, "a@example.test"));
+        assert!(!invitation_address_matches(
+            Some("b@example.test"),
+            "a@example.test"
+        ));
+    }
+}

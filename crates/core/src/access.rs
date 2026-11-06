@@ -426,6 +426,44 @@ pub struct Issue {
     pub expires_at: i64,
 }
 
+/// Desktop proof admission is one-use even when later persistence fails. A
+/// successful reservation burns the proof; only a newly issued startup proof
+/// can retry after rollback. This prevents concurrent or delayed resurrection.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BootstrapAdmission {
+    Keep,
+    Expire,
+    ReserveAndBurn,
+}
+pub fn admit_bootstrap(
+    expected_hash: Option<&str>,
+    presented_hash: &str,
+    elapsed_seconds: u64,
+    ttl_seconds: u64,
+) -> BootstrapAdmission {
+    match expected_hash {
+        None => BootstrapAdmission::Keep,
+        Some(_) if elapsed_seconds >= ttl_seconds => BootstrapAdmission::Expire,
+        Some(hash) if hash == presented_hash => BootstrapAdmission::ReserveAndBurn,
+        Some(_) => BootstrapAdmission::Keep,
+    }
+}
+pub fn bootstrap_issue(device: &Device, now: i64) -> Result<Issue, AccessError> {
+    if device.revoked {
+        return Err(AccessError::DeviceRevoked);
+    }
+    Ok(Issue {
+        device_id: device.id.clone(),
+        generation: device
+            .generation
+            .checked_add(1)
+            .ok_or(AccessError::StaleRevision)?,
+        expires_at: now
+            .checked_add(DEVICE_CREDENTIAL_TTL_SECONDS)
+            .ok_or(AccessError::StaleRevision)?,
+    })
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Claim {
     /// Issue generation `n + 1`, superseding every earlier device credential.
@@ -485,7 +523,7 @@ pub fn claim(
 /// Apply a fresh issue exactly once; a delayed or duplicated issue cannot
 /// restore an older generation.
 pub fn apply_issue(device: &Device, issue: &Issue) -> Result<Device, AccessError> {
-    if issue.device_id != device.id || issue.generation != device.generation + 1 {
+    if issue.device_id != device.id || Some(issue.generation) != device.generation.checked_add(1) {
         return Err(AccessError::StaleRevision);
     }
     if device.revoked {
@@ -717,6 +755,41 @@ pub fn revoke(device: &Device, expected_revision: u64) -> Result<Option<Device>,
         revoked: true,
         ..device.clone()
     }))
+}
+
+/// Canonical access-policy shape used by all administrative entry points.
+/// Restriction tokens are exact identifiers, so surrounding whitespace is
+/// rejected rather than silently creating a different allow/deny token.
+pub fn policy_shape_valid(policy: &Policy, permission_count: usize) -> bool {
+    let text = |value: &str, limit| {
+        !value.is_empty()
+            && value.chars().count() <= limit
+            && value.trim() == value
+            && !value.chars().any(char::is_control)
+    };
+    (!policy.deny_rated || policy.allowed_ratings.is_empty())
+        && policy.allowed_ratings.len() <= 200
+        && policy.blocked_labels.len() <= crate::access_admin::MAX_BLOCKED_LABELS
+        && permission_count <= 32
+        && policy.allowed_ratings.iter().all(|r| text(r, 64))
+        && policy.blocked_labels.iter().all(|l| text(l, 100))
+        && reference_ids_valid(policy.library_ids.iter().map(String::as_str))
+}
+pub fn reference_ids_valid<'a>(ids: impl IntoIterator<Item = &'a str>) -> bool {
+    let mut count = 0;
+    for id in ids {
+        count += 1;
+        if count > 200
+            || id.is_empty()
+            || id.len() > 128
+            || !id
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+        {
+            return false;
+        }
+    }
+    true
 }
 
 /// `None` means the policy is unchanged; no revision or event is produced.
@@ -2023,5 +2096,47 @@ mod logical_scope_properties {
             }
         ));
         assert!(owns_job(&Principal::operator(), "legacy"));
+    }
+}
+
+#[cfg(test)]
+mod canonical_policy_tests {
+    use super::*;
+    #[test]
+    fn all_entry_points_share_exact_restriction_tokens() {
+        for value in ["", " PG", "PG ", "PG\n", "\t"] {
+            let mut p = Policy::default();
+            p.allowed_ratings.insert(value.into());
+            assert!(!policy_shape_valid(&p, 1));
+        }
+        let mut p = Policy::default();
+        p.allowed_ratings.insert("PG".into());
+        assert!(policy_shape_valid(&p, 32));
+        assert!(!policy_shape_valid(&p, 33));
+        p.deny_rated = true;
+        assert!(!policy_shape_valid(&p, 1));
+        assert!(reference_ids_valid(["a-z_0", "B"]));
+        assert!(!reference_ids_valid(["a/b"]));
+        assert!(!reference_ids_valid(std::iter::repeat_n("a", 201)));
+    }
+}
+
+/// Claimed receipts remain historical after expiry; denied wins every phase.
+pub fn pairing_status(
+    phase: &PairingPhase,
+    denied: bool,
+    expires_at: i64,
+    now: i64,
+) -> &'static str {
+    if denied {
+        "denied"
+    } else if matches!(phase, PairingPhase::Claimed { .. }) {
+        "claimed"
+    } else if now >= expires_at {
+        "expired"
+    } else if matches!(phase, PairingPhase::Approved { .. }) {
+        "approved"
+    } else {
+        "pending"
     }
 }

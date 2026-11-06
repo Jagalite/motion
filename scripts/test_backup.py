@@ -1,6 +1,8 @@
 """Restore establishes a fresh event epoch so old cursors reset."""
 import pathlib
 import sqlite3
+import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -33,6 +35,8 @@ def database(path):
         INSERT INTO signin_transactions VALUES ('transaction');
         CREATE TABLE signin_outbox (id TEXT PRIMARY KEY, transaction_id TEXT REFERENCES signin_transactions(id));
         INSERT INTO signin_outbox VALUES ('email', 'transaction');
+        CREATE TABLE signin_mail_tests (id TEXT PRIMARY KEY);
+        INSERT INTO signin_mail_tests VALUES ('test-message');
         CREATE TABLE signin_requests (id TEXT PRIMARY KEY);
         INSERT INTO signin_requests VALUES ('request');
         CREATE TABLE signin_proofs (id TEXT PRIMARY KEY);
@@ -41,6 +45,8 @@ def database(path):
         INSERT INTO signin_families VALUES ('family', 0, 7);
         CREATE TABLE signin_settings (reviewed_epoch TEXT);
         INSERT INTO signin_settings VALUES ('original');
+        CREATE TABLE catalog_review_plans (id TEXT PRIMARY KEY);
+        INSERT INTO catalog_review_plans VALUES ('pending-proposal');
         CREATE TABLE signin_audit (id TEXT);
         INSERT INTO signin_audit VALUES ('audit');
     """)
@@ -49,6 +55,36 @@ def database(path):
 
 
 class RestoreEpoch(unittest.TestCase):
+    def test_older_snapshot_without_catalog_proposals_restores(self):
+        with tempfile.TemporaryDirectory() as root:
+            root = pathlib.Path(root)
+            (root / 'data').mkdir()
+            database(root / 'data' / 'playscale.sqlite3')
+            with sqlite3.connect(root / 'data' / 'playscale.sqlite3') as db:
+                db.execute('DROP TABLE catalog_review_plans')
+            backup.backup(root / 'data', root / 'snapshot')
+            backup.restore(root / 'snapshot', root / 'restored')
+            with sqlite3.connect(root / 'restored' / 'playscale.sqlite3') as db:
+                self.assertEqual(db.execute('SELECT revoked FROM devices').fetchone()[0], 1)
+                self.assertEqual(db.execute("SELECT count(*) FROM sqlite_master WHERE name='catalog_review_plans'").fetchone()[0], 0)
+
+    def test_installed_tool_carries_the_shared_restore_contract(self):
+        with tempfile.TemporaryDirectory() as root:
+            root = pathlib.Path(root)
+            tools = root / 'tools'
+            tools.mkdir()
+            source = pathlib.Path(__file__).resolve().parent
+            for name in ('backup.py', 'restore-authority.json'):
+                shutil.copy2(source / name, tools / name)
+            (root / 'data').mkdir()
+            database(root / 'data' / 'playscale.sqlite3')
+            subprocess.run([sys.executable, str(tools / 'backup.py'), 'backup', '--data-dir', str(root / 'data'), '--output', str(root / 'snapshot')], check=True, capture_output=True)
+            subprocess.run([sys.executable, str(tools / 'backup.py'), 'restore', '--backup', str(root / 'snapshot'), '--data-dir', str(root / 'restored')], check=True, capture_output=True)
+            with sqlite3.connect(root / 'restored' / 'playscale.sqlite3') as db:
+                self.assertEqual(db.execute('SELECT count(*) FROM signin_mail_tests').fetchone()[0], 0)
+                self.assertEqual(db.execute('SELECT count(*) FROM catalog_review_plans').fetchone()[0], 0)
+                self.assertEqual(db.execute('SELECT revoked FROM devices').fetchone()[0], 1)
+
     def test_restore_rotates_epoch_and_keeps_server_identity(self):
         with tempfile.TemporaryDirectory() as root:
             root = pathlib.Path(root)
@@ -60,7 +96,7 @@ class RestoreEpoch(unittest.TestCase):
             server, epoch = db.execute('SELECT server_id, restore_epoch FROM server_identity').fetchone()
             for table in ('credentials', 'content_tickets', 'pairings', 'idempotency_records',
                           'access_invitations', 'signin_transactions', 'signin_outbox',
-                          'signin_requests', 'signin_proofs'):
+                          'signin_requests', 'signin_proofs', 'signin_mail_tests', 'catalog_review_plans'):
                 self.assertEqual(db.execute(f'SELECT count(*) FROM {table}').fetchone()[0], 0, table)
             self.assertEqual(db.execute('SELECT revoked FROM devices').fetchone()[0], 1)
             self.assertEqual(db.execute('SELECT revoked,revision FROM signin_families').fetchone(), (1, 8))

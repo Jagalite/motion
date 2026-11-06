@@ -106,9 +106,10 @@ pub(crate) async fn audit(
 }
 /// A separate committed writer reservation makes failed requests count too.
 pub(super) async fn limit(app: &App, bucket: &str, max: i64, window: i64) -> Result<(), Problem> {
+    let observed_now = now();
     let mut tx = begin_write(&app.db).await?;
     sqlx::query("DELETE FROM signin_limits WHERE window_start<?")
-        .bind(now() - 86400)
+        .bind(observed_now.saturating_sub(86400))
         .execute(&mut *tx)
         .await?;
     let key = keyed(app, "rate", bucket);
@@ -117,13 +118,13 @@ pub(super) async fn limit(app: &App, bucket: &str, max: i64, window: i64) -> Res
             .bind(&key)
             .fetch_optional(&mut *tx)
             .await?;
-    let (start, attempts) = row
-        .filter(|(start, _)| now() - start < window)
-        .unwrap_or((now(), 0));
-    if attempts >= max {
-        return Err(Problem::rate_limited((start + window - now()).max(1) as u64));
-    }
-    sqlx::query("INSERT INTO signin_limits(bucket,window_start,attempts) VALUES(?,?,?) ON CONFLICT(bucket) DO UPDATE SET window_start=excluded.window_start,attempts=excluded.attempts").bind(key).bind(start).bind(attempts+1).execute(&mut *tx).await?;
+    let (start, attempts) = match core::reserve_rate_window(row, observed_now, max, window) {
+        core::RateAdmission::Reserve { start, attempts } => (start, attempts),
+        core::RateAdmission::Limited { retry_after } => {
+            return Err(Problem::rate_limited(retry_after));
+        }
+    };
+    sqlx::query("INSERT INTO signin_limits(bucket,window_start,attempts) VALUES(?,?,?) ON CONFLICT(bucket) DO UPDATE SET window_start=excluded.window_start,attempts=excluded.attempts").bind(key).bind(start).bind(attempts).execute(&mut *tx).await?;
     tx.commit().await?;
     Ok(())
 }
@@ -222,26 +223,33 @@ pub(crate) async fn require_fresh(
         return Err(problem(core::Error::RecentProofRequired));
     }
     let actor_hash: Option<String> = row.get("actor_credential_hash");
-    if actor_hash.as_deref() != caller.credential().map(|x| x.0) {
-        return Err(problem(core::Error::RecentProofRequired));
-    }
     let approver_hash: Option<String> = row.get("approver_credential_hash");
     actor_valid(c, approver.as_deref().unwrap(), approver_hash.as_deref()).await?;
-    if approver.as_deref() != Some("operator") {
-        let approver_device = auth::load_device(c, approver.as_deref().unwrap())
-            .await?
-            .ok_or_else(unavailable)?;
-        let actor_user = owned_user(c, caller).await?;
-        if !approver_device
-            .device
-            .grant
-            .permissions
-            .contains(&Permission::SystemAdmin)
-            && (actor_user.is_none()
-                || approver_device.user_id.as_deref() != actor_user.as_ref().map(|u| u.id.as_str()))
-        {
-            return Err(problem(core::Error::RecentProofRequired));
-        }
+    let actor_user = owned_user(c, caller).await?;
+    let approver_device = if approver.as_deref() == Some("operator") {
+        None
+    } else {
+        Some(
+            auth::load_device(c, approver.as_deref().unwrap())
+                .await?
+                .ok_or_else(unavailable)?,
+        )
+    };
+    if !core::proof_authority_valid(&core::ProofAuthority {
+        recorded_actor_credential: actor_hash.as_deref(),
+        current_actor_credential: caller.credential().map(|x| x.0),
+        actor_current: true,
+        approver_current: true,
+        approver_admin: approver_device.as_ref().is_none_or(|d| {
+            d.device
+                .grant
+                .permissions
+                .contains(&Permission::SystemAdmin)
+        }),
+        actor_owner: actor_user.as_ref().map(|u| u.id.as_str()),
+        approver_owner: approver_device.as_ref().and_then(|d| d.user_id.as_deref()),
+    }) {
+        return Err(problem(core::Error::RecentProofRequired));
     }
     sqlx::query("UPDATE signin_proofs SET consumed=1 WHERE id=?")
         .bind(id)
@@ -422,9 +430,7 @@ pub(super) async fn revoke_families(
         if let Some(device) = device
             && let Some(row) = auth::load_device(c, &device).await?
         {
-            let mut next = row.device.clone();
-            next.revoked = true;
-            next.revision += 1;
+            let next = core::revoke_family_device(&row.device)?;
             changes.push((row.device, next));
         }
     }

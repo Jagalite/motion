@@ -148,41 +148,57 @@ async fn owner_live(
     app: &App,
     m: &Message,
 ) -> Result<bool, Problem> {
-    Ok(match m.purpose {
+    let observed_now = now();
+    let live = match m.purpose {
         Purpose::SigninCode | Purpose::RegistrationCode => {
             let state: Option<String> =
                 sqlx::query_scalar("SELECT state_json FROM signin_transactions WHERE id=?")
                     .bind(&m.owner)
                     .fetch_optional(&mut *c)
                     .await?;
-            match state.map(|s| serde_json::from_str::<core::Transaction>(&s)) {
-                Some(Ok(tx)) => {
-                    tx.phase == core::Phase::Pending
-                        && tx.server_epoch == app.access.server_epoch
-                        && tx.epoch == m.epoch
+            let tx = state.and_then(|s| serde_json::from_str::<core::Transaction>(&s).ok());
+            let owner = tx.as_ref().map_or(policy::OwnerObservation::Missing, |tx| {
+                policy::OwnerObservation::Challenge {
+                    purpose: tx.purpose,
+                    pending: tx.phase == core::Phase::Pending,
+                    server_epoch: &tx.server_epoch,
+                    epoch: &tx.epoch,
                 }
-                _ => false,
-            }
+            });
+            policy::owner_eligible(m, owner, &app.access.server_epoch, observed_now)
         }
-        Purpose::Invitation => sqlx::query_scalar::<_, i64>(
-            "SELECT count(*) FROM access_invitations WHERE id=? AND revoked=0 AND device_id IS NULL AND identity_id IS NULL AND expires_at>?",
-        )
-        .bind(&m.owner)
-        .bind(now())
-        .fetch_one(&mut *c)
-        .await?
-            > 0,
-        // A notice has no proof to protect; it lives until its deadline.
-        Purpose::AccountNotice => true,
-        Purpose::Test => sqlx::query_scalar::<_, i64>(
-            "SELECT count(*) FROM signin_mail_tests WHERE id=? AND expires_at>?",
-        )
-        .bind(&m.owner)
-        .bind(now())
-        .fetch_one(&mut *c)
-        .await?
-            > 0,
-    })
+        Purpose::Invitation => {
+            let row = sqlx::query("SELECT revoked,device_id,identity_id,expires_at FROM access_invitations WHERE id=?")
+                .bind(&m.owner).fetch_optional(&mut *c).await?;
+            let owner = row.as_ref().map_or(policy::OwnerObservation::Missing, |r| {
+                policy::OwnerObservation::Invitation {
+                    revoked: r.get("revoked"),
+                    device_claimed: r.get::<Option<String>, _>("device_id").is_some(),
+                    identity_claimed: r.get::<Option<String>, _>("identity_id").is_some(),
+                    expires_at: r.get("expires_at"),
+                }
+            });
+            policy::owner_eligible(m, owner, &app.access.server_epoch, observed_now)
+        }
+        Purpose::AccountNotice => policy::owner_eligible(
+            m,
+            policy::OwnerObservation::AccountNotice,
+            &app.access.server_epoch,
+            observed_now,
+        ),
+        Purpose::Test => {
+            let expires: Option<i64> =
+                sqlx::query_scalar("SELECT expires_at FROM signin_mail_tests WHERE id=?")
+                    .bind(&m.owner)
+                    .fetch_optional(&mut *c)
+                    .await?;
+            let owner = expires.map_or(policy::OwnerObservation::Missing, |expires_at| {
+                policy::OwnerObservation::Test { expires_at }
+            });
+            policy::owner_eligible(m, owner, &app.access.server_epoch, observed_now)
+        }
+    };
+    Ok(live)
 }
 
 struct Facts {
@@ -219,7 +235,7 @@ async fn observe_facts(
     Ok((
         Facts {
             // An explicit delivery test may run before email sign-in is enabled.
-            enabled: mail.cfg.enabled || m.purpose == Purpose::Test,
+            enabled: policy::configuration_admits(m.purpose, mail.cfg.enabled),
             mode: mail.cfg.mode,
             revision: mail.revision as u64,
             key_id: mail.key_id(),
@@ -298,7 +314,19 @@ pub(super) async fn process(app: &App, id: &str) -> Result<Phase, Problem> {
     let mut tx = begin_write(&app.db).await?;
     let m = load(&mut tx, id).await?.ok_or_else(Problem::not_found)?;
     let (facts, mail) = observe_facts(&mut tx, app, &m).await?;
-    let attempt = match policy::claim(&m, &facts.current(), &token) {
+    let sealed: Option<String> = sqlx::query_scalar("SELECT payload FROM signin_outbox WHERE id=?")
+        .bind(id)
+        .fetch_one(&mut *tx)
+        .await?;
+    let payload: Option<Payload> = sealed
+        .and_then(|sealed| open(app, &format!("mail:{id}"), &sealed).ok())
+        .and_then(|clear| serde_json::from_str(&clear).ok());
+    let availability = if payload.is_some() {
+        policy::PayloadAvailability::Available
+    } else {
+        policy::PayloadAvailability::Unavailable
+    };
+    let attempt = match policy::claim_with_payload(&m, &facts.current(), &token, availability) {
         Decision::Wait => {
             tx.commit().await?;
             return Ok(m.phase);
@@ -308,26 +336,14 @@ pub(super) async fn process(app: &App, id: &str) -> Result<Phase, Problem> {
             tx.commit().await?;
             return Ok(next.phase);
         }
+        Decision::PayloadUnavailable(next) => {
+            persist(&mut tx, &next, Some("payload unavailable")).await?;
+            tx.commit().await?;
+            return Ok(next.phase);
+        }
         Decision::Attempt(next) => next,
     };
-    let sealed: Option<String> = sqlx::query_scalar("SELECT payload FROM signin_outbox WHERE id=?")
-        .bind(id)
-        .fetch_one(&mut *tx)
-        .await?;
-    let payload: Option<Payload> = sealed
-        .and_then(|sealed| open(app, &format!("mail:{id}"), &sealed).ok())
-        .and_then(|clear| serde_json::from_str(&clear).ok());
-    let Some(payload) = payload else {
-        // Missing or undecryptable payload: nothing can ever be sent.
-        let failed = Message {
-            phase: Phase::Failed,
-            lease: None,
-            ..m
-        };
-        persist(&mut tx, &failed, Some("payload unavailable")).await?;
-        tx.commit().await?;
-        return Ok(Phase::Failed);
-    };
+    let payload = payload.expect("core only reserves attempts with an available payload");
     persist(&mut tx, &attempt, None).await?;
     sqlx::query("UPDATE signin_outbox SET last_attempt_at=? WHERE id=?")
         .bind(now())
@@ -337,34 +353,46 @@ pub(super) async fn process(app: &App, id: &str) -> Result<Phase, Problem> {
     tx.commit().await?;
 
     let bytes = STANDARD.decode(&payload.bytes).unwrap_or_default();
-    let (observation, detail) = if bytes.is_empty() {
-        (
-            Observation::Permanent(policy::Stage::Message),
-            "message bytes unavailable".to_owned(),
-        )
-    } else if attempt.mode == Mode::Direct {
-        adapter::deliver_direct(
-            &app.access.mail.routing(),
-            &adapter::Direct {
-                helo: &mail.cfg.direct.hostname,
-                envelope_from: &payload.envelope_from,
-                recipient: &payload.recipient,
-                message: &bytes,
-                loopback_port: mail.cfg.direct.loopback_port,
-            },
-            || recheck(app, id, &token),
-        )
-        .await
-    } else {
-        adapter::deliver_relay(
-            &mail.relay(),
-            &payload.envelope_from,
-            &payload.recipient,
-            &bytes,
-            recheck(app, id, &token),
-        )
-        .await
+    let submitted = std::sync::atomic::AtomicBool::new(false);
+    let recheck_submission = || async {
+        let admitted = recheck(app, id, &token).await;
+        if admitted {
+            submitted.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        admitted
     };
+    let budget = std::time::Duration::from_secs(policy::attempt_budget_seconds(&attempt, now()));
+    let delivery = async {
+        if bytes.is_empty() {
+            (
+                Observation::Permanent(policy::Stage::Message),
+                "message bytes unavailable".to_owned(),
+            )
+        } else if attempt.mode == Mode::Direct {
+            adapter::deliver_direct(
+                &app.access.mail.routing(),
+                &adapter::Direct {
+                    helo: &mail.cfg.direct.hostname,
+                    envelope_from: &payload.envelope_from,
+                    recipient: &payload.recipient,
+                    message: &bytes,
+                    loopback_port: mail.cfg.direct.loopback_port,
+                },
+                recheck_submission,
+            )
+            .await
+        } else {
+            adapter::deliver_relay(
+                &mail.relay(),
+                &payload.envelope_from,
+                &payload.recipient,
+                &bytes,
+                recheck_submission(),
+            )
+            .await
+        }
+    };
+    let (observation, detail) = bounded_attempt(budget, &submitted, delivery).await;
 
     let mut tx = begin_write(&app.db).await?;
     let current = load(&mut tx, id).await?.ok_or_else(Problem::not_found)?;
@@ -386,6 +414,31 @@ pub(super) async fn process(app: &App, id: &str) -> Result<Phase, Problem> {
     .await?;
     tx.commit().await?;
     Ok(phase)
+}
+
+/// One bound surrounds DNS, all routes and the current-authority check. Once
+/// authority was granted, interruption is conservatively ambiguous because a
+/// transport may already have emitted content; a timeout cannot authorize retry
+/// as definitely unsubmitted.
+async fn bounded_attempt<F>(
+    budget: std::time::Duration,
+    submitted: &std::sync::atomic::AtomicBool,
+    delivery: F,
+) -> (Observation, String)
+where
+    F: std::future::Future<Output = (Observation, String)>,
+{
+    match tokio::time::timeout(budget, delivery).await {
+        Ok(result) => result,
+        Err(_) => (
+            if submitted.load(std::sync::atomic::Ordering::Relaxed) {
+                Observation::Ambiguous
+            } else {
+                Observation::Temporary(policy::Stage::Route)
+            },
+            "whole mail attempt deadline exceeded".to_owned(),
+        ),
+    }
 }
 
 /// Bounded, address-free diagnostic text.
@@ -488,6 +541,97 @@ pub(super) fn activity_value(row: &sqlx::sqlite::SqliteRow) -> Value {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn whole_attempt_deadline_includes_pending_authority_check() {
+        for admitted in [false, true] {
+            let submitted = std::sync::atomic::AtomicBool::new(admitted);
+            let result = bounded_attempt(
+                std::time::Duration::from_millis(1),
+                &submitted,
+                std::future::pending(),
+            )
+            .await;
+            assert_eq!(
+                result.0,
+                if admitted {
+                    Observation::Ambiguous
+                } else {
+                    Observation::Temporary(policy::Stage::Route)
+                }
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn bulk_cancellation_matches_core_phase_matrix() {
+        use sqlx::Connection;
+        for owner_filter in [false, true] {
+            let mut c = sqlx::SqliteConnection::connect(":memory:").await.unwrap();
+            sqlx::query("CREATE TABLE signin_outbox(id TEXT, owner_id TEXT, phase TEXT, payload TEXT, updated_at INTEGER)")
+                .execute(&mut c).await.unwrap();
+            for phase in [
+                Phase::Queued,
+                Phase::Sending,
+                Phase::Accepted,
+                Phase::Failed,
+                Phase::Unknown,
+                Phase::Expired,
+                Phase::Cancelled,
+            ] {
+                for owner in ["a", "b"] {
+                    sqlx::query("INSERT INTO signin_outbox VALUES (?,?,?,?,0)")
+                        .bind(format!("{}-{owner}", phase.as_str()))
+                        .bind(owner)
+                        .bind(phase.as_str())
+                        .bind("sealed")
+                        .execute(&mut c)
+                        .await
+                        .unwrap();
+                }
+            }
+            if owner_filter {
+                cancel_owner(&mut c, "a").await.unwrap();
+            } else {
+                cancel_all(&mut c).await.unwrap();
+            }
+            for row in sqlx::query("SELECT * FROM signin_outbox")
+                .fetch_all(&mut c)
+                .await
+                .unwrap()
+            {
+                let id: String = row.get("id");
+                let original = Phase::parse(id.split('-').next().unwrap()).unwrap();
+                let m = Message {
+                    id,
+                    purpose: Purpose::Test,
+                    owner: row.get("owner_id"),
+                    mode: Mode::Relay,
+                    config_revision: 1,
+                    key_id: None,
+                    epoch: "epoch".into(),
+                    expires_at: 100,
+                    phase: original,
+                    attempts: 1,
+                    lease: None,
+                    next_attempt: 0,
+                    ambiguous: false,
+                };
+                let next = if !owner_filter || m.owner == "a" {
+                    policy::cancel(&m)
+                } else {
+                    m.clone()
+                };
+                assert_eq!(row.get::<String, _>("phase"), next.phase.as_str());
+                assert_eq!(
+                    row.get::<Option<String>, _>("payload").is_none(),
+                    next.phase != original
+                );
+            }
+        }
+    }
+
     #[test]
     fn redaction_drops_addresses_and_controls() {
         assert_eq!(

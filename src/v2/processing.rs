@@ -45,7 +45,11 @@ pub(crate) fn recipe(id: &str) -> Option<Value> {
             "v1;mp4;v0-libx264-veryfast-crf23-threads2;yuv420p;scale-min1280x720-aspect-even;a-selected-aac160k;no-subtitles;no-data;metadata-strip;faststart"
         }
     };
-    let backends = if matches!(id, "h264720p" | "video_profile") && cfg!(target_os = "macos") {
+    let backends = if playscale_core::processing::backend_allowed(
+        id,
+        "videotoolbox",
+        cfg!(target_os = "macos"),
+    ) {
         vec!["software", "videotoolbox"]
     } else {
         vec!["software"]
@@ -67,21 +71,13 @@ fn recipe_digest(
     subtitle: bool,
 ) -> Option<String> {
     let descriptor = recipe(id)?;
-    let base = descriptor["digest"].as_str()?;
-    if profile.is_none() && backend == "software" && id != "video_profile" && !subtitle {
-        return Some(base.to_owned());
-    }
-    if (id == "video_profile") != profile.is_some() {
-        return None;
-    }
-    let mut inputs = json!({"semantics":base,"backend":backend,"video_profile":profile});
-    if subtitle {
-        inputs["subtitle"] = json!("selected-text-mov_text");
-    }
-    Some(format!(
-        "sha256:{}",
-        super::sha256(&serde_json::to_vec(&inputs).ok()?)
-    ))
+    playscale_core::processing::recipe_identity(
+        id,
+        descriptor["digest"].as_str()?,
+        backend,
+        profile.map(serde_json::to_value).transpose().ok()?,
+        subtitle,
+    )
 }
 fn software_backend() -> String {
     "software".into()
@@ -246,8 +242,57 @@ pub(crate) async fn exact_binding(
     timeline: &str,
     file: &str,
     revision: &str,
-) -> Result<bool, sqlx::Error> {
-    sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM version_files b JOIN media_versions v ON v.id=b.version_id JOIN timelines t ON t.id=v.timeline_id JOIN media_files f ON f.id=b.file_id WHERE v.timeline_id=? AND b.file_id=? AND b.file_revision=? AND v.origin='original' AND f.edition_id=t.edition_id AND b.start_ms IS NULL AND b.end_ms IS NULL AND (SELECT count(*) FROM version_files p WHERE p.version_id=v.id)=1)").bind(timeline).bind(file).bind(revision).fetch_one(conn).await
+) -> Result<playscale_core::processing::BindingEvidence, sqlx::Error> {
+    type Row = (
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+        i64,
+        Option<i64>,
+        Option<i64>,
+        i64,
+    );
+    let rows: Vec<Row> = sqlx::query_as("SELECT v.id,v.timeline_id,b.file_id,b.file_revision,v.origin,f.edition_id,t.edition_id,b.part,b.start_ms,b.end_ms,(SELECT count(*) FROM version_files p WHERE p.version_id=v.id) FROM version_files b JOIN media_versions v ON v.id=b.version_id JOIN timelines t ON t.id=v.timeline_id JOIN media_files f ON f.id=b.file_id WHERE b.file_id=?")
+        .bind(file).fetch_all(conn).await?;
+    Ok(playscale_core::processing::BindingEvidence {
+        timeline: timeline.to_owned(),
+        file: file.to_owned(),
+        revision: revision.to_owned(),
+        candidates: rows
+            .into_iter()
+            .map(
+                |(
+                    version,
+                    timeline,
+                    file,
+                    file_revision,
+                    origin,
+                    file_edition,
+                    timeline_edition,
+                    part,
+                    start_ms,
+                    end_ms,
+                    part_count,
+                )| playscale_core::processing::WholeBinding {
+                    version,
+                    timeline,
+                    file,
+                    file_revision,
+                    origin,
+                    file_edition,
+                    timeline_edition,
+                    part,
+                    start_ms,
+                    end_ms,
+                    part_count,
+                },
+            )
+            .collect(),
+    })
 }
 
 pub(crate) async fn publication_facts(
@@ -295,7 +340,7 @@ pub(crate) async fn publication_facts(
             requester_authorized: principal.is_some(),
             source_enabled: enabled,
             source_in_scope,
-            exact_whole_timeline_binding: binding,
+            binding,
             recipe_unchanged: recipe_digest(
                 &job.recipe,
                 &job.backend,
@@ -361,23 +406,20 @@ pub(crate) async fn output_rendition_status(
             expired,
             phase: serde_json::from_value(json!(phase)).map_err(Problem::internal)?,
             source_current: source_available && current == revision,
-            binding_current: binding,
+            binding,
             output_current: available,
         },
     )))
 }
 
 pub(crate) async fn selection(
-    app: &App,
+    _app: &App,
     conn: &mut sqlx::SqliteConnection,
     timeline: &str,
     source: &FileRef,
     streams: &[crate::db::Track],
     requested: Tracks,
 ) -> Result<Tracks, Problem> {
-    use playscale_core::components::{
-        Kind, SubtitleOccurrence, embedded_track, subtitle_occurrence,
-    };
     let version: String = sqlx::query_scalar(
         "SELECT v.id FROM version_files b JOIN media_versions v ON v.id=b.version_id \
          WHERE v.timeline_id=? AND b.file_id=? AND b.file_revision=? AND v.origin='original' \
@@ -390,101 +432,53 @@ pub(crate) async fn selection(
     .await?;
     let components =
         if requested.audio_component_id.is_some() || requested.subtitle_component_id.is_some() {
-            crate::components::timeline_components(&app.db, timeline)
+            crate::components::timeline_components_in(conn, timeline)
                 .await
                 .map_err(Problem::internal)?
         } else {
             vec![]
         };
-    let ordinal = |kind: &str, index: i64| -> Option<u32> {
-        streams
+    use playscale_core::processing::{PreparationSelection, PreparationStream, SelectionRefusal};
+    let selected = playscale_core::processing::preparation_selection(
+        &PreparationSelection {
+            audio_track: requested.audio_track_id.clone(),
+            subtitle_track: requested.subtitle_track_id.clone(),
+            audio_component: requested.audio_component_id.clone(),
+            subtitle_component: requested.subtitle_component_id.clone(),
+        },
+        &streams
             .iter()
-            .filter(|t| t.kind == kind)
-            .position(|t| t.index == index)
-            .map(|i| i as u32)
-    };
-    let unavailable = || {
-        Problem::invalid(
+            .map(|t| PreparationStream {
+                index: t.index,
+                kind: t.kind.clone(),
+                codec: t.codec.clone(),
+            })
+            .collect::<Vec<_>>(),
+        &components,
+        &version,
+        &source.file_id,
+        &source.file_revision,
+    )
+    .map_err(|reason| match reason {
+        SelectionRefusal::UnknownTrack => {
+            Problem::invalid("unknown_track", "The selected track does not exist")
+        }
+        SelectionRefusal::ComponentUnavailable => Problem::invalid(
             "component_unavailable",
             "The component does not occur in this source revision",
-        )
-    };
-    let conflict = || {
-        Problem::invalid(
+        ),
+        SelectionRefusal::ConflictingPins => Problem::invalid(
             "track_component_conflict",
             "The track and component pins disagree",
-        )
-    };
-    let count = |kind: &str| streams.iter().filter(|t| t.kind == kind).count();
-    let audio_track = super::playback::track_index(&requested.audio_track_id, 'a', count("audio"))?;
-    let audio_component = match &requested.audio_component_id {
-        None => None,
-        Some(id) => Some(
-            embedded_track(
-                &components,
-                id,
-                Kind::Audio,
-                &version,
-                &source.file_id,
-                &source.file_revision,
-            )
-            .and_then(|index| ordinal("audio", index))
-            .ok_or_else(unavailable)?,
         ),
-    };
-    if audio_track
-        .zip(audio_component)
-        .is_some_and(|(a, b)| a != b)
-    {
-        return Err(conflict());
-    }
-    let subtitle_track =
-        super::playback::track_index(&requested.subtitle_track_id, 's', count("subtitle"))?;
-    let subtitle_component = match &requested.subtitle_component_id {
-        None => None,
-        Some(id) => match subtitle_occurrence(
-            &components,
-            id,
-            &version,
-            &source.file_id,
-            &source.file_revision,
-        ) {
-            Some(SubtitleOccurrence::Embedded(index)) => {
-                Some(ordinal("subtitle", index).ok_or_else(unavailable)?)
-            }
-            Some(SubtitleOccurrence::Sidecar(_)) => {
-                return Err(Problem::invalid(
-                    "preparation_subtitle_unsupported",
-                    "A preparation keeps only an embedded text subtitle",
-                ));
-            }
-            None => return Err(unavailable()),
-        },
-    };
-    if subtitle_track
-        .zip(subtitle_component)
-        .is_some_and(|(a, b)| a != b)
-    {
-        return Err(conflict());
-    }
-    let subtitle = subtitle_track.or(subtitle_component);
-    // Only text survives as an MP4 subtitle (mov_text) without changing its
-    // meaning; bitmap and styled subtitles would need burning in.
-    if let Some(n) = subtitle
-        && !streams
-            .iter()
-            .filter(|t| t.kind == "subtitle")
-            .nth(n as usize)
-            .is_some_and(|t| playscale_core::delivery::sidecar_subtitle(&t.codec))
-    {
-        return Err(Problem::invalid(
+        SelectionRefusal::UnsupportedSubtitle => Problem::invalid(
             "preparation_subtitle_unsupported",
             "A preparation keeps only an embedded text subtitle (SubRip, mov_text or WebVTT)",
-        ));
-    }
+        ),
+    })?;
     Ok(Tracks {
-        audio_track_id: audio_track.or(audio_component).map(|n| format!("a{n}")),
-        subtitle_track_id: subtitle.map(|n| format!("s{n}")),
+        audio_track_id: selected.audio.map(|n| format!("a{n}")),
+        subtitle_track_id: selected.subtitle.map(|n| format!("s{n}")),
         ..requested
     })
 }
@@ -498,14 +492,13 @@ async fn prepare(
     caller.require(Permission::ProcessingRequest)?;
     let key = idempotency_key(&headers)?;
     let input = body.value;
-    let recipe = recipe(&input.recipe_id)
+    recipe(&input.recipe_id)
         .ok_or_else(|| Problem::invalid("unknown_recipe", "Select a listed recipe"))?;
-    if !recipe["allowed_backends"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|b| b.as_str() == Some(&input.backend))
-    {
+    if !playscale_core::processing::backend_allowed(
+        &input.recipe_id,
+        &input.backend,
+        cfg!(target_os = "macos"),
+    ) {
         return Err(Problem::invalid(
             "unsupported_backend",
             "Select a recipe backend supported on this platform",
@@ -602,6 +595,7 @@ async fn prepare(
         &input.source.file_revision,
     )
     .await?
+    .is_current()
     {
         return Err(Problem::new(
             StatusCode::CONFLICT,
@@ -611,17 +605,14 @@ async fn prepare(
     }
     let tracks: Vec<crate::db::Track> =
         serde_json::from_str(&source.tracks_json).map_err(Problem::internal)?;
-    if matches!(input.recipe_id.as_str(), "h264720p" | "video_profile")
-        && !tracks.iter().find(|t| t.kind == "video").is_some_and(|t| {
-            t.kind == "video"
-                && t.width.is_some()
-                && t.height.is_some()
-                && !matches!(
-                    t.color_transfer.as_deref(),
-                    Some("smpte2084" | "arib-std-b67")
-                )
-        })
-    {
+    if !playscale_core::processing::video_source_eligible(
+        playscale_core::processing::SourceContract::Preparation,
+        &input.recipe_id,
+        tracks
+            .iter()
+            .find(|t| t.kind == "video")
+            .map(|t| (t.width, t.height, t.color_transfer.as_deref())),
+    ) {
         return Err(Problem::invalid(
             "preparation_video_unsupported",
             "Video preparation requires a probed SDR video stream with known dimensions",
@@ -767,7 +758,7 @@ async fn renditions(
                 expired,
                 phase: serde_json::from_value(json!(phase)).map_err(Problem::internal)?,
                 source_current: source_available && current.as_deref() == Some(&revision),
-                binding_current: binding,
+                binding,
                 output_current: available,
             },
         );
@@ -831,5 +822,104 @@ mod recipe_identity_tests {
             recipe_digest("remux_mp4", "software", None, false).unwrap()
         );
         assert!(recipe_digest("video_profile", "software", None, false).is_none());
+    }
+}
+
+#[cfg(test)]
+mod binding_adapter_tests {
+    use super::*;
+    use sqlx::SqlitePool;
+
+    #[tokio::test]
+    async fn gathered_binding_facts_match_the_prior_sql_contract() {
+        let pool = SqlitePool::connect("sqlite::memory:").await.unwrap();
+        for sql in [
+            "CREATE TABLE timelines (id TEXT PRIMARY KEY, edition_id TEXT)",
+            "CREATE TABLE media_versions (id TEXT PRIMARY KEY, timeline_id TEXT, origin TEXT)",
+            "CREATE TABLE media_files (id TEXT PRIMARY KEY, edition_id TEXT)",
+            "CREATE TABLE version_files (version_id TEXT, part INTEGER, file_id TEXT, file_revision TEXT, start_ms INTEGER, end_ms INTEGER)",
+            "INSERT INTO timelines VALUES ('t','e'),('other','e')",
+            "INSERT INTO media_versions VALUES ('v','t','original')",
+            "INSERT INTO media_files VALUES ('f','e'),('second','e')",
+            "INSERT INTO version_files VALUES ('v',1,'f','r',NULL,NULL)",
+        ] {
+            sqlx::query(sql).execute(&pool).await.unwrap();
+        }
+        let mut conn = pool.acquire().await.unwrap();
+        async fn compare(conn: &mut sqlx::SqliteConnection, expected: bool) {
+            let old: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM version_files b JOIN media_versions v ON v.id=b.version_id JOIN timelines t ON t.id=v.timeline_id JOIN media_files f ON f.id=b.file_id WHERE v.timeline_id=? AND b.file_id=? AND b.file_revision=? AND v.origin='original' AND f.edition_id=t.edition_id AND b.start_ms IS NULL AND b.end_ms IS NULL AND (SELECT count(*) FROM version_files p WHERE p.version_id=v.id)=1)")
+                .bind("t").bind("f").bind("r").fetch_one(&mut *conn).await.unwrap();
+            let evidence = exact_binding(conn, "t", "f", "r").await.unwrap();
+            assert_eq!(old, expected);
+            assert_eq!(evidence.is_current(), old);
+            let old_download: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM media_versions v JOIN version_files b ON b.version_id=v.id AND b.part=1 WHERE v.id=? AND v.timeline_id=? AND b.file_id=? AND b.file_revision=? AND b.start_ms IS NULL AND b.end_ms IS NULL AND NOT EXISTS(SELECT 1 FROM version_files o WHERE o.version_id=v.id AND o.part<>1))")
+                .bind("v").bind("t").bind("f").bind("r").fetch_one(&mut *conn).await.unwrap();
+            assert_eq!(evidence.matches_download("v"), old_download);
+        }
+        compare(&mut conn, true).await;
+        for (change, restore) in [
+            (
+                "UPDATE media_versions SET timeline_id='other'",
+                "UPDATE media_versions SET timeline_id='t'",
+            ),
+            (
+                "UPDATE version_files SET file_revision='old'",
+                "UPDATE version_files SET file_revision='r'",
+            ),
+            (
+                "UPDATE media_versions SET origin='generated'",
+                "UPDATE media_versions SET origin='original'",
+            ),
+            (
+                "UPDATE media_files SET edition_id='other' WHERE id='f'",
+                "UPDATE media_files SET edition_id='e' WHERE id='f'",
+            ),
+            (
+                "UPDATE version_files SET start_ms=0",
+                "UPDATE version_files SET start_ms=NULL",
+            ),
+            (
+                "UPDATE version_files SET end_ms=10",
+                "UPDATE version_files SET end_ms=NULL",
+            ),
+            (
+                "INSERT INTO version_files VALUES ('v',2,'second','r',NULL,NULL)",
+                "DELETE FROM version_files WHERE part=2",
+            ),
+        ] {
+            sqlx::query(change).execute(&mut *conn).await.unwrap();
+            compare(&mut conn, false).await;
+            sqlx::query(restore).execute(&mut *conn).await.unwrap();
+            compare(&mut conn, true).await;
+        }
+        sqlx::query("UPDATE version_files SET part=2")
+            .execute(&mut *conn)
+            .await
+            .unwrap();
+        compare(&mut conn, true).await; // Preparation allows one part numbered 2; downloads require part 1.
+        sqlx::query("UPDATE version_files SET part=1")
+            .execute(&mut *conn)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO media_versions VALUES ('v2','t','original')")
+            .execute(&mut *conn)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO version_files VALUES ('v2',1,'f','r',NULL,NULL)")
+            .execute(&mut *conn)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE media_versions SET origin='generated' WHERE id='v'")
+            .execute(&mut *conn)
+            .await
+            .unwrap();
+        compare(&mut conn, true).await;
+        assert!(
+            exact_binding(&mut conn, "t", "missing", "r")
+                .await
+                .unwrap()
+                .candidates
+                .is_empty()
+        );
     }
 }

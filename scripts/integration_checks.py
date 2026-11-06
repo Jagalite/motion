@@ -33,6 +33,8 @@ CHECKS = [
     ('video_profiles', PY + ['scripts/video_profiles_smoke.py', '--binary', 'target/debug/playscale'], 900),
     # Operator tooling.
     ('backup_tool', PY + ['scripts/test_backup.py'], 120),
+    ('legacy_ownership_contract', PY + ['scripts/test_legacy_ownership_contract.py'], 120),
+    ('representation_dependencies', PY + ['scripts/test_representation_dependency_contract.py'], 120),
     ('packaging_helpers', PY + ['scripts/test_packaging.py'], 120),
     ('provider_identity', PY + ['scripts/test_motion_provider.py'], 120),
     # Browser client modules under Node.

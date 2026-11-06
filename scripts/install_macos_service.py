@@ -63,6 +63,7 @@ def main():
     tools = root / 'tools'
     tools.mkdir(exist_ok=True, mode=0o700)
     shutil.copy2(pathlib.Path(__file__).resolve().with_name('backup.py'), tools / 'backup.py')
+    shutil.copy2(pathlib.Path(__file__).resolve().with_name('restore-authority.json'), tools / 'restore-authority.json')
     logs = root / 'logs'
     logs.mkdir(exist_ok=True, mode=0o700)
     release = root / 'releases' / release_id

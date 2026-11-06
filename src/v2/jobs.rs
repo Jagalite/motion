@@ -10,7 +10,7 @@ use axum::{
     routing::{get, post},
 };
 use playscale_core::{
-    access::{self, Idempotent, Permission},
+    access::{self, Idempotent},
     jobs::{self, Input, Job, transition},
 };
 use serde_json::{Value, json};
@@ -112,13 +112,7 @@ async fn control(
     let mut tx = begin_write(&app.db).await?;
     let principal = caller.reauthorize(&mut tx, None).await?;
     let old = row(&mut tx, &id, &principal).await?;
-    let permission = if old.kind == "backup" {
-        Permission::SystemAdmin
-    } else if old.kind == "metadata" {
-        Permission::CatalogWrite
-    } else {
-        Permission::ProcessingRequest
-    };
+    let permission = jobs::control_permission(&old.kind);
     if !principal.allows(permission) {
         return Err(access::AccessError::Forbidden(permission).into());
     }
@@ -155,7 +149,35 @@ async fn control(
         phase: serde_json::from_value(json!(old.phase)).map_err(Problem::internal)?,
         attempt: old.attempt.try_into().map_err(Problem::internal)?,
     };
-    if let Some(reviewed) = reviewed {
+    let processing_retry = if retry && old.kind == "rendition" {
+        let active: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM processing_jobs WHERE phase IN ('queued','running','cancelling')",
+        )
+        .fetch_one(&mut *tx)
+        .await?;
+        let current = u64::try_from(old.revision).map_err(Problem::internal)?;
+        Some(
+            playscale_core::processing::retry(&state, Some((current, reviewed.unwrap())), active)
+                .map_err(|reason| match reason {
+                playscale_core::processing::RetryRefusal::StaleRevision => {
+                    Problem::from(access::AccessError::StaleRevision)
+                }
+                playscale_core::processing::RetryRefusal::NotRetryable => Problem::new(
+                    StatusCode::CONFLICT,
+                    "not_retryable",
+                    "Only failed or cancelled jobs can retry",
+                ),
+                playscale_core::processing::RetryRefusal::QueueFull => Problem::new(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "processing_limit",
+                    "Processing queue is full",
+                ),
+            })?,
+        )
+    } else {
+        None
+    };
+    if let Some(reviewed) = reviewed.filter(|_| old.kind != "rendition") {
         let current = u64::try_from(old.revision).map_err(Problem::internal)?;
         match jobs::admit_retry(&state, current, reviewed) {
             Ok(()) => {}
@@ -214,7 +236,8 @@ async fn control(
         }
     }
 
-    let (next, _) = transition(&state, if retry { Input::Retry } else { Input::Cancel });
+    let next = processing_retry
+        .unwrap_or_else(|| transition(&state, if retry { Input::Retry } else { Input::Cancel }).0);
     if next != state {
         if old.kind == "scan" {
             sqlx::query("UPDATE jobs SET phase=?,error=NULL WHERE id=?")

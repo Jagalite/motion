@@ -353,52 +353,97 @@ fn maintain_backups(root: &Path, keep: Option<usize>) -> anyhow::Result<()> {
         let entry = entry?;
         let path = entry.path();
         let name = entry.file_name().to_string_lossy().into_owned();
-        if !entry.file_type()?.is_dir()
-            || !name.starts_with("auto-")
-            || std::fs::read(path.join(".playscale-backup"))
+        use playscale_core::maintenance::{AutomaticBackup, automatic_backup};
+        let owned = entry.file_type()?.is_dir()
+            && std::fs::read(path.join(".playscale-backup"))
                 .ok()
                 .as_deref()
-                != Some(b"playscale-scheduled-v1")
-        {
-            continue;
-        }
-        if name.ends_with(".partial") {
-            if entry
+                == Some(b"playscale-scheduled-v1");
+        let partial = name.ends_with(".partial");
+        let age = if owned && partial {
+            entry
                 .metadata()?
                 .modified()?
                 .elapsed()
                 .unwrap_or_default()
                 .as_secs()
-                > 86400
-            {
-                std::fs::remove_dir_all(path)?;
-            }
-            continue;
-        }
-        if keep.is_some()
-            && let Ok(bytes) = std::fs::read(path.join("manifest.json"))
-            && bytes.len() < 65536
-            && serde_json::from_slice::<Snapshot>(&bytes).is_ok()
-        {
-            complete.push(path);
+        } else {
+            0
+        };
+        let valid = owned
+            && !partial
+            && keep.is_some()
+            && std::fs::read(path.join("manifest.json")).is_ok_and(|bytes| {
+                bytes.len() < 65536 && serde_json::from_slice::<Snapshot>(&bytes).is_ok()
+            });
+        match automatic_backup(
+            owned,
+            name.starts_with("auto-"),
+            partial,
+            age,
+            valid,
+            keep.is_some(),
+        ) {
+            AutomaticBackup::Ignore => {}
+            AutomaticBackup::RemoveAbandoned => std::fs::remove_dir_all(path)?,
+            AutomaticBackup::RetainCandidate => complete.push(path),
         }
     }
     complete.sort();
     complete.reverse();
-    for path in complete.into_iter().skip(keep.unwrap_or(usize::MAX)) {
-        std::fs::remove_dir_all(path)?;
+    for (rank, path) in complete.into_iter().enumerate() {
+        if !playscale_core::maintenance::retain_backup_rank(rank, keep.unwrap_or(usize::MAX)) {
+            std::fs::remove_dir_all(path)?;
+        }
     }
     Ok(())
 }
 pub async fn prune_history(app: &App) -> anyhow::Result<()> {
     let cutoff = now() - app.storage.settings.history_retention_seconds as i64;
     let _lock = app.jobs.lock().await;
-    let mut tx = app.db.begin().await?;
-    sqlx::query("DELETE FROM jobs WHERE id IN (SELECT id FROM jobs WHERE phase IN ('completed','failed','cancelled') AND created_at<? ORDER BY created_at LIMIT 500)").bind(cutoff).execute(&mut *tx).await?;
-    // Keep the most recent authoritative session to preserve the legacy-write barrier.
-    sqlx::query("DELETE FROM playback_sessions WHERE id IN (SELECT id FROM playback_sessions WHERE updated_at<? AND status IN ('ended','stopped','superseded','invalidated') AND id NOT IN (SELECT session_id FROM viewing_state WHERE session_id IS NOT NULL) ORDER BY updated_at LIMIT 500)").bind(cutoff).execute(&mut *tx).await?;
-    // Published rendition provenance stays in the catalog. Idempotency keys have this documented retention horizon.
-    sqlx::query("DELETE FROM processing_jobs WHERE id IN (SELECT id FROM processing_jobs WHERE updated_at<? AND cache_cleaned=1 AND id NOT IN (SELECT job_id FROM preparations) AND phase IN ('completed','failed','cancelled') ORDER BY updated_at LIMIT 500)").bind(cutoff).execute(&mut *tx).await?;
+    let mut tx = crate::db::begin_write(&app.db).await?;
+    use playscale_core::maintenance::{HistoryKind, prune_history};
+    // Candidate reads and exact-row deletion share the writer transaction; the
+    // core decides terminal/reference/cache eligibility, not the SQL filter.
+    for (table, time_column, kind, references, cleaned) in [
+        ("jobs", "created_at", HistoryKind::Job, "0", "1"),
+        (
+            "playback_sessions",
+            "updated_at",
+            HistoryKind::Playback,
+            "EXISTS(SELECT 1 FROM viewing_state v WHERE v.session_id=t.id)",
+            "1",
+        ),
+        (
+            "processing_jobs",
+            "updated_at",
+            HistoryKind::Processing,
+            "EXISTS(SELECT 1 FROM preparations p WHERE p.job_id=t.id)",
+            "cache_cleaned",
+        ),
+    ] {
+        let (phase, terminal) = if matches!(kind, HistoryKind::Playback) {
+            ("status", "('ended','stopped','superseded','invalidated')")
+        } else {
+            ("phase", "('completed','failed','cancelled')")
+        };
+        let rows: Vec<(String, String, i64, bool, bool)> = sqlx::query_as(&format!(
+            "SELECT id,{phase},{time_column},{references},{cleaned} FROM {table} t WHERE {time_column}<? AND {phase} IN {terminal} AND NOT ({references}) AND ({cleaned}) ORDER BY {time_column},id LIMIT 500"
+        )).bind(cutoff).fetch_all(&mut *tx).await?;
+        for (id, phase, timestamp, referenced, cache_cleaned) in rows
+            .into_iter()
+            .filter(|(_, phase, timestamp, referenced, cache_cleaned)| {
+                prune_history(kind, phase, *timestamp, cutoff, *referenced, *cache_cleaned)
+            })
+            .take(500)
+        {
+            let _ = (phase, timestamp, referenced, cache_cleaned);
+            sqlx::query(&format!("DELETE FROM {table} WHERE id=?"))
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
+        }
+    }
     tx.commit().await?;
     Ok(())
 }

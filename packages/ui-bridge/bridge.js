@@ -142,24 +142,38 @@ function savePendingKeys(keys) {
   try { sessionStorage.setItem(keyStore, JSON.stringify(keys)); } catch { /* storage unavailable: keys live for this page only */ }
 }
 const memoryKeys = {};
+const scopedIdentity = identity => `${mutationScope(document, location)} ${identity}`;
 function keyFor(identity) {
+  identity = scopedIdentity(identity);
   const stored = pendingKeys();
-  const saved = stored[identity];
-  const key = (typeof saved === 'string' && /^[0-9a-f]{32}$/.test(saved) ? saved : null) ?? memoryKeys[identity] ?? newKey();
-  memoryKeys[identity] = key;
-  savePendingKeys({...stored, [identity]: key});
-  return key;
+  const saved = memoryKeys[identity] ?? stored[identity];
+  const candidate = typeof saved === 'string' ? saved : saved?.key;
+  const valid = typeof candidate === 'string' && /^[0-9a-f]{32}$/.test(candidate);
+  // Legacy stored strings may represent a lost acknowledgement.
+  const record = valid ? {key: candidate, unknown: typeof saved === 'string' || saved.unknown === true}
+    : {key: newKey(), unknown: false};
+  memoryKeys[identity] = record;
+  savePendingKeys({...stored, [identity]: record});
+  return record.key;
+}
+function beginKey(identity) {
+  const scoped = scopedIdentity(identity);
+  const prior = memoryKeys[scoped]?.unknown === true;
+  if (memoryKeys[scoped]) {
+    memoryKeys[scoped] = {...memoryKeys[scoped], unknown: true};
+    savePendingKeys({...pendingKeys(), [scoped]: memoryKeys[scoped]});
+  }
+  return prior;
 }
 function settleKey(identity) {
+  identity = scopedIdentity(identity);
   delete memoryKeys[identity];
   const stored = pendingKeys();
   delete stored[identity];
   savePendingKeys(stored);
 }
-
-/** True only when the server definitely did not apply the request. */
-function definitelyRejected(error) {
-  return Boolean(error.status) && error.status >= 400 && error.status < 500 && ![408, 425, 429].includes(error.status);
+function failKey(identity, unknown, error) {
+  if (mutationOutcome(unknown, error) === 'settled') settleKey(identity);
 }
 
 // After a command the page is rendered again by the server. A keyboard or
@@ -218,12 +232,6 @@ const submitting = new WeakSet();
  * syncing (which clears the session), stands for the user. Without a rendered
  * session there is no late report to recover, so there is no retry.
  */
-function markRetryRevision(current, renderedManualEpoch, renderedSession) {
-  const valid = typeof current?.revision === 'string' && /^(0|[1-9][0-9]{0,19})$/.test(current.revision);
-  if (!valid || typeof renderedManualEpoch !== 'string' || renderedManualEpoch === '') return null;
-  if (typeof renderedSession !== 'string' || renderedSession === '' || current.session_id !== renderedSession) return null;
-  return current.manual_epoch === renderedManualEpoch ? current.revision : null;
-}
 
 async function submitCommand(form) {
   if (submitting.has(form)) return;
@@ -237,6 +245,7 @@ async function submitCommand(form) {
   const generation = edits.get(form) ?? 0;
   const button = form.querySelector('button[type="submit"]');
   let identity;
+  let priorUnknown = false;
   try {
     const file = form.dataset.body === 'file' ? form.querySelector('input[type="file"]')?.files?.[0] : undefined;
     if (form.dataset.body === 'file' && !file) throw Object.assign(new Error('Choose a file first.'), {status: 400});
@@ -248,6 +257,7 @@ async function submitCommand(form) {
     identity = `${form.dataset.command} ${form.dataset.ifMatch ?? ''} ${JSON.stringify(described)}`;
     const headers = {};
     if (form.dataset.idempotent === 'true') headers['Idempotency-Key'] = keyFor(identity);
+    priorUnknown = beginKey(identity);
     if (form.dataset.ifMatch) headers['If-Match'] = form.dataset.ifMatch;
     // Viewing-history writes name the history they were rendered against.
     if (form.dataset.viewingEpoch) headers['X-Motion-Viewing-Epoch'] = form.dataset.viewingEpoch;
@@ -279,7 +289,7 @@ async function submitCommand(form) {
   } catch (error) {
     // Only a definite rejection ends this request's identity; 5xx, 408/429
     // and network failures may have been applied, so a retry reuses the key.
-    if (definitelyRejected(error)) settleKey(identity);
+    failKey(identity, priorUnknown, error);
     if (status) {
       status.textContent = message(error);
       status.setAttribute('role', 'alert');
@@ -327,12 +337,14 @@ function showPlan(form, plan, request = {}) {
   confirm.addEventListener('click', async () => {
     confirm.setAttribute('disabled', '');
     if (status) status.textContent = 'Working…';
+    const requestKey = keyFor(identity);
+    const priorUnknown = beginKey(identity);
     try {
-      await call(method, path, {plan_token: plan.plan_token}, {'Idempotency-Key': keyFor(identity)});
+      await call(method, path, {plan_token: plan.plan_token}, {'Idempotency-Key': requestKey});
       settleKey(identity);
       reloadAfter(form);
     } catch (error) {
-      if (definitelyRejected(error)) settleKey(identity);
+      failKey(identity, priorUnknown, error);
       if (status) {
         status.textContent = message(error);
         status.setAttribute('role', 'alert');

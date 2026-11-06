@@ -32,14 +32,7 @@ pub(super) fn bounded(field: &str, value: &str, min: usize, max: usize) -> Resul
 }
 
 pub(super) fn valid_ids(field: &str, ids: &[String]) -> Result<(), Problem> {
-    let ok = ids.len() <= 200
-        && ids.iter().all(|id| {
-            !id.is_empty()
-                && id.len() <= 128
-                && id
-                    .bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
-        });
+    let ok = core::reference_ids_valid(ids.iter().map(String::as_str));
     if ok {
         Ok(())
     } else {
@@ -187,6 +180,7 @@ pub async fn create_pairing(
     let pending: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM pairings WHERE phase='pending' AND denied=0 AND expires_at>?",
     )
+    .bind(now)
     .fetch_one(&mut *tx)
     .await?;
     if !core::admit_pairing(pending as usize) {
@@ -676,14 +670,7 @@ async fn bootstrap_device(
             row
         }
     };
-    if device.device.revoked {
-        return Err(AccessError::DeviceRevoked.into());
-    }
-    let issue = core::Issue {
-        device_id: device.device.id.clone(),
-        generation: device.device.generation + 1,
-        expires_at: now + core::DEVICE_CREDENTIAL_TTL_SECONDS,
-    };
+    let issue = core::bootstrap_issue(&device.device, now)?;
     let next = core::apply_issue(&device.device, &issue)?;
     sqlx::query("DELETE FROM credentials WHERE device_id=?")
         .bind(&issue.device_id)
@@ -734,27 +721,30 @@ pub async fn delete_session(State(app): State<App>, caller: Caller) -> Result<Re
             .bind(hash)
             .fetch_optional(&mut *tx)
             .await?;
-    if let Some(id) = family {
-        // Logout is always allowed, including the last administrator session.
-        // Independent pairing/operator recovery remains available.
-        sqlx::query("UPDATE signin_families SET revoked=1,revision=revision+1 WHERE id=?")
-            .bind(&id)
-            .execute(&mut *tx)
-            .await?;
-        sqlx::query("UPDATE devices SET revoked=1,revision=revision+1 WHERE id=?")
-            .bind(&caller.principal.id)
-            .execute(&mut *tx)
-            .await?;
-        sqlx::query("DELETE FROM credentials WHERE device_id=?")
-            .bind(&caller.principal.id)
-            .execute(&mut *tx)
-            .await?;
-        super::signin::audit(&mut tx, &caller.principal.id, &id, "session.logout", "ok").await?;
-    } else {
-        sqlx::query("DELETE FROM credentials WHERE token_hash=?")
-            .bind(hash)
-            .execute(&mut *tx)
-            .await?;
+    match playscale_core::signin::logout_effect(family.as_deref(), &caller.principal.id, hash) {
+        playscale_core::signin::LogoutEffect::RevokeFamily { family: id, device } => {
+            // Logout is always allowed, including the last administrator session.
+            // Independent pairing/operator recovery remains available.
+            sqlx::query("UPDATE signin_families SET revoked=1,revision=revision+1 WHERE id=?")
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
+            sqlx::query("UPDATE devices SET revoked=1,revision=revision+1 WHERE id=?")
+                .bind(device)
+                .execute(&mut *tx)
+                .await?;
+            sqlx::query("DELETE FROM credentials WHERE device_id=?")
+                .bind(device)
+                .execute(&mut *tx)
+                .await?;
+            super::signin::audit(&mut tx, &caller.principal.id, id, "session.logout", "ok").await?;
+        }
+        playscale_core::signin::LogoutEffect::DeleteCredential { hash } => {
+            sqlx::query("DELETE FROM credentials WHERE token_hash=?")
+                .bind(hash)
+                .execute(&mut *tx)
+                .await?;
+        }
     }
     tx.commit().await?;
     let mut response = StatusCode::NO_CONTENT.into_response();
@@ -979,25 +969,15 @@ pub async fn replace_policy(
     caller.require(Permission::SystemAdmin)?;
     let expected = if_match(&headers)?;
     let input = body.value;
-    if input.deny_rated && !input.allowed_ratings.is_empty() {
-        return Err(Problem::invalid(
-            "invalid_field",
-            "Denying rated content requires an empty rating allowlist",
-        ));
-    }
+    // Raw request limits are checked before set normalization removes duplicates.
     valid_ids("library_ids", &input.library_ids)?;
-    let text_ok = |v: &String, max: usize| {
-        (1..=max).contains(&v.chars().count()) && !v.chars().any(char::is_control)
-    };
-    let labels_ok = input.allowed_ratings.len() <= 200
-        && input.blocked_labels.len() <= playscale_core::access_admin::MAX_BLOCKED_LABELS
-        && input.permissions.len() <= 32
-        && input.allowed_ratings.iter().all(|r| text_ok(r, 64))
-        && input.blocked_labels.iter().all(|l| text_ok(l, 100));
-    if !labels_ok {
+    if input.allowed_ratings.len() > 200
+        || input.blocked_labels.len() > playscale_core::access_admin::MAX_BLOCKED_LABELS
+        || input.permissions.len() > 32
+    {
         return Err(Problem::invalid(
             "invalid_field",
-            "Ratings, labels or permissions exceed their limits or contain control characters",
+            "Access policy is too large",
         ));
     }
     let policy = Policy {
@@ -1007,6 +987,12 @@ pub async fn replace_policy(
         deny_rated: input.deny_rated,
         blocked_labels: input.blocked_labels.into_iter().collect(),
     };
+    if !core::policy_shape_valid(&policy, input.permissions.len()) {
+        return Err(Problem::invalid(
+            "invalid_field",
+            "Access policy identifiers, ratings, labels or permissions are invalid",
+        ));
+    }
     let mut tx = begin_write(&app.db).await?;
     caller
         .reauthorize(&mut tx, Some(Permission::SystemAdmin))

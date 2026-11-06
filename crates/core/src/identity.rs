@@ -124,6 +124,8 @@ pub struct MergePlan {
     pub external_ids: BTreeSet<(String, String)>,
     pub target_revision: u64,
     pub warnings: Vec<String>,
+    #[serde(default)]
+    pub contributions: Vec<crate::catalog::ContributionTransfer>,
 }
 
 /// Preview an explicit merge. Works merge; their cuts and timelines do not. Positions
@@ -217,7 +219,33 @@ pub fn plan_merge(
             .checked_add(1)
             .ok_or(IdentityError::RevisionExhausted(request.target.clone()))?,
         warnings,
+        contributions: Vec::new(),
     })
+}
+
+pub fn plan_merge_contributions(
+    mut plan: MergePlan,
+    target: &crate::catalog::ContributionOwner,
+    sources: &[crate::catalog::ContributionOwner],
+) -> MergePlan {
+    plan.contributions = crate::catalog::merge_contributions(target, sources);
+    plan
+}
+pub fn commit_merge_contributions(
+    reviewed: &MergePlan,
+    current: &BTreeMap<Id, Aggregate>,
+    aliases: &BTreeMap<Id, Id>,
+    target: &crate::catalog::ContributionOwner,
+    sources: &[crate::catalog::ContributionOwner],
+) -> Result<MergePlan, IdentityError> {
+    let mut structural = reviewed.clone();
+    structural.contributions.clear();
+    let plan = commit_merge(&structural, current, aliases)?;
+    let fresh = plan_merge_contributions(plan, target, sources);
+    if fresh != *reviewed {
+        return Err(IdentityError::StaleRevision(reviewed.target.clone()));
+    }
+    Ok(fresh)
 }
 
 /// Hierarchy guard for merges: only works of one kind merge, and a retired work
@@ -347,6 +375,12 @@ pub struct SplitPlan {
     pub new_title: String,
     pub moves: Vec<SplitMove>,
     pub warnings: Vec<String>,
+    #[serde(default)]
+    pub occurrences: Vec<SplitOccurrence>,
+    #[serde(default)]
+    pub occurrence_moves: Vec<SplitOccurrenceMove>,
+    #[serde(default)]
+    pub revision_pins: Vec<(Id, Vec<Binding>)>,
 }
 
 /// Preview a split of selected versions into a new work. `new_id` supplies opaque IDs
@@ -480,7 +514,134 @@ pub fn plan_split(
         new_title: title.into(),
         moves,
         warnings,
+        occurrences: Vec::new(),
+        occurrence_moves: Vec::new(),
+        revision_pins: Vec::new(),
     })
+}
+
+/// Physical occurrence ownership is independent of version structure. The full
+/// reviewed inventory also fences copies added/removed or re-observed at commit.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct SplitOccurrence {
+    pub id: Id,
+    pub edition: Id,
+    pub revision: String,
+}
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct SplitOccurrenceMove {
+    pub id: Id,
+    pub from_edition: Id,
+    pub to_edition: Id,
+}
+
+pub fn plan_split_occurrences(
+    current: &Aggregate,
+    mut plan: SplitPlan,
+    mut occurrences: Vec<SplitOccurrence>,
+) -> SplitPlan {
+    occurrences.sort();
+    let mut destinations = BTreeMap::new();
+    for step in &plan.moves {
+        for edition in &current.editions {
+            for timeline in &edition.timelines {
+                for version in &timeline.versions {
+                    let destination = match step {
+                        SplitMove::Edition { .. } => None, // Same edition identity; owner work changes structurally.
+                        SplitMove::Timelines {
+                            from_edition,
+                            new_edition,
+                            timelines,
+                        } if &edition.id == from_edition && timelines.contains(&timeline.id) => {
+                            Some(new_edition)
+                        }
+                        SplitMove::Versions {
+                            from_timeline,
+                            new_edition,
+                            versions,
+                            ..
+                        } if &timeline.id == from_timeline && versions.contains(&version.id) => {
+                            Some(new_edition)
+                        }
+                        _ => None,
+                    };
+                    if let Some(destination) = destination {
+                        destinations.insert(version.id.as_str(), destination);
+                    }
+                }
+            }
+        }
+    }
+    let mut assignments = Vec::new();
+    for occurrence in &occurrences {
+        let Some(edition) = current.editions.iter().find(|e| e.id == occurrence.edition) else {
+            continue;
+        };
+        let versions: Vec<_> = edition.timelines.iter().flat_map(|t| &t.versions).collect();
+        let explicit = versions
+            .iter()
+            .filter_map(|v| destinations.get(v.id.as_str()).map(|d| (*v, *d)))
+            .find(|(v, _)| v.bindings.iter().any(|b| b.file_id == occurrence.id))
+            .map(|(_, d)| d);
+        let retained_bound = versions.iter().any(|v| {
+            !destinations.contains_key(v.id.as_str())
+                && v.bindings.iter().any(|b| b.file_id == occurrence.id)
+        });
+        let retained_pin = versions.iter().any(|v| {
+            !destinations.contains_key(v.id.as_str())
+                && v.bindings.iter().any(|b| b.revision == occurrence.revision)
+        });
+        let copy = if retained_pin || retained_bound {
+            None
+        } else {
+            versions
+                .iter()
+                .filter_map(|v| destinations.get(v.id.as_str()).map(|d| (*v, *d)))
+                .find(|(v, _)| v.bindings.iter().any(|b| b.revision == occurrence.revision))
+                .map(|(_, d)| d)
+        };
+        if let Some(destination) = explicit.or(copy) {
+            assignments.push(SplitOccurrenceMove {
+                id: occurrence.id.clone(),
+                from_edition: occurrence.edition.clone(),
+                to_edition: destination.clone(),
+            });
+        }
+    }
+    plan.revision_pins = current
+        .editions
+        .iter()
+        .flat_map(|e| &e.timelines)
+        .flat_map(|t| &t.versions)
+        .map(|v| (v.id.clone(), v.bindings.clone()))
+        .collect();
+    plan.revision_pins.sort_by(|a, b| a.0.cmp(&b.0));
+    plan.occurrences = occurrences;
+    plan.occurrence_moves = assignments;
+    plan
+}
+
+/// Revalidate both structure and independent occurrence ownership under the writer.
+pub fn commit_split_occurrences(
+    reviewed: &SplitPlan,
+    current: Option<&Aggregate>,
+    taken: bool,
+    occurrences: Vec<SplitOccurrence>,
+) -> Result<SplitPlan, IdentityError> {
+    let mut structure = reviewed.clone();
+    structure.occurrences.clear();
+    structure.occurrence_moves.clear();
+    structure.revision_pins.clear();
+    let fresh = commit_split(&structure, current, taken)?;
+    let fresh = plan_split_occurrences(
+        current.expect("commit requires current"),
+        fresh,
+        occurrences,
+    );
+    if fresh != *reviewed {
+        return Err(IdentityError::StaleRevision(reviewed.item.clone()));
+    }
+    Ok(fresh)
 }
 
 /// IDs in the order [`plan_split`] allocates them, so a reviewed plan can be
@@ -1161,4 +1322,160 @@ pub fn remap_relationships(
         }
     }
     Ok(remap)
+}
+
+pub fn timeline_owner(current: &Aggregate, edition: &str) -> Result<(), IdentityError> {
+    if current.editions.iter().any(|e| e.id == edition) {
+        Ok(())
+    } else {
+        Err(IdentityError::InvalidBindings(
+            "edition belongs to another work".into(),
+        ))
+    }
+}
+
+/// Authorization plan over every owner touched by structural movement,
+/// relationship rewrites, and invalidated order membership. Recompute under the
+/// writer and authorize against current grants; a preview grants no authority.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MutationFootprint {
+    pub owners: BTreeSet<Id>,
+}
+pub fn merge_footprint(
+    sources: &[Id],
+    target: &str,
+    edges: &[Edge],
+    order_owners: &[(Id, Id)],
+) -> MutationFootprint {
+    let retired: BTreeSet<&str> = sources
+        .iter()
+        .map(String::as_str)
+        .filter(|s| *s != target)
+        .collect();
+    let mut owners: BTreeSet<Id> = sources.iter().cloned().chain([target.into()]).collect();
+    for edge in edges {
+        if retired.contains(edge.source.as_str()) || retired.contains(edge.target.as_str()) {
+            owners.extend([edge.source.clone(), edge.target.clone()]);
+        }
+    }
+    for (moved, owner) in order_owners {
+        if retired.contains(moved.as_str()) {
+            owners.insert(owner.clone());
+        }
+    }
+    MutationFootprint { owners }
+}
+pub fn order_footprint(
+    timeline_owner: Id,
+    old_owner: Option<Id>,
+    new_owner: Id,
+) -> MutationFootprint {
+    MutationFootprint {
+        owners: [Some(timeline_owner), old_owner, Some(new_owner)]
+            .into_iter()
+            .flatten()
+            .collect(),
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OrderPlacement {
+    pub timeline_revision: u64,
+    pub group_revisions: BTreeMap<Id, u64>,
+    pub changed: bool,
+}
+fn next_order_revision(id: &str, revision: u64) -> Result<u64, IdentityError> {
+    revision
+        .checked_add(1)
+        .filter(|r| *r <= i64::MAX as u64)
+        .ok_or_else(|| IdentityError::RevisionExhausted(id.into()))
+}
+/// Eligibility and exact revision effects are one decision. An identical
+/// placement is a no-op, but still checks the reviewed destination revision.
+pub fn order_placement(
+    timeline: &str,
+    timeline_revision: u64,
+    ancestors: &[Id],
+    owner: &str,
+    group: &str,
+    revision: u64,
+    expected: u64,
+    position: u32,
+    occupied: &BTreeMap<u32, Id>,
+    previous: Option<(&str, u32, u64)>,
+) -> Result<OrderPlacement, IdentityError> {
+    if revision != expected {
+        return Err(IdentityError::StaleRevision(group.into()));
+    }
+    place_in_order(timeline, ancestors, owner, position, occupied)?;
+    let changed =
+        previous.is_none_or(|(old, old_position, _)| old != group || old_position != position);
+    let mut revisions = BTreeMap::new();
+    if changed {
+        revisions.insert(group.into(), next_order_revision(group, revision)?);
+        if let Some((old, _, old_revision)) = previous.filter(|(old, _, _)| *old != group) {
+            revisions.insert(old.into(), next_order_revision(old, old_revision)?);
+        }
+    }
+    Ok(OrderPlacement {
+        timeline_revision: if changed {
+            next_order_revision(timeline, timeline_revision)?
+        } else {
+            timeline_revision
+        },
+        group_revisions: revisions,
+        changed,
+    })
+}
+pub fn invalidate_order(
+    timeline: &str,
+    timeline_revision: u64,
+    group: &str,
+    group_revision: u64,
+    ancestors: &[Id],
+    owner: &str,
+) -> Result<Option<OrderPlacement>, IdentityError> {
+    if order_membership_valid(ancestors, owner) {
+        return Ok(None);
+    }
+    Ok(Some(OrderPlacement {
+        timeline_revision: next_order_revision(timeline, timeline_revision)?,
+        group_revisions: BTreeMap::from([(
+            group.into(),
+            next_order_revision(group, group_revision)?,
+        )]),
+        changed: true,
+    }))
+}
+
+pub fn split_footprint(
+    plan: &SplitPlan,
+    current: &Aggregate,
+    order_owners: &[(Id, Id)],
+) -> MutationFootprint {
+    let mut moved = BTreeSet::new();
+    for step in &plan.moves {
+        match step {
+            SplitMove::Edition { edition } => {
+                moved.extend(
+                    current
+                        .editions
+                        .iter()
+                        .filter(|e| &e.id == edition)
+                        .flat_map(|e| &e.timelines)
+                        .map(|t| t.id.clone()),
+                );
+            }
+            SplitMove::Timelines { timelines, .. } => moved.extend(timelines.iter().cloned()),
+            // Partial version movement creates an ungrouped fresh timeline.
+            SplitMove::Versions { .. } => {}
+        }
+    }
+    let mut owners = BTreeSet::from([plan.item.clone()]);
+    for (timeline, owner) in order_owners {
+        if moved.contains(timeline) {
+            owners.insert(owner.clone());
+        }
+    }
+    MutationFootprint { owners }
 }

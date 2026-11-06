@@ -7,7 +7,7 @@ use anyhow::Context;
 use playscale_core::jobs::{Effect, Input, Phase, transition};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, HashMap},
     io::{Read, Seek, SeekFrom},
     path::{Path, PathBuf},
     time::Duration,
@@ -23,7 +23,7 @@ pub struct Found {
     pub bytes: i64,
     pub duration: Option<f64>,
     pub tracks: Vec<Track>,
-    /// Container chapters; None when not probed (kept as stored).
+    /// Container chapters; None means no chapter observation was made.
     pub chapters: Option<Vec<playscale_core::markers::FileChapter>>,
     pub reused: bool,
     /// Sidecar NFO observed and parsed beside the file (outside the writer).
@@ -634,7 +634,11 @@ pub async fn run_scan(app: &App, job: &JobRow, shutdown: &CancellationToken) -> 
         }
     };
     let mut cached = std::collections::HashMap::new();
-    if app.storage.settings.incremental_scans && cfg!(unix) && !job.full_scan {
+    if playscale_core::scan::incremental_cache_enabled(
+        app.storage.settings.incremental_scans,
+        cfg!(unix),
+        job.full_scan,
+    ) {
         let rows: Vec<db::ItemRow> =
             sqlx::query_as("SELECT * FROM catalog_files WHERE library_id=?")
                 .bind(&job.library_id)
@@ -655,50 +659,69 @@ pub async fn run_scan(app: &App, job: &JobRow, shutdown: &CancellationToken) -> 
             let root = path.clone();
             let rel = relative.clone();
             let hold = permit.clone();
-            let reused =
-                match tokio::task::spawn_blocking(move || -> anyhow::Result<Option<Found>> {
+            let reused = match tokio::task::spawn_blocking(
+                move || -> anyhow::Result<Option<(Found, playscale_core::scan::ProbeDecision)>> {
                     let _hold = hold;
                     let file = open_file(&root, &rel)?;
                     let stamp = fingerprint(&file.metadata()?);
-                    if stamp != row.fingerprint {
+                    if playscale_core::scan::probe_decision(
+                        &row.fingerprint,
+                        &stamp,
+                        std::iter::empty::<(&str, u32)>(),
+                        false,
+                    ) == playscale_core::scan::ProbeDecision::InspectFully
+                    {
                         return Ok(None);
                     }
                     // Streams probed before the facts later policies need
                     // were recorded are inspected again (HDR colour facts,
                     // attachment MIME types and sizes).
                     let tracks: Vec<Track> = serde_json::from_str(&row.tracks_json)?;
-                    if tracks.iter().any(Track::lacks_probe_facts) {
+                    let chapters = row
+                        .chapters_json
+                        .as_deref()
+                        .and_then(|j| serde_json::from_str(j).ok());
+                    let decision = playscale_core::scan::probe_decision(
+                        &row.fingerprint,
+                        &stamp,
+                        tracks
+                            .iter()
+                            .map(|track| (track.kind.as_str(), track.probe_version)),
+                        chapters.is_some(),
+                    );
+                    if decision == playscale_core::scan::ProbeDecision::InspectFully {
                         return Ok(None);
                     }
-                    Ok(Some(Found {
-                        relative: row.relative_path,
-                        title: row.title,
-                        revision: row.revision,
-                        fingerprint: stamp,
-                        bytes: row.bytes,
-                        duration: row.duration_seconds,
-                        tracks,
-                        // Stored chapters, or None when never probed (then
-                        // probed alone below, without hashing the file again).
-                        chapters: row
-                            .chapters_json
-                            .as_deref()
-                            .and_then(|j| serde_json::from_str(j).ok()),
-                        reused: true,
-                        nfo: crate::nfo::Sidecar::Absent,
-                    }))
-                })
-                .await?
-                {
-                    Ok(reused) => reused,
-                    Err(error) => {
-                        tracing::debug!(%error, "file could not be revalidated");
-                        inventory.uninspected(&relative);
-                        continue;
-                    }
-                };
-            if let Some(mut file) = reused {
-                if file.chapters.is_none() {
+                    Ok(Some((
+                        Found {
+                            relative: row.relative_path,
+                            title: row.title,
+                            revision: row.revision,
+                            fingerprint: stamp,
+                            bytes: row.bytes,
+                            duration: row.duration_seconds,
+                            tracks,
+                            // Stored chapters, or None when never probed (then
+                            // probed alone below, without hashing the file again).
+                            chapters,
+                            reused: true,
+                            nfo: crate::nfo::Sidecar::Absent,
+                        },
+                        decision,
+                    )))
+                },
+            )
+            .await?
+            {
+                Ok(reused) => reused,
+                Err(error) => {
+                    tracing::debug!(%error, "file could not be revalidated");
+                    inventory.uninspected(&relative);
+                    continue;
+                }
+            };
+            if let Some((mut file, decision)) = reused {
+                if decision == playscale_core::scan::ProbeDecision::ProbeChapters {
                     // Interruptible like a full inspection: dropping the
                     // probe kills its ffprobe child.
                     let probe = probe_chapters(
@@ -825,6 +848,10 @@ async fn finish(
         .bind(&job.library_id)
         .fetch_all(&mut *tx)
         .await?;
+        let previous_revisions: HashMap<&str, &str> = old
+            .iter()
+            .map(|row| (row.0.as_str(), row.3.as_str()))
+            .collect();
         let (plan, excluded) = playscale_core::scan::reconcile_scoped(
             &old.iter()
                 .map(|r| playscale_core::scan::Existing {
@@ -898,13 +925,9 @@ async fn finish(
                 Assignment::New => {
                     let item = new_id();
                     let edition = new_id();
-                    let kind = if file.tracks.iter().any(|t| t.kind == "video") {
-                        "video"
-                    } else if file.tracks.iter().any(|t| t.kind == "audio") {
-                        "audio"
-                    } else {
-                        "video"
-                    };
+                    let kind = playscale_core::scan::initial_item_kind(
+                        file.tracks.iter().map(|track| track.kind.as_str()),
+                    );
                     sqlx::query("INSERT INTO items (id,title,kind) VALUES (?,?,?)")
                         .bind(&item)
                         .bind(&file.title)
@@ -925,8 +948,22 @@ async fn finish(
             let file_id = id.clone();
             let file_relative = file.relative.clone();
             let edition_timeline = edition.clone();
-            sqlx::query("INSERT INTO media_files (id,edition_id,library_id,relative_path,revision,fingerprint,bytes,duration_seconds,tracks_json,available,chapters_json) VALUES (?,?,?,?,?,?,?,?,?,1,?) ON CONFLICT(id) DO UPDATE SET relative_path=excluded.relative_path,revision=excluded.revision,fingerprint=excluded.fingerprint,bytes=excluded.bytes,duration_seconds=excluded.duration_seconds,tracks_json=excluded.tracks_json,available=1,chapters_json=CASE WHEN excluded.chapters_json IS NOT NULL THEN excluded.chapters_json WHEN media_files.revision=excluded.revision THEN media_files.chapters_json END WHERE media_files.revision<>excluded.revision OR media_files.fingerprint<>excluded.fingerprint OR media_files.relative_path<>excluded.relative_path OR media_files.available=0 OR media_files.tracks_json<>excluded.tracks_json OR media_files.duration_seconds IS NOT excluded.duration_seconds OR (excluded.chapters_json IS NOT NULL AND media_files.chapters_json IS NOT excluded.chapters_json)")
-                .bind(id).bind(edition).bind(&job.library_id).bind(file.relative).bind(file.revision).bind(file.fingerprint).bind(file.bytes).bind(file.duration).bind(serde_json::to_string(&file.tracks)?).bind(file.chapters.as_ref().map(serde_json::to_string).transpose()?).execute(&mut *tx).await?;
+            let observed_chapters = file
+                .chapters
+                .as_ref()
+                .map(serde_json::to_string)
+                .transpose()?;
+            let chapter_effect = playscale_core::scan::chapter_evidence(
+                previous_revisions.get(id.as_str()).copied(),
+                &file.revision,
+                observed_chapters.as_deref(),
+            );
+            let (retain_chapters, chapter_json) = match chapter_effect {
+                playscale_core::scan::ChapterEffect::Retain => (true, None),
+                playscale_core::scan::ChapterEffect::Set(value) => (false, value),
+            };
+            sqlx::query("INSERT INTO media_files (id,edition_id,library_id,relative_path,revision,fingerprint,bytes,duration_seconds,tracks_json,available,chapters_json) VALUES (?,?,?,?,?,?,?,?,?,1,?) ON CONFLICT(id) DO UPDATE SET relative_path=excluded.relative_path,revision=excluded.revision,fingerprint=excluded.fingerprint,bytes=excluded.bytes,duration_seconds=excluded.duration_seconds,tracks_json=excluded.tracks_json,available=1,chapters_json=CASE WHEN ? THEN media_files.chapters_json ELSE excluded.chapters_json END WHERE media_files.revision<>excluded.revision OR media_files.fingerprint<>excluded.fingerprint OR media_files.relative_path<>excluded.relative_path OR media_files.available=0 OR media_files.tracks_json<>excluded.tracks_json OR media_files.duration_seconds IS NOT excluded.duration_seconds OR (excluded.chapters_json IS NOT NULL AND media_files.chapters_json IS NOT excluded.chapters_json)")
+                .bind(id).bind(edition).bind(&job.library_id).bind(file.relative).bind(file.revision).bind(file.fingerprint).bind(file.bytes).bind(file.duration).bind(serde_json::to_string(&file.tracks)?).bind(chapter_json).bind(retain_chapters).execute(&mut *tx).await?;
             if first_version {
                 // Unknown equivalence is permitted only in the new, empty timeline.
                 crate::curation::create_version(

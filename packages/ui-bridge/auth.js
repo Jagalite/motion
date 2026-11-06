@@ -193,19 +193,24 @@ async function proofFlow(parent, action, target, retry) {
   }), group);
 }
 async function mutation(parent, method, path, body, options = {}) {
-  const bytes = new TextEncoder().encode(JSON.stringify([method, path, body, options.revision]));
+  const bytes = new TextEncoder().encode(JSON.stringify([mutationScope(document, location), method, path, body, options.revision]));
   const digest = await crypto.subtle.digest('SHA-256', bytes);
   const identity = Array.from(new Uint8Array(digest), byte => byte.toString(16).padStart(2, '0')).join('');
-  const key = pending.get(identity) ?? crypto.randomUUID();
-  pending.set(identity, key);
+  const previous = pending.get(identity);
+  const key = previous?.key ?? crypto.randomUUID();
+  let unknown = previous?.unknown === true;
+  pending.set(identity, {key, unknown});
   const perform = async proof => {
+    const priorUnknown = unknown;
+    unknown = true;
+    pending.set(identity, {key, unknown});
     try {
       const result = await api(method, path, body, {...options, key, proof});
       pending.delete(identity);
       await options.done?.(result);
       return result;
     } catch (error) {
-      if (error.status && error.status < 500 && ![408, 425, 429].includes(error.status)) pending.delete(identity);
+      if (mutationOutcome(priorUnknown, error) === 'settled') { pending.delete(identity); unknown = false; }
       throw error;
     }
   };
@@ -226,7 +231,7 @@ function form(parent, label, run) {
   element.append(fields);
   const submit = node('button', label, {type: 'submit'}); element.append(submit);
   const output = status(element);
-  element.addEventListener('submit', event => { event.preventDefault(); void withBusy(submit, output, async () => { await run(fields, output); }); });
+  element.addEventListener('submit', event => { event.preventDefault(); return withBusy(submit, output, async () => { await run(fields, output); }); });
   parent.append(element);
   return {element, fields, output, submit};
 }

@@ -6,6 +6,7 @@
 // events (motion-ui-host cache, playscale_core::offline). This adapter only
 // sequences those effects and never publishes, renumbers or erases by itself.
 import {createHash, randomBytes} from 'node:crypto';
+import {downloadReconciliation, advanceDownloadReconciliation} from './download-reconciliation.mjs';
 import {closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, rmSync, statSync, truncateSync, writeFileSync, writeSync, createWriteStream} from 'node:fs';
 import {dirname, join} from 'node:path';
 import {Readable, Transform} from 'node:stream';
@@ -606,85 +607,57 @@ export function createDownloadAgent({base, identity, api, fetchMedia, cache, quo
         status(`Offline progress could not be reconciled yet (${error.code ?? error.status ?? error.message}). It stays on this device.`);
       }
       let before = await cache(target.path, target.scope, ['status']);
-      // Every title removed on this device stays out of this pass, settled or
-      // not: the download list was read before the server deleted it.
-      const removed = new Set(before.removals ?? []);
-      // Titles the person removed on this device: delete each download on
-      // the server, then settle the removal with its answer. Until it is
-      // settled the cache refuses to save that download again.
-      if ((before.removals ?? []).length > 0) {
-        for (const id of before.removals) {
-          if (signal?.aborted) return;
-          let outcome = 'deleted';
-          try { await api(`/api/v2/downloads/${encodeURIComponent(id)}`, {method: 'DELETE'}); }
-          catch (error) {
-            if (signal?.aborted) throw error;
-            outcome = error.status === 404 ? 'absent' : 'failed';
-            if (outcome === 'failed') status(`A title removed on this device is still listed by the server (${error.code ?? error.status ?? error.message}); it will not be saved again.`);
-          }
-          // Settle only once the removal is noted for its report; otherwise
-          // the intent stays and this is retried next pass.
-          if (!noteRemoved(id)) continue;
-          await cache(target.path, target.scope, ['settle-removal', '--download-id', id, '--outcome', outcome]);
-        }
-        before = await cache(target.path, target.scope, ['status']);
-      }
-      let local = before.manifest;
-      const wanted = downloads.filter(d => d.profile_id === profile && !removed.has(d.id));
-      // Cancelled, expired and no-longer-visible downloads leave this device,
-      // published copies and unpublished staged transfers alike.
-      const present = new Set([...local.downloads.map(entry => entry.identity.download_id), ...before.staged]);
-      for (const id of present) {
-        const listed = wanted.find(d => d.id === id);
-        if (listed?.state !== 'ready') {
-          // Remove only once the removal is noted for its report; otherwise
-          // the copy stays until a later pass can note it.
-          if (!noteRemoved(id)) continue;
-          await cache(target.path, target.scope, ['remove', '--download-id', id]);
-          // An ended download still listed learns that its copy is gone.
-          if (listed && await report(listed, 'removed', 0)) forgetRemoved(id);
-        }
-      }
-      // Bring the server's view of this device's copies up to date: a
-      // terminal report that failed earlier, copies saved before reports
-      // existed, and copies removed through the offline window. Only what
-      // the device knows locally is reported.
-      const saved = new Set(local.downloads.map(entry => entry.identity.download_id));
-      const pending = pendingRemoved();
-      for (const listed of downloads.filter(d => d.profile_id === profile)) {
+      const operation = randomBytes(16).toString('hex');
+      let planned = downloadReconciliation({operation, profile, scope: target.scope, inventory: downloads,
+        complete: true, snapshot: before, reconciled});
+      const advance = input => {
+        planned = advanceDownloadReconciliation(planned.state, {operation, ...input});
+        return planned.effects;
+      };
+      for (const effect of planned.effects) {
         if (signal?.aborted) return;
-        const reported = listed.device_transfer;
-        const current = reported && reported.download_revision === listed.revision;
-        if (listed.state === 'ready' && saved.has(listed.id) && !(current && reported.state === 'verified_local')) {
-          await report(listed, 'verified_local', Number(listed.size_bytes) || 0);
-        } else if (listed.state !== 'ready' && !saved.has(listed.id) && !before.staged.includes(listed.id)
-          && (pending.has(listed.id) || reported) && !(current && reported.state === 'removed')) {
-          if (await report(listed, 'removed', 0)) forgetRemoved(listed.id);
-        } else if (current && reported.state === 'removed') {
-          forgetRemoved(listed.id);
-        }
-      }
-      let failed = false;
-      for (const download of wanted.filter(d => d.state === 'ready')) {
-        if (signal?.aborted) return;
-        if (local.downloads.some(entry => entry.identity.download_id === download.id)) continue;
-        // One failing transfer never blocks the others; the next pass retries it.
-        try { await transfer(download, target); }
+        let outcome = 'deleted';
+        try { await api(`/api/v2/downloads/${encodeURIComponent(effect.id)}`, {method: 'DELETE'}); }
         catch (error) {
           if (signal?.aborted) throw error;
-          failed = true;
+          outcome = error.status === 404 ? 'absent' : 'failed';
+          if (outcome === 'failed') status(`A title removed on this device is still listed by the server (${error.code ?? error.status ?? error.message}); it will not be saved again.`);
+        }
+        // Durable reporting intent precedes settling a tombstone.
+        if (!noteRemoved(effect.id)) continue;
+        await cache(target.path, target.scope, ['settle-removal', '--download-id', effect.id, '--outcome', outcome]);
+      }
+      before = await cache(target.path, target.scope, ['status']);
+      for (const effect of advance({type: 'RemovalsObserved', snapshot: before})) {
+        if (!noteRemoved(effect.id)) continue;
+        await cache(target.path, target.scope, ['remove', '--download-id', effect.id]);
+      }
+      before = await cache(target.path, target.scope, ['status']);
+      for (const effect of advance({type: 'CleanupObserved', snapshot: before, pendingReports: [...pendingRemoved()]})) {
+        if (signal?.aborted) return;
+        if (effect.type === 'ForgetReport') forgetRemoved(effect.id);
+        else if (await report(effect.listed, effect.status, effect.bytes) && effect.status === 'removed') forgetRemoved(effect.listed.id);
+      }
+      const outcomes = [];
+      for (const effect of advance({type: 'ReportsObserved', snapshot: before})) {
+        if (signal?.aborted) return;
+        const download = effect.download;
+        try { await transfer(download, target); outcomes.push({id: download.id, outcome: 'saved'}); }
+        catch (error) {
+          if (signal?.aborted) throw error;
+          outcomes.push({id: download.id, outcome: 'failed'});
           status(`A download could not be saved yet: ${error.message}`);
           const staged = join(target.path, 'staging', `${download.id}.part`);
           await report(download, 'failed', Math.min(existsSync(staged) ? statSync(staged).size : 0, Number(download.size_bytes) || 0));
         }
       }
-      // Every still-ready demand has now had its chance to recover a verified
-      // blob; anything unreferenced belongs to an ended demand or a crash.
-      if (!failed) await cache(target.path, target.scope, ['collect']);
-      local = (await cache(target.path, target.scope, ['status'])).manifest;
-      // Refreshing the base is best-effort; it never blocks other profiles.
-      if (reconciled) {
-        try { await rebase(target, local); }
+      for (const effect of advance({type: 'TransfersObserved', outcomes})) {
+        if (effect.type === 'Collect') await cache(target.path, target.scope, ['collect']);
+      }
+      const after = await cache(target.path, target.scope, ['status']);
+      const local = after.manifest;
+      for (const effect of advance({type: 'CollectionObserved', snapshot: after})) {
+        try { await rebase(target, effect.manifest); }
         catch (error) {
           if (signal?.aborted) throw error;
           status(`Offline resume points could not be refreshed yet (${error.code ?? error.status ?? error.message}).`);

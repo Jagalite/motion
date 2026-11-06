@@ -13,33 +13,32 @@ pub(crate) async fn publish_sidecars(
     subtitles: &BTreeMap<String, Vec<(String, String)>>,
     complete: &std::collections::BTreeSet<String>,
 ) -> anyhow::Result<()> {
-    let dir = playscale_core::scan::parent(relative);
-    let stem = std::path::Path::new(relative)
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or_default();
-    // The previous set is replaced only when the directory was listed
-    // completely; otherwise unproven sidecars are retained.
-    if complete.contains(dir) {
-        sqlx::query("DELETE FROM sidecar_subtitles WHERE file_id=?")
-            .bind(file)
-            .execute(&mut *conn)
-            .await?;
-    }
-    for (name, fingerprint) in subtitles.get(dir).into_iter().flatten() {
-        let Some(sidecar) = core::sidecar_subtitle(stem, name) else {
-            continue;
-        };
-        sqlx::query("INSERT OR REPLACE INTO sidecar_subtitles VALUES (?,?,?,?,?,?,?)")
-            .bind(file)
-            .bind(name)
-            .bind(fingerprint)
-            .bind(&sidecar.language)
-            .bind(sidecar.roles.forced)
-            .bind(sidecar.roles.hearing_impaired)
-            .bind(&sidecar.format)
-            .execute(&mut *conn)
-            .await?;
+    for effect in core::sidecar_plan(file, relative, subtitles, complete) {
+        match effect {
+            core::SidecarEffect::Clear { file } => {
+                sqlx::query("DELETE FROM sidecar_subtitles WHERE file_id=?")
+                    .bind(file)
+                    .execute(&mut *conn)
+                    .await?;
+            }
+            core::SidecarEffect::Upsert {
+                file,
+                name,
+                fingerprint,
+                subtitle,
+            } => {
+                sqlx::query("INSERT OR REPLACE INTO sidecar_subtitles VALUES (?,?,?,?,?,?,?)")
+                    .bind(file)
+                    .bind(name)
+                    .bind(fingerprint)
+                    .bind(&subtitle.language)
+                    .bind(subtitle.roles.forced)
+                    .bind(subtitle.roles.hearing_impaired)
+                    .bind(&subtitle.format)
+                    .execute(&mut *conn)
+                    .await?;
+            }
+        }
     }
     Ok(())
 }
@@ -122,4 +121,67 @@ pub(crate) async fn timeline_components_in(
     }
     let versions: Vec<(String, Vec<Observed>)> = versions.into_iter().collect();
     Ok(core::derive(timeline, &versions))
+}
+
+#[cfg(test)]
+mod sidecar_adapter_tests {
+    use super::*;
+    use std::collections::BTreeSet;
+
+    #[tokio::test]
+    async fn incomplete_coverage_keeps_unseen_rows_and_applies_observations_atomically() {
+        let pool = SqlitePool::connect("sqlite::memory:").await.unwrap();
+        sqlx::query("CREATE TABLE sidecar_subtitles (file_id TEXT, name TEXT, fingerprint TEXT, language TEXT, forced BOOLEAN, hearing_impaired BOOLEAN, format TEXT, PRIMARY KEY(file_id,name))")
+            .execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO sidecar_subtitles VALUES ('file','film.fr.srt','old-fr','fr',0,0,'srt'),('file','film.en.srt','old-en','en',0,0,'srt')")
+            .execute(&pool).await.unwrap();
+        let observations = BTreeMap::from([(
+            "dir".to_owned(),
+            vec![
+                ("film.en.srt".to_owned(), "new-en".to_owned()),
+                ("film.de.srt".to_owned(), "new-de".to_owned()),
+            ],
+        )]);
+        let mut tx = pool.begin().await.unwrap();
+        publish_sidecars(
+            &mut tx,
+            "file",
+            "dir/film.mkv",
+            &observations,
+            &BTreeSet::new(),
+        )
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+        let rows: Vec<(String, String)> =
+            sqlx::query_as("SELECT name,fingerprint FROM sidecar_subtitles ORDER BY name")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            rows,
+            [
+                ("film.de.srt".into(), "new-de".into()),
+                ("film.en.srt".into(), "new-en".into()),
+                ("film.fr.srt".into(), "old-fr".into())
+            ]
+        );
+        let mut tx = pool.begin().await.unwrap();
+        publish_sidecars(
+            &mut tx,
+            "file",
+            "dir/film.mkv",
+            &observations,
+            &BTreeSet::from(["dir".into()]),
+        )
+        .await
+        .unwrap();
+        tx.rollback().await.unwrap();
+        let after_rollback: Vec<(String, String)> =
+            sqlx::query_as("SELECT name,fingerprint FROM sidecar_subtitles ORDER BY name")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert_eq!(after_rollback, rows);
+    }
 }

@@ -321,6 +321,48 @@ pub struct Invitation {
     pub phase: InvitationPhase,
 }
 
+/// Historical status precedence is independent of current issuer availability.
+pub fn invitation_status(invite: &Invitation, available: bool, now: i64) -> &'static str {
+    match invite.phase {
+        InvitationPhase::Revoked => "revoked",
+        InvitationPhase::Registered { .. } => "registered",
+        InvitationPhase::Claimed { .. } => "claimed",
+        InvitationPhase::Unused if now >= invite.expires_at => "expired",
+        InvitationPhase::Unused if !available => "invalidated",
+        InvitationPhase::Unused => "unused",
+    }
+}
+/// Creation receipts may reproduce an unused secret, never a consumed one.
+pub fn replay_invitation_creation(invite: &Invitation, available: bool, now: i64) -> bool {
+    matches!(invite.phase, InvitationPhase::Unused) && available && now < invite.expires_at
+}
+pub enum InvitationIssuer<'a> {
+    Operator {
+        recorded_hash: Option<&'a str>,
+        current_hash: &'a str,
+    },
+    Administrator {
+        recorded_id: &'a str,
+        recorded_revision: u64,
+        current: Option<&'a crate::access::Principal>,
+    },
+}
+pub fn invitation_issuer_current(issuer: InvitationIssuer<'_>) -> bool {
+    match issuer {
+        InvitationIssuer::Operator {
+            recorded_hash,
+            current_hash,
+        } => recorded_hash == Some(current_hash),
+        InvitationIssuer::Administrator {
+            recorded_id,
+            recorded_revision,
+            current,
+        } => current.is_some_and(|p| {
+            p.id == recorded_id && p.policy_revision == recorded_revision && p.is_admin()
+        }),
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Redemption {
     Issue,
@@ -397,4 +439,44 @@ pub fn revoke_invitation(
         expected,
         invitation.phase != InvitationPhase::Revoked,
     )
+}
+
+#[cfg(test)]
+mod invitation_receipt_tests {
+    use super::*;
+    #[test]
+    fn consumed_creation_receipts_never_reissue_secrets() {
+        for phase in [
+            InvitationPhase::Unused,
+            InvitationPhase::Revoked,
+            InvitationPhase::Registered {
+                identity_id: "identity".into(),
+            },
+            InvitationPhase::Claimed {
+                claim_hash: "claim".into(),
+                device_id: "device".into(),
+                generation: 1,
+            },
+        ] {
+            for available in [false, true] {
+                for now in [9, 10, 11] {
+                    let invitation = Invitation {
+                        expires_at: 10,
+                        user_id: "user".into(),
+                        user_revision: 1,
+                        grant: Grant::default(),
+                        policy: Policy::default(),
+                        phase: phase.clone(),
+                    };
+                    assert_eq!(
+                        replay_invitation_creation(&invitation, available, now),
+                        phase == InvitationPhase::Unused && available && now < 10
+                    );
+                    if matches!(phase, InvitationPhase::Registered { .. }) {
+                        assert_eq!(invitation_status(&invitation, available, now), "registered");
+                    }
+                }
+            }
+        }
+    }
 }

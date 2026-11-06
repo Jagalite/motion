@@ -117,40 +117,93 @@ pub async fn run_one(app: &App) -> anyhow::Result<bool> {
     };
     // Provisional writes live in a savepoint until core confirms completeness.
     // Any unusable/stale input or adapter error rolls back the entire refresh.
-    let mut success = false;
-    if permitted
-        && current.executing(attempt)
+    use playscale_core::metadata::{RefreshResult, finish_refresh, refresh_may_publish};
+    let mut completion = finish_refresh(&current, attempt, permitted, &RefreshResult::Unavailable);
+    if refresh_may_publish(&current, attempt, permitted, observed.is_ok())
         && let Ok(observed) = &observed
     {
-        let unusable = observed
+        let identities: Vec<String> = observed.iter().map(|(row, _)| row.0.clone()).collect();
+        let usable: Vec<String> = observed
             .iter()
-            .filter(|(_, s)| matches!(s, crate::nfo::Sidecar::Unusable))
-            .count();
+            .filter(|(_, sidecar)| !matches!(sidecar, crate::nfo::Sidecar::Unusable))
+            .map(|(row, _)| row.0.clone())
+            .collect();
         let mut publication = tx.begin().await?;
-        match crate::nfo::publish_refresh_in(&mut publication, &item, observed).await {
-            Ok(count)
-                if playscale_core::metadata::refresh_complete(
-                    observed.len(),
-                    unusable,
-                    count,
-                    permitted,
-                ) =>
-            {
-                publication.commit().await?;
-                success = true;
-            }
-            _ => {
-                publication.rollback().await?;
-            }
+        let result = match crate::nfo::publish_refresh_in(&mut publication, &item, observed).await {
+            Ok(published) => RefreshResult::Acknowledged {
+                observed: identities,
+                usable,
+                published,
+            },
+            Err(_) => RefreshResult::Unavailable,
+        };
+        completion = finish_refresh(&current, attempt, permitted, &result);
+        if completion
+            .as_ref()
+            .is_some_and(|decision| decision.commit_publication)
+        {
+            publication.commit().await?;
+        } else {
+            publication.rollback().await?;
         }
     }
-    let (next, _) = jobs::transition(&current, Input::Finished { attempt, success });
-    sqlx::query("UPDATE metadata_jobs SET phase=?,error=? WHERE id=?")
-        .bind(crate::db::phase_name(next.phase))
-        .bind((!success).then_some("refresh_unavailable_or_unauthorized"))
-        .bind(id)
-        .execute(&mut *tx)
-        .await?;
+    persist_completion(&mut tx, &id, completion).await?;
     tx.commit().await?;
     Ok(true)
+}
+
+/// Apply the core completion in the caller's transaction. No decision means an
+/// obsolete worker, which must not update phase, error or revision.
+async fn persist_completion(
+    conn: &mut SqliteConnection,
+    id: &str,
+    completion: Option<playscale_core::metadata::RefreshCompletion>,
+) -> anyhow::Result<()> {
+    if let Some(completion) = completion {
+        sqlx::query("UPDATE metadata_jobs SET phase=?,error=? WHERE id=?")
+            .bind(crate::db::phase_name(completion.job.phase))
+            .bind(completion.error)
+            .bind(id)
+            .execute(&mut *conn)
+            .await?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod completion_adapter_tests {
+    use super::*;
+    #[tokio::test]
+    async fn obsolete_completion_preserves_phase_error_and_revision() {
+        let pool = SqlitePool::connect("sqlite::memory:").await.unwrap();
+        sqlx::query("CREATE TABLE metadata_jobs (id TEXT PRIMARY KEY, phase TEXT, error TEXT, revision INTEGER)")
+            .execute(&pool).await.unwrap();
+        sqlx::query("CREATE TRIGGER bump AFTER UPDATE ON metadata_jobs BEGIN UPDATE metadata_jobs SET revision=revision+1 WHERE id=NEW.id; END")
+            .execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO metadata_jobs VALUES ('job','running','current error',7)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let current = Job {
+            phase: jobs::Phase::Running,
+            attempt: 2,
+        };
+        let completion = playscale_core::metadata::finish_refresh(
+            &current,
+            1,
+            true,
+            &playscale_core::metadata::RefreshResult::Unavailable,
+        );
+        let mut tx = pool.begin().await.unwrap();
+        persist_completion(&mut tx, "job", completion)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        let row: (String, Option<String>, i64) =
+            sqlx::query_as("SELECT phase,error,revision FROM metadata_jobs WHERE id='job'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(row, ("running".into(), Some("current error".into()), 7));
+    }
 }

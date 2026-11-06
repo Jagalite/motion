@@ -1,4 +1,5 @@
 use super::*;
+use playscale_core::signin_flows as flow;
 const BINDING_COOKIE: &str = "motion_signin";
 // Use only the transport peer supplied by axum. Forwarded headers cannot choose
 // a rate-limit identity. Reverse proxies share their transport peer's bucket.
@@ -60,7 +61,7 @@ async fn initiating_caller(
     // Login proves a new identity. A lingering expired/revoked session must not
     // block it or turn it into linking. Origin and transaction-browser binding
     // still apply; every identity-changing purpose authenticates the caller.
-    if purpose == core::Purpose::Login {
+    if !flow::authentication_required(purpose) {
         return Ok(None);
     }
     if auth::bearer(headers)?.is_some() || auth::session_cookie(headers).is_some() {
@@ -179,17 +180,18 @@ async fn save_state(
     Ok(())
 }
 pub(super) async fn trim(c: &mut sqlx::SqliteConnection) -> Result<(), Problem> {
+    let at = now();
     sqlx::query("DELETE FROM signin_transactions WHERE expires_at<?")
-        .bind(now() - 3600)
+        .bind(at - 3600)
         .execute(&mut *c)
         .await?;
-    sqlx::query("UPDATE signin_requests SET status='expired',revision=revision+1 WHERE status='pending' AND expires_at<=?").bind(now()).execute(&mut *c).await?;
+    expire_requests(c, at).await?;
     sqlx::query("DELETE FROM signin_requests WHERE expires_at<?")
-        .bind(now() - 86400 * 7)
+        .bind(at - 86400 * 7)
         .execute(&mut *c)
         .await?;
     sqlx::query("DELETE FROM signin_proofs WHERE expires_at<?")
-        .bind(now() - 3600)
+        .bind(at - 3600)
         .execute(&mut *c)
         .await?;
     Ok(())
@@ -227,15 +229,13 @@ pub async fn oidc_start(
     body: Body<Start>,
 ) -> Result<Response, Problem> {
     origin(&app, &headers)?;
-    if !core::safe_return(&body.value.return_to)
-        || !matches!(
-            body.value.purpose,
-            core::Purpose::Login
-                | core::Purpose::Link
-                | core::Purpose::Test
-                | core::Purpose::Reauth
+    let authority = flow::authority(flow::Protocol::Oidc, body.value.purpose).map_err(|_| {
+        Problem::bad(
+            "invalid_signin_request",
+            "Choose a valid sign-in purpose and local destination",
         )
-    {
+    })?;
+    if !core::safe_return(&body.value.return_to) {
         return Err(Problem::bad(
             "invalid_signin_request",
             "Choose a valid sign-in purpose and local destination",
@@ -250,45 +250,38 @@ pub async fn oidc_start(
     let caller = initiating_caller(&app, &headers, body.value.purpose).await?;
     let mut tx = begin_write(&app.db).await?;
     trim(&mut tx).await?;
-    if hold(&mut tx).await? {
+    let held = hold(&mut tx).await?;
+    if held {
         return Err(unavailable());
     }
     let (revision, enabled, cfg) = provider(&mut tx, &app, &provider_id).await?;
-    if !enabled && body.value.purpose != core::Purpose::Test {
+    if !flow::method_available(
+        flow::Protocol::Oidc,
+        body.value.purpose,
+        enabled,
+        true,
+        held,
+    ) {
         return Err(unavailable());
     }
     let mut evidence_until = now() + core::TRANSACTION_TTL;
-    let user = if body.value.purpose != core::Purpose::Login {
+    let user = if authority.authenticated {
         let caller = caller.as_ref().ok_or(AccessError::Unauthenticated)?;
         caller
             .reauthorize(
                 &mut tx,
-                if body.value.purpose == core::Purpose::Test {
+                if authority.administrator {
                     Some(Permission::SystemAdmin)
                 } else {
                     None
                 },
             )
             .await?;
-        if matches!(
-            body.value.purpose,
-            core::Purpose::Link | core::Purpose::Test
-        ) {
-            evidence_until = require_fresh(
-                &mut tx,
-                caller,
-                &headers,
-                if body.value.purpose == core::Purpose::Test {
-                    "provider.test"
-                } else {
-                    "identity.link"
-                },
-                &provider_id,
-            )
-            .await?;
+        if let Some(action) = authority.fresh_action {
+            evidence_until = require_fresh(&mut tx, caller, &headers, action, &provider_id).await?;
         }
         let user = owned_user(&mut tx, caller).await?;
-        if body.value.purpose != core::Purpose::Test && user.is_none() {
+        if authority.owned_user && user.is_none() {
             return Err(Problem::invalid(
                 "user_required",
                 "Assign this device to a user before linking a sign-in method",
@@ -349,6 +342,53 @@ pub struct Callback {
     code: Option<String>,
     error: Option<String>,
 }
+/// Expiry is a durable request transition shared by OIDC and email admission.
+/// The caller holds the writer and uses the same time for capacity and insertion.
+pub(super) async fn expire_requests(
+    c: &mut sqlx::SqliteConnection,
+    at: i64,
+) -> Result<(), Problem> {
+    let expired: Vec<(String,i64,i64)> = sqlx::query_as("SELECT id,revision,expires_at FROM signin_requests WHERE status='pending' AND expires_at<=?").bind(at).fetch_all(&mut *c).await?;
+    for (id, revision, expires_at) in expired {
+        let revision = u64::try_from(revision).map_err(Problem::internal)?;
+        let next = core::decide_request(
+            &core::RequestObservation {
+                pending: true,
+                revision,
+                expires_at,
+                method_current: true,
+            },
+            revision,
+            core::RequestAction::Expire,
+            false,
+            at,
+        )
+        .map_err(|_| unavailable())?;
+        sqlx::query("UPDATE signin_requests SET status='expired',revision=? WHERE id=?")
+            .bind(next as i64)
+            .bind(id)
+            .execute(&mut *c)
+            .await?;
+    }
+    Ok(())
+}
+async fn pending_request_capacity(
+    c: &mut sqlx::SqliteConnection,
+    at: i64,
+) -> Result<bool, Problem> {
+    expire_requests(c, at).await?;
+    let count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM signin_requests WHERE status='pending' AND expires_at>?",
+    )
+    .bind(at)
+    .fetch_one(&mut *c)
+    .await?;
+    Ok(playscale_core::registration::capacity_available(
+        playscale_core::registration::Policy::ApprovalRequired,
+        count,
+    ))
+}
+
 pub async fn oidc_callback(
     State(app): State<App>,
     Query(query): Query<Callback>,
@@ -365,10 +405,10 @@ pub async fn oidc_callback(
         .await?
         .ok_or_else(unavailable)?;
     let row = txrow(&mut tx, &id).await?;
-    let mut state = current(&mut tx, &app, &row, &headers, Step::Reserve).await?;
+    let state = current(&mut tx, &app, &row, &headers, Step::Reserve).await?;
     if query.error.is_some() {
-        state.phase = core::Phase::Failed;
-        save_state(&mut tx, &state, Some("denied")).await?;
+        let (failed, result) = flow::protocol_failure(state, true);
+        save_state(&mut tx, &failed, Some(result)).await?;
         tx.commit().await?;
         return Ok(callback_response(&id));
     }
@@ -398,8 +438,8 @@ pub async fn oidc_callback(
     let verified = match verified {
         Ok(v) => v,
         Err(_) => {
-            state.phase = core::Phase::Failed;
-            save_state(&mut tx, &state, Some("failed")).await?;
+            let (failed, result) = flow::protocol_failure(state, false);
+            save_state(&mut tx, &failed, Some(result)).await?;
             audit(
                 &mut tx,
                 "anonymous",
@@ -413,8 +453,28 @@ pub async fn oidc_callback(
         }
     };
     let mut token = None;
-    let result = match state.purpose {
-        core::Purpose::Test => {
+    let identity: Option<(String, String)> =
+        if matches!(state.purpose, core::Purpose::Login | core::Purpose::Reauth) {
+            sqlx::query_as(
+            "SELECT id,user_id FROM signin_identities WHERE issuer=? AND subject=? AND enabled=1",
+        )
+        .bind(&verified.issuer)
+        .bind(&verified.subject)
+        .fetch_optional(&mut *tx)
+        .await?
+        } else {
+            None
+        };
+    let completion = flow::completion(
+        flow::Protocol::Oidc,
+        state.purpose,
+        state.user_id.as_deref(),
+        identity
+            .as_ref()
+            .map(|(id, owner)| (id.as_str(), owner.as_str())),
+    )?;
+    let result = match completion {
+        flow::Completion::Test => {
             let actor = row.actor_id.as_deref().ok_or_else(unavailable)?;
             if actor != "operator" {
                 let device = auth::load_device(&mut tx, actor)
@@ -432,7 +492,7 @@ pub async fn oidc_callback(
             sqlx::query("UPDATE signin_providers SET login_test_at=?,test_at=?,test_ok=1 WHERE id=? AND revision=?").bind(now()).bind(now()).bind(row.provider_id.as_deref()).bind(state.provider_revision as i64).execute(&mut *tx).await?;
             "tested"
         }
-        core::Purpose::Link => {
+        flow::Completion::Link => {
             let user = access_management::load_user(&mut tx, state.user_id.as_deref().unwrap())
                 .await?
                 .ok_or_else(unavailable)?;
@@ -452,48 +512,26 @@ pub async fn oidc_callback(
             .await?;
             "linked"
         }
-        core::Purpose::Login | core::Purpose::Reauth => {
-            let identity: Option<String> = sqlx::query_scalar(
-                "SELECT id FROM signin_identities WHERE issuer=? AND subject=? AND enabled=1",
-            )
-            .bind(&verified.issuer)
-            .bind(&verified.subject)
-            .fetch_optional(&mut *tx)
-            .await?;
-            if let Some(identity) = identity {
-                if state.purpose == core::Purpose::Reauth {
-                    let owner: String =
-                        sqlx::query_scalar("SELECT user_id FROM signin_identities WHERE id=?")
-                            .bind(&identity)
-                            .fetch_one(&mut *tx)
-                            .await?;
-                    core::link_owner(state.user_id.as_deref(), &owner)?;
-                }
-                token = Some(
-                    issue(
-                        &mut tx,
-                        &app,
-                        &identity,
-                        state.provider_revision,
-                        verified.authenticated_at,
-                    )
-                    .await?,
-                );
-                "signed_in"
-            } else if state.purpose == core::Purpose::Login {
-                let count: i64 = sqlx::query_scalar(
-                    "SELECT count(*) FROM signin_requests WHERE status='pending'",
+        flow::Completion::Session { identity } => {
+            token = Some(
+                issue(
+                    &mut tx,
+                    &app,
+                    &identity,
+                    state.provider_revision,
+                    verified.authenticated_at,
                 )
-                .fetch_one(&mut *tx)
-                .await?;
-                if count >= 1000 {
-                    return Err(Problem::rate_limited(600));
-                }
-                sqlx::query("INSERT OR IGNORE INTO signin_requests(id,provider_id,provider_revision,issuer,subject,email,name,created_at,expires_at) VALUES(?,?,?,?,?,?,?,?,?)").bind(new_id()).bind(row.provider_id.as_deref()).bind(state.provider_revision as i64).bind(&verified.issuer).bind(&verified.subject).bind(verified.email.as_deref().filter(|s|s.len()<=254)).bind(verified.display_name.as_deref().filter(|s|s.len()<=200)).bind(now()).bind(now()+86400).execute(&mut *tx).await?;
-                "pending_approval"
-            } else {
-                return Err(unavailable());
+                .await?,
+            );
+            "signed_in"
+        }
+        flow::Completion::PendingApproval => {
+            let at = now();
+            if !pending_request_capacity(&mut tx, at).await? {
+                return Err(Problem::rate_limited(600));
             }
+            sqlx::query("INSERT OR IGNORE INTO signin_requests(id,provider_id,provider_revision,issuer,subject,email,name,created_at,expires_at) VALUES(?,?,?,?,?,?,?,?,?)").bind(new_id()).bind(row.provider_id.as_deref()).bind(state.provider_revision as i64).bind(&verified.issuer).bind(&verified.subject).bind(verified.email.as_deref().filter(|s|s.len()<=254)).bind(verified.display_name.as_deref().filter(|s|s.len()<=200)).bind(at).bind(at+86400).execute(&mut *tx).await?;
+            "pending_approval"
         }
         _ => return Err(unavailable()),
     };
@@ -581,11 +619,12 @@ pub(super) async fn link_identity(
     };
     if let Some((id, owner, enabled)) = existing {
         core::link_owner(Some(&owner), &user.id)?;
-        let row =
-            sqlx::query("SELECT profile_ids,permissions,policy FROM signin_identities WHERE id=?")
-                .bind(&id)
-                .fetch_one(&mut *c)
-                .await?;
+        let row = sqlx::query(
+            "SELECT revision,profile_ids,permissions,policy FROM signin_identities WHERE id=?",
+        )
+        .bind(&id)
+        .fetch_one(&mut *c)
+        .await?;
         let mut previous = Device::approved(
             id.clone(),
             Grant {
@@ -596,16 +635,24 @@ pub(super) async fn link_identity(
             },
         );
         previous.policy = serde_json::from_str(row.get("policy")).map_err(Problem::internal)?;
-        let next = access_admin::link_ceiling(user, initiating, Some(&previous))?;
-        if !enabled || next.grant != previous.grant || next.policy != previous.policy {
-            let families: Vec<String> = sqlx::query_scalar(
-                "SELECT id FROM signin_families WHERE identity_id=? AND revoked=0",
-            )
-            .bind(&id)
-            .fetch_all(&mut *c)
-            .await?;
+        previous.revision = row
+            .get::<i64, _>("revision")
+            .try_into()
+            .map_err(Problem::internal)?;
+        let families: Vec<String> =
+            sqlx::query_scalar("SELECT id FROM signin_families WHERE identity_id=? AND revoked=0")
+                .bind(&id)
+                .fetch_all(&mut *c)
+                .await?;
+        if let flow::Relink::Replace {
+            identity,
+            revision,
+            ceiling: next,
+            revoke_families: families,
+        } = flow::relink(user, initiating, &previous, enabled, &families)?
+        {
             revoke_families(c, &families, &user.id).await?;
-            sqlx::query("UPDATE signin_identities SET enabled=1,revision=revision+1,profile_ids=?,permissions=?,policy=? WHERE id=?").bind(jsonstr(&next.grant.profile_ids)).bind(jsonstr(&next.grant.permissions)).bind(jsonstr(&next.policy)).bind(&id).execute(&mut *c).await?;
+            sqlx::query("UPDATE signin_identities SET enabled=1,revision=?,profile_ids=?,permissions=?,policy=? WHERE id=?").bind(revision as i64).bind(jsonstr(&next.grant.profile_ids)).bind(jsonstr(&next.grant.permissions)).bind(jsonstr(&next.policy)).bind(identity).execute(&mut *c).await?;
         }
         return Ok(id);
     }
@@ -705,15 +752,12 @@ pub async fn email_start(
     body: Body<EmailStart>,
 ) -> Result<Response, Problem> {
     origin(&app, &headers)?;
-    if !matches!(
-        body.value.purpose,
-        core::Purpose::Login | core::Purpose::Enroll | core::Purpose::Reauth
-    ) {
-        return Err(Problem::bad(
+    let authority = flow::authority(flow::Protocol::Email, body.value.purpose).map_err(|_| {
+        Problem::bad(
             "invalid_signin_request",
             "Choose a valid email sign-in purpose",
-        ));
-    }
+        )
+    })?;
     limit(&app, "email:global", 60, 60).await?;
     network_limit(&app, &peer, "email", 20, 600).await?;
     let browser = binding(&headers)
@@ -729,18 +773,23 @@ pub async fn email_start(
     trim(&mut tx).await?;
     let mail = mail(&mut tx, &app).await?;
     let revision = mail.revision;
-    if !mail.cfg.enabled || !super::outbox::rehearse(&mail) || hold(&mut tx).await? {
+    if !flow::method_available(
+        flow::Protocol::Email,
+        body.value.purpose,
+        mail.cfg.enabled,
+        super::outbox::rehearse(&mail),
+        hold(&mut tx).await?,
+    ) {
         return Err(unavailable());
     }
     let mut evidence_until = now() + core::TRANSACTION_TTL;
-    let user = if body.value.purpose == core::Purpose::Login {
+    let user = if !authority.authenticated {
         None
     } else {
         let caller = caller.as_ref().ok_or(AccessError::Unauthenticated)?;
         caller.reauthorize(&mut tx, None).await?;
-        if body.value.purpose == core::Purpose::Enroll {
-            evidence_until =
-                require_fresh(&mut tx, caller, &headers, "identity.link", "email").await?;
+        if let Some(action) = authority.fresh_action {
+            evidence_until = require_fresh(&mut tx, caller, &headers, action, "email").await?;
         }
         Some(owned_user(&mut tx, caller).await?.ok_or_else(|| {
             Problem::invalid(
@@ -749,36 +798,42 @@ pub async fn email_start(
             )
         })?)
     };
-    let identity: Option<(String, String, bool)> =
-        sqlx::query_as("SELECT id,user_id,enabled FROM signin_identities WHERE address=?")
+    let identity: Option<(String, String, bool, i64)> =
+        sqlx::query_as("SELECT id,user_id,enabled,revision FROM signin_identities WHERE address=?")
             .bind(&address)
             .fetch_optional(&mut *tx)
             .await?;
-    let eligible = if address.is_empty() {
-        false
-    } else if body.value.purpose == core::Purpose::Enroll {
+    let identity_user = match &identity {
+        Some((_, owner, _, _)) => access_management::load_user(&mut tx, owner).await?,
+        None => None,
+    };
+    let binding = |u: &User| flow::UserBinding {
+        id: u.id.clone(),
+        revision: u.revision,
+    };
+    let observed_identity =
         identity
             .as_ref()
-            .is_none_or(|(_, owner, _)| Some(owner) == user.as_ref().map(|u| &u.id))
-    } else if let Some((_, owner, true)) = &identity {
-        let active = access_management::load_user(&mut tx, owner)
-            .await?
-            .is_some_and(|u| !u.disabled);
-        active
-            && (body.value.purpose == core::Purpose::Login
-                || Some(owner) == user.as_ref().map(|u| &u.id))
-    } else {
-        false
-    };
-    let bound_user = if !eligible {
-        None
-    } else if let Some(user) = user {
-        Some(user)
-    } else if let Some((_, owner, _)) = &identity {
-        access_management::load_user(&mut tx, owner).await?
-    } else {
-        None
-    };
+            .map(|(id, owner, enabled, revision)| flow::RecipientIdentity {
+                id: id.clone(),
+                revision: *revision as u64,
+                user: identity_user
+                    .as_ref()
+                    .map(binding)
+                    .unwrap_or_else(|| flow::UserBinding {
+                        id: owner.clone(),
+                        revision: 0,
+                    }),
+                enabled: *enabled,
+                user_enabled: identity_user.as_ref().is_some_and(|u| !u.disabled),
+            });
+    let recipient = flow::email_recipient(
+        body.value.purpose,
+        !address.is_empty(),
+        user.as_ref().map(binding).as_ref(),
+        observed_identity.as_ref(),
+    );
+    let eligible = matches!(recipient, flow::Recipient::IssueChallenge { .. });
     let ceiling = match caller
         .as_ref()
         .filter(|c| !c.is_local_operator() && body.value.purpose != core::Purpose::Login)
@@ -794,35 +849,25 @@ pub async fn email_start(
         "{:08}",
         u32::from_be_bytes(random[..4].try_into().unwrap()) % 100_000_000
     );
-    let state = core::Transaction {
-        id: id.clone(),
-        purpose: body.value.purpose,
-        browser_hash: keyed(&app, "browser", &browser),
-        epoch: epoch(&mut tx).await?,
-        server_epoch: app.access.server_epoch.clone(),
-        provider_revision: revision as u64,
-        user_id: bound_user.as_ref().map(|u| u.id.clone()),
-        user_revision: bound_user.as_ref().map(|u| u.revision),
-        identity_revision: if eligible {
-            match identity.as_ref() {
-                Some((id, _, _)) => sqlx::query_scalar::<_, i64>(
-                    "SELECT revision FROM signin_identities WHERE id=?",
-                )
-                .bind(id)
-                .fetch_optional(&mut *tx)
-                .await?
-                .map(|n| n as u64),
-                None => None,
-            }
-        } else {
-            None
+    let state = flow::bind_recipient(
+        core::Transaction {
+            id: id.clone(),
+            purpose: body.value.purpose,
+            browser_hash: keyed(&app, "browser", &browser),
+            epoch: epoch(&mut tx).await?,
+            server_epoch: app.access.server_epoch.clone(),
+            provider_revision: revision as u64,
+            user_id: None,
+            user_revision: None,
+            identity_revision: None,
+            actor_revision: ceiling.as_ref().map(|d| d.revision),
+            expires_at: evidence_until,
+            phase: core::Phase::Pending,
+            attempts: 0,
+            registration: None,
         },
-        actor_revision: ceiling.as_ref().map(|d| d.revision),
-        expires_at: evidence_until,
-        phase: core::Phase::Pending,
-        attempts: 0,
-        registration: None,
-    };
+        &recipient,
+    );
     let actor = if body.value.purpose == core::Purpose::Login {
         None
     } else {
@@ -892,13 +937,12 @@ pub async fn email_finish(
     // A retried registration (for example after a lost response) returns its
     // stable recorded outcome without issuing another user or session family.
     let recorded = row.state()?;
-    if recorded.purpose == core::Purpose::Register
-        && recorded.phase == core::Phase::Consumed
-        && binding(&headers)
+    if flow::consumed_replay(
+        &recorded,
+        binding(&headers)
             .map(|b| keyed(&app, "browser", b))
-            .as_deref()
-            == Some(recorded.browser_hash.as_str())
-    {
+            .as_deref(),
+    ) {
         return Ok(
             Json(json!({"status":row.result,"session_issued":false,"redirect_to":null}))
                 .into_response(),
@@ -925,7 +969,24 @@ pub async fn email_finish(
     updated.state_json = jsonstr(&state);
     let state = current(&mut tx, &app, &updated, &headers, Step::Complete).await?;
     let mut token = None;
-    let result = if state.purpose == core::Purpose::Register {
+    let identity: Option<(String, String)> =
+        if matches!(state.purpose, core::Purpose::Login | core::Purpose::Reauth) {
+            sqlx::query_as("SELECT id,user_id FROM signin_identities WHERE id=? AND enabled=1")
+                .bind(updated.identity_id.as_deref())
+                .fetch_optional(&mut *tx)
+                .await?
+        } else {
+            None
+        };
+    let completion = flow::completion(
+        flow::Protocol::Email,
+        state.purpose,
+        state.user_id.as_deref(),
+        identity
+            .as_ref()
+            .map(|(id, owner)| (id.as_str(), owner.as_str())),
+    )?;
+    let result = if completion == flow::Completion::Registration {
         match super::registration::complete(&mut tx, &app, &updated, &state).await? {
             Ok(super::registration::Completed::Session(result, issued)) => {
                 token = Some(issued);
@@ -964,7 +1025,7 @@ pub async fn email_finish(
                 ));
             }
         }
-    } else if state.purpose == core::Purpose::Enroll {
+    } else if completion == flow::Completion::Link {
         let user = access_management::load_user(
             &mut tx,
             state.user_id.as_deref().ok_or_else(unavailable)?,
@@ -986,16 +1047,11 @@ pub async fn email_finish(
         )
         .await?;
         "linked"
-    } else {
-        let identity = updated.identity_id.as_deref().ok_or_else(unavailable)?;
-        let owner: String =
-            sqlx::query_scalar("SELECT user_id FROM signin_identities WHERE id=? AND enabled=1")
-                .bind(identity)
-                .fetch_one(&mut *tx)
-                .await?;
-        core::link_owner(state.user_id.as_deref(), &owner)?;
-        token = Some(issue(&mut tx, &app, identity, state.provider_revision, now()).await?);
+    } else if let flow::Completion::Session { identity } = completion {
+        token = Some(issue(&mut tx, &app, &identity, state.provider_revision, now()).await?);
         "signed_in"
+    } else {
+        return Err(unavailable());
     };
     save_state(&mut tx, &state, Some(result)).await?;
     super::outbox::cancel_owner(&mut tx, &id).await?;
@@ -1060,5 +1116,44 @@ fn static_result(result: String) -> &'static str {
         "invitation_accepted" => "invitation_accepted",
         "account_active" => "account_active",
         _ => "failed",
+    }
+}
+
+#[cfg(test)]
+mod request_capacity_tests {
+    #[tokio::test]
+    async fn oidc_capacity_expires_old_requests_but_rejects_one_thousand_live_requests() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = crate::db::connect(&dir.path().join("db.sqlite"))
+            .await
+            .unwrap();
+        let mut tx = crate::db::begin_write(&db).await.unwrap();
+        sqlx::query("INSERT INTO signin_providers(id,revision,name,issuer,client_id) VALUES ('provider',1,'Fixture','https://issuer','client')").execute(&mut *tx).await.unwrap();
+        // Start already trims expired requests. A request still live at start
+        // can expire before callback; admission must reobserve the same core
+        // expiry policy at callback time, not rely on the earlier sweep.
+        sqlx::query("WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM n WHERE x<1000) INSERT INTO signin_requests(id,kind,provider_id,issuer,subject,provider_revision,created_at,expires_at) SELECT 'expired-'||x,'oidc','provider','https://issuer', 'subject-'||x,1,0,10 FROM n").execute(&mut *tx).await.unwrap();
+        assert!(!super::pending_request_capacity(&mut tx, 9).await.unwrap());
+        assert!(super::pending_request_capacity(&mut tx, 10).await.unwrap());
+        let expired: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM signin_requests WHERE status='expired' AND revision=2",
+        )
+        .fetch_one(&mut *tx)
+        .await
+        .unwrap();
+        assert_eq!(expired, 1000);
+        sqlx::query("WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM n WHERE x<1000) INSERT INTO signin_requests(id,kind,provider_id,issuer,subject,provider_revision,created_at,expires_at) SELECT 'live-'||x,'oidc','provider','https://issuer','subject-'||x,1,10,20 FROM n").execute(&mut *tx).await.unwrap();
+        assert!(!super::pending_request_capacity(&mut tx, 10).await.unwrap());
+        tx.commit().await.unwrap();
+        let mut tx = crate::db::begin_write(&db).await.unwrap();
+        assert!(super::pending_request_capacity(&mut tx, 20).await.unwrap());
+        let expired: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM signin_requests WHERE status='expired' AND revision=2",
+        )
+        .fetch_one(&mut *tx)
+        .await
+        .unwrap();
+        assert_eq!(expired, 2000);
+        tx.commit().await.unwrap();
     }
 }

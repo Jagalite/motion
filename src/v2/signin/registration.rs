@@ -14,8 +14,6 @@ use std::collections::BTreeSet;
 
 pub(super) const REQUEST_TTL: i64 = 7 * 86_400;
 /// Open registrations activated per rolling day, and pending email requests.
-pub(super) const DAILY_ACTIVATIONS: i64 = 100;
-pub(super) const PENDING_REQUESTS: i64 = 1000;
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
@@ -71,19 +69,27 @@ async fn available_invitation(
     app: &App,
     address: &str,
 ) -> Result<Option<policy::InvitationRef>, Problem> {
-    let rows: Vec<access_management::InviteRow> = sqlx::query_as(
-        "SELECT * FROM access_invitations WHERE email=? AND revoked=0 AND device_id IS NULL AND identity_id IS NULL AND expires_at>? ORDER BY created_at DESC LIMIT 4",
-    )
-    .bind(address)
-    .bind(now())
-    .fetch_all(&mut *c)
-    .await?;
-    for row in rows {
-        if registrable(c, app, &row).await? {
-            return Ok(Some(policy::InvitationRef {
-                id: row.id.clone(),
-                revision: row.revision_value(),
-            }));
+    let at = now();
+    let mut cursor: Option<(i64, String)> = None;
+    loop {
+        let rows: Vec<access_management::InviteRow> = sqlx::query_as(
+            "SELECT * FROM access_invitations WHERE email=? AND revoked=0 AND device_id IS NULL AND identity_id IS NULL AND expires_at>? AND (? IS NULL OR created_at<? OR (created_at=? AND id<?)) ORDER BY created_at DESC,id DESC LIMIT 64",
+        )
+        .bind(address).bind(at)
+        .bind(cursor.as_ref().map(|c| c.0)).bind(cursor.as_ref().map(|c| c.0))
+        .bind(cursor.as_ref().map(|c| c.0)).bind(cursor.as_ref().map(|c| c.1.as_str()))
+        .fetch_all(&mut *c).await?;
+        if rows.is_empty() {
+            break;
+        }
+        for row in rows {
+            cursor = Some((row.created_at, row.id.clone()));
+            if registrable(c, app, &row).await? {
+                return Ok(Some(policy::InvitationRef {
+                    id: row.id.clone(),
+                    revision: row.revision_value(),
+                }));
+            }
         }
     }
     Ok(None)
@@ -318,16 +324,16 @@ pub(super) async fn complete(
         None => None,
     };
     let invitation_registrable = match &invitation_row {
-        Some(row) => row.email.as_deref() == Some(address) && registrable(tx, app, row).await?,
+        Some(row) => {
+            policy::invitation_address_matches(row.email.as_deref(), address)
+                && registrable(tx, app, row).await?
+        }
         None => false,
     };
     // Expire lapsed requests in this writer so a new one can replace them. One
     // observed time keeps expiry, pending and capacity facts consistent.
     let at = now();
-    sqlx::query("UPDATE signin_requests SET status='expired',revision=revision+1 WHERE status='pending' AND expires_at<=?")
-        .bind(at)
-        .execute(&mut *tx)
-        .await?;
+    super::flows::expire_requests(tx, at).await?;
     let pending = sqlx::query_scalar::<_, i64>(
         "SELECT count(*) FROM signin_requests WHERE kind='email' AND status='pending' AND address=? AND expires_at>?",
     )
@@ -344,13 +350,12 @@ pub(super) async fn complete(
         )
         .await
         .is_ok();
-    let capacity = match registration.policy {
+    let capacity_count = match registration.policy {
         policy::Policy::Open => {
             sqlx::query_scalar::<_, i64>("SELECT count(*) FROM registration_activations WHERE at>?")
                 .bind(at - 86_400)
                 .fetch_one(&mut *tx)
                 .await?
-                < DAILY_ACTIVATIONS
         }
         _ => {
             sqlx::query_scalar::<_, i64>(
@@ -359,7 +364,6 @@ pub(super) async fn complete(
             .bind(at)
             .fetch_one(&mut *tx)
             .await?
-                < PENDING_REQUESTS
         }
     };
     let decision = policy::decide(
@@ -377,7 +381,7 @@ pub(super) async fn complete(
                 }),
             pending_request: pending,
             default_grant_valid: default_valid,
-            capacity,
+            capacity: policy::capacity_available(registration.policy, capacity_count),
         },
     );
     let outcome = match decision {
@@ -602,14 +606,19 @@ pub async fn replace_registration(
             .await?;
         // Pending registration challenges captured the old revision and would
         // fail at completion anyway; end them now and withdraw queued codes.
-        let ids: Vec<String> = sqlx::query_scalar("SELECT id FROM signin_transactions WHERE json_extract(state_json,'$.purpose')='register' AND json_extract(state_json,'$.phase')='pending'")
-            .fetch_all(&mut *tx)
-            .await?;
-        for id in ids {
-            sqlx::query("UPDATE signin_transactions SET state_json=json_set(state_json,'$.phase','failed'),code_hash=NULL,result='registration_changed' WHERE id=?")
-                .bind(&id)
-                .execute(&mut *tx)
-                .await?;
+        let rows: Vec<(String, String)> = sqlx::query_as("SELECT id,state_json FROM signin_transactions WHERE json_extract(state_json,'$.purpose')='register' AND json_extract(state_json,'$.phase')='pending'")
+            .fetch_all(&mut *tx).await?;
+        for (id, json) in rows {
+            let mut state: core::Transaction =
+                serde_json::from_str(&json).map_err(Problem::internal)?;
+            let next =
+                core::invalidated_phase(state.phase, core::Invalidation::RegistrationChanged);
+            if next == state.phase {
+                continue;
+            }
+            state.phase = next;
+            sqlx::query("UPDATE signin_transactions SET state_json=?,code_hash=NULL,result='registration_changed' WHERE id=?")
+                .bind(jsonstr(&state)).bind(&id).execute(&mut *tx).await?;
             outbox::cancel_owner(&mut tx, &id).await?;
         }
         audit(

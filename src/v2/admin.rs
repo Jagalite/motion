@@ -282,17 +282,49 @@ pub async fn run_backup(app: &App) -> anyhow::Result<bool> {
     Ok(true)
 }
 
+async fn cleanup_candidates(app: &App, after: &str) -> anyhow::Result<Vec<String>> {
+    Ok(sqlx::query_scalar("WITH candidates AS (SELECT id FROM backup_jobs WHERE phase='completed' AND error='backup_expired' UNION SELECT id FROM (SELECT id FROM backup_jobs WHERE phase='completed' AND error IS NULL ORDER BY created_at DESC,id DESC LIMIT -1 OFFSET ?)) SELECT id FROM candidates WHERE id>? ORDER BY id LIMIT 500")
+        .bind(app.storage.settings.backups_keep as i64).bind(after).fetch_all(&app.db).await?)
+}
+
 async fn retain_requested(app: &App) -> anyhow::Result<()> {
-    let ids:Vec<String> = sqlx::query_scalar("SELECT id FROM backup_jobs WHERE phase='completed' AND error='backup_expired' UNION SELECT id FROM (SELECT id FROM backup_jobs WHERE phase='completed' AND error IS NULL ORDER BY created_at DESC,id DESC LIMIT -1 OFFSET ?) LIMIT 500").bind(app.storage.settings.backups_keep as i64).fetch_all(&app.db).await?;
+    let after: String =
+        sqlx::query_scalar("SELECT after_id FROM backup_cleanup_cursor WHERE singleton=1")
+            .fetch_one(&app.db)
+            .await?;
+    let mut ids = cleanup_candidates(app, &after).await?;
+    if ids.is_empty() && !after.is_empty() {
+        ids = cleanup_candidates(app, "").await?;
+    }
     for id in ids {
         // Withdraw the ready claim before removing bytes; retain job provenance.
+        use playscale_core::maintenance::{BackupAvailability, BackupRetentionInput};
         let mut tx = begin_write(&app.db).await?;
-        sqlx::query(
-            "UPDATE backup_jobs SET error='backup_expired' WHERE id=? AND phase='completed'",
-        )
-        .bind(&id)
-        .execute(&mut *tx)
-        .await?;
+        sqlx::query("UPDATE backup_cleanup_cursor SET after_id=? WHERE singleton=1")
+            .bind(&id)
+            .execute(&mut *tx)
+            .await?;
+        let marker: Option<Option<String>> =
+            sqlx::query_scalar("SELECT error FROM backup_jobs WHERE id=? AND phase='completed'")
+                .bind(&id)
+                .fetch_optional(&mut *tx)
+                .await?;
+        let Some(availability) =
+            marker.and_then(|marker| BackupAvailability::from_marker(marker.as_deref()))
+        else {
+            tx.commit().await?;
+            continue;
+        };
+        let withdrawn = availability.transition(BackupRetentionInput::Expire);
+        if withdrawn != BackupAvailability::Withdrawn {
+            tx.commit().await?;
+            continue;
+        }
+        sqlx::query("UPDATE backup_jobs SET error=? WHERE id=? AND phase='completed'")
+            .bind(withdrawn.marker())
+            .bind(&id)
+            .execute(&mut *tx)
+            .await?;
         tx.commit().await?;
         let path = app
             .storage
@@ -308,16 +340,21 @@ async fn retain_requested(app: &App) -> anyhow::Result<()> {
                     "unowned backup destination"
                 );
                 std::fs::remove_dir_all(&path)?;
-                #[cfg(unix)]
-                std::fs::File::open(path.parent().unwrap())?.sync_all()?;
             }
+            #[cfg(unix)]
+            std::fs::File::open(path.parent().unwrap())?.sync_all()?;
             Ok(())
         })
         .await?;
         match removed {
             Err(error) => tracing::warn!(%error,"expired backup cleanup will retry"),
             Ok(()) => {
-                sqlx::query("UPDATE backup_jobs SET error='backup_reclaimed' WHERE id=? AND error='backup_expired'").bind(&id).execute(&app.db).await?;
+                let reclaimed = withdrawn.transition(BackupRetentionInput::DurableAbsence);
+                sqlx::query("UPDATE backup_jobs SET error=? WHERE id=? AND error='backup_expired'")
+                    .bind(reclaimed.marker())
+                    .bind(&id)
+                    .execute(&app.db)
+                    .await?;
             }
         }
     }

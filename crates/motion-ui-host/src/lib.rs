@@ -150,28 +150,8 @@ pub(crate) fn validate_manifest(manifest: &CacheManifest) -> anyhow::Result<()> 
 pub(crate) fn validate_download(item: &CachedDownload) -> anyhow::Result<()> {
     let m = &item.identity;
     ensure!(
-        offline::identifier(&m.download_id) && offline::identifier(&m.timeline_id),
-        "invalid download identity"
-    );
-    ensure!(
-        [
-            &m.timeline_revision,
-            &m.base_viewing_revision,
-            &m.base_manual_epoch
-        ]
-        .into_iter()
-        .all(|s| offline::sequence(s).is_some()),
-        "invalid causal revision"
-    );
-    ensure!(
-        m.viewing_epoch
-            .as_deref()
-            .is_none_or(offline::viewing_epoch),
-        "invalid server history identity"
-    );
-    ensure!(
-        !m.source_revision.is_empty() && m.source_revision.len() <= 256,
-        "invalid source revision"
+        offline::valid_download_identity(m),
+        "invalid download identity or causal revision"
     );
     ensure!(
         item.title.len() <= 1024
@@ -483,7 +463,7 @@ impl OfflinePresentationReader for Cache {
 }
 
 struct Media {
-    ticket: String,
+    playback: offline::LocalPlayback,
     item: CachedDownload,
     file: Arc<Mutex<std::fs::File>>,
 }
@@ -659,6 +639,7 @@ async fn open_media(State(host): State<Host>, AxumPath(id): AxumPath<String>) ->
     // already admitted retain Arc<File> until their actual read completes;
     // the new snapshot must fit alongside only those outstanding readers.
     host.media.lock().unwrap().take();
+    let opening = offline::LocalPlayback::Closed.begin(&id);
     let cache = host.cache.clone();
     let download = id.clone();
     let snapshot = tokio::task::spawn_blocking(move || {
@@ -676,23 +657,23 @@ async fn open_media(State(host): State<Host>, AxumPath(id): AxumPath<String>) ->
     let history = host.cache.history.lock().unwrap();
     // The newest local observation of this download (also across rebases),
     // else the server position recorded at the last rebase.
-    let position = history
+    let latest = history
         .events
         .iter()
         .rev()
-        .find(|e| e.media.download_id == item.identity.download_id)
-        .map_or(item.resume_position_ms.unwrap_or(0), |e| {
-            if e.status == "ended" {
-                0
-            } else {
-                e.position_ms
-            }
-        });
+        .find(|e| e.media.download_id == item.identity.download_id);
+    let position = playscale_core::timeline_viewing::resume_position(
+        playscale_core::timeline_viewing::ResumePolicy::Offline,
+        latest.map(|e| e.position_ms).or(item.resume_position_ms),
+        latest.is_some_and(|e| e.status == "ended"),
+        Some(item.duration_ms),
+    );
     let ticket = Uuid::new_v4().simple().to_string();
     let result = json!({"scope":host.cache.scope,"media":item.identity,"duration_ms":item.duration_ms,"position_ms":position,
         "next_sequence":history.next_sequence().map(|n|n.to_string()),"media_url":format!("/cache/media/{ticket}")});
+    let playback = opening.snapshot(&id, &ticket, true);
     *host.media.lock().unwrap() = Some(Media {
-        ticket,
+        playback,
         item,
         file: Arc::new(Mutex::new(file)),
     });
@@ -807,7 +788,10 @@ async fn remove(State(host): State<Host>, AxumPath(id): AxumPath<String>) -> Res
 }
 async fn close_media(State(host): State<Host>, AxumPath(ticket): AxumPath<String>) -> Response {
     let mut active = host.media.lock().unwrap();
-    if active.as_ref().is_some_and(|media| media.ticket == ticket) {
+    if active
+        .as_ref()
+        .is_some_and(|media| media.playback.retire(&ticket) == offline::LocalPlayback::Closed)
+    {
         active.take();
     }
     // Exact-ticket retirement is idempotent and cannot close a newer open.
@@ -829,7 +813,7 @@ async fn media(
         let active = host.media.lock().unwrap();
         active
             .as_ref()
-            .filter(|m| m.ticket == ticket)
+            .filter(|m| m.playback.admits(&ticket))
             .map(|m| (m.file.clone(), m.item.clone()))
     };
     let Some((file, item)) = opened else {

@@ -3,7 +3,7 @@ import {readFileSync} from 'node:fs';
 import {test} from 'node:test';
 import {runInNewContext} from 'node:vm';
 
-const source = readFileSync(new URL('./player.js', import.meta.url), 'utf8');
+const source = readFileSync(new URL('../playback/replacement.mjs', import.meta.url), 'utf8').replaceAll('export ', '') + '\n' + readFileSync(new URL('./player.js', import.meta.url), 'utf8');
 const maintainLease = runInNewContext(source.replace('export {close, maintainLease};', 'maintainLease;'), {
   document: {getElementById: () => null, querySelector: () => null, addEventListener() {}}, addEventListener() {}, AbortController,
 });
@@ -322,10 +322,12 @@ test('replacement preparation heartbeat never reports the predecessor playhead',
     crypto: {randomUUID: () => 'key'}, sent, replacement,
   });
   const old = {controls: true, player: {state: {status: 'paused', currentTime: 10}}, pause: async () => {}};
-  Object.assign(player.state, {deliveryId: 'old', element: old, generation: {generation: '2', media_time_origin_ms: 0}});
+  Object.assign(player.state, {deliveryId: 'old', delivery: {id: 'old'}, element: old, generation: {generation: '2', media_time_origin_ms: 0}});
   assert.equal(await player.switchDelivery({plan_token: 'plan'}), false);
-  assert.equal(sent.length, 1);
+  assert.equal(sent.length, 2);
   assert.equal(JSON.stringify(sent[0]), JSON.stringify({active_generation: '1'}));
+  assert.equal(sent[1].active_generation, '2', 'rollback renews the predecessor owner');
+  assert.equal(sent[1].playhead.position_ms, 10000);
   assert.equal(player.state.element, old);
 });
 
@@ -588,4 +590,130 @@ test('authored previews require the exact playing file and revision', () => {
   assert.equal(matchingPreviewSource(manifest, {file_id: 'cut-b', file_revision: 'r1'}), false);
   assert.equal(matchingPreviewSource(manifest, {file_id: 'cut-a', file_revision: 'r2'}), false);
   assert.equal(matchingPreviewSource(manifest, null), false);
+});
+
+test('deferred predecessor pause cannot write into restarted viewing or clear a newer change fence', async () => {
+  let finishPause;
+  const paused = new Promise(resolve => { finishPause = resolve; });
+  const recorded = [];
+  let counter = 0;
+  const player = runInNewContext(source.replace('export {close, maintainLease};', `
+    status = () => {};
+    retire = async () => {};
+    ({state, switchDelivery, close});
+  `), {
+    document: {getElementById: () => null, querySelector: () => null, addEventListener() {}}, addEventListener() {},
+    crypto: {randomUUID: () => 'op' + (++counter)}, setTimeout: callback => callback(),
+  });
+  const old = {controls: true, player: {state: {status: 'paused', currentTime: 10}}, pause: () => paused,
+    destroy: async () => {}, remove() {}};
+  Object.assign(player.state, {deliveryId: 'old', element: old, generation: {generation: '2', media_time_origin_ms: 0}});
+  const switching = player.switchDelivery({plan_token: 'plan'});
+  await player.close();
+  Object.assign(player.state, {closing: null, epoch: player.state.epoch + 1, changing: true, changeOwner: 'new-operation',
+    viewing: {record: event => recorded.push(event), flush: async () => true}});
+  finishPause();
+  assert.equal(await switching, false);
+  assert.deepEqual(recorded, []);
+  assert.equal(player.state.changing, true);
+  assert.equal(player.state.changeOwner, 'new-operation');
+});
+
+for (const scenario of ['cross-delivery success', 'cross-delivery rollback', 'same-delivery rollback']) {
+  test(`${scenario} keeps installed lease and viewing callbacks live after the change settles`, async () => {
+    const records = [], requests = [], leases = [];
+    const makeElement = () => {
+      const callbacks = [];
+      const element = {controls: true, inert: false, callbacks,
+        player: {state: {status: 'playing', currentTime: 4, volume: 1, muted: false, playbackRate: 1},
+          subscribe(callback) { callbacks.push(callback); return () => {}; }},
+        async pause() { element.player.state.status = 'paused'; },
+        async play() { element.player.state.status = 'playing'; }, async destroy() {}, remove() {}};
+      return element;
+    };
+    const oldElement = makeElement(), newElement = makeElement();
+    const oldGeneration = {generation: '1', media_time_origin_ms: 0};
+    const newGeneration = {generation: '2', media_time_origin_ms: 0};
+    const oldDelivery = {id: 'old', active: oldGeneration};
+    const newDelivery = {id: 'new', active: newGeneration};
+    let nextKey = 0;
+    const fixture = {newElement, newDelivery, records, requests, leases, fail: scenario === 'cross-delivery rollback'};
+    const player = runInNewContext(source.replace('export {close, maintainLease};', `
+      status = () => {};
+      showSkips = () => {};
+      rememberAudio = () => {};
+      retire = async () => {};
+      disposePlayer = async () => {};
+      preparePlayer = async () => fixture.newElement;
+      firstGeneration = async () => fixture.newDelivery;
+      retryCommand = async () => { if (fixture.fail) throw Object.assign(new Error('refused'), {status: 400}); return fixture.newDelivery; };
+      api = async (method, path, body) => {
+        fixture.requests.push({method, path, body});
+        if (method === 'PUT') return {id: 'session', revision: '2', delivery_id: 'new'};
+        return {...state.delivery};
+      };
+      maintainLease = (delivery, generation, options) => {
+        const lease = {delivery, generation, options, stopped: false}; fixture.leases.push(lease);
+        return () => { lease.stopped = true; };
+      };
+      ({state, switchDelivery, changePlayback, close});
+    `), {
+      fixture, document: {getElementById: () => null, querySelector: () => null, addEventListener() {}},
+      addEventListener() {}, crypto: {randomUUID: () => `op${++nextKey}`}, AbortSignal, setTimeout: callback => callback(),
+    });
+    const writer = {session: {id: 'session', revision: '1', delivery_id: 'old'}, record: event => records.push(event),
+      flush: async () => true, rebind(session) { this.session = session; }};
+    Object.assign(player.state, {epoch: 10, deliveryId: 'old', delivery: oldDelivery, generation: oldGeneration,
+      element: oldElement, viewing: writer, replace: async () => { throw new Error('replan refused'); }});
+    const changed = scenario === 'same-delivery rollback'
+      ? await player.changePlayback({kind: 'seek', position_ms: 1000})
+      : await player.switchDelivery({plan_token: 'plan'});
+    assert.equal(changed, scenario === 'cross-delivery success');
+    assert.equal(player.state.changing, false);
+    assert.equal(player.state.changeOwner, null);
+    const element = player.state.element;
+    const lease = leases.at(-1);
+    const observer = element.callbacks.at(-1);
+    assert.ok(observer, 'the actual viewing observer is installed');
+    assert.equal(lease.stopped, false);
+    assert.equal(lease.options.current(), true, 'persistent owner outlives the operation fence');
+    records.length = 0; requests.length = 0;
+    observer({...element.player.state, currentTime: 7, status: 'playing'});
+    await lease.options.send(lease.delivery.id, lease.generation, AbortSignal.timeout(1000));
+    assert.equal(records.length, 1, 'progress still records after the promise resolves');
+    assert.equal(records[0].delivery_generation, scenario === 'cross-delivery success' ? '2' : '1');
+    assert.equal(requests.length, 1, 'installed heartbeat callback still sends');
+    assert.equal(requests[0].body.active_generation, lease.generation);
+    assert.ok(requests[0].body.playhead, 'heartbeat uses this owner’s playhead');
+    const id = player.state.deliveryId;
+    player.state.deliveryId = 'replacement-owner';
+    assert.equal(lease.options.current(), false, 'another delivery invalidates old callbacks in the same page');
+    observer({...element.player.state, currentTime: 8, status: 'paused'});
+    assert.equal(records.length, 1);
+    player.state.deliveryId = id;
+    await player.close();
+    const count = records.length;
+    assert.equal(lease.options.current(), false, 'close retires the page owner');
+    observer({...element.player.state, currentTime: 9, status: 'paused'});
+    assert.equal(records.length, count);
+  });
+}
+
+test('same-delivery activation cannot record into a restarted page after deferred pause', async () => {
+  let finishPause;
+  const paused = new Promise(resolve => { finishPause = resolve; });
+  const records = [];
+  const player = runInNewContext(source.replace('export {close, maintainLease};', '({state, makeSwitcher});'), {
+    document: {getElementById: () => null, querySelector: () => null, addEventListener() {}}, addEventListener() {},
+    createGenerationSwitcher: ports => ports,
+  });
+  const old = {pause: () => paused, player: {state: {currentTime: 3}}};
+  Object.assign(player.state, {epoch: 1, element: old, generation: {generation: '1', media_time_origin_ms: 0}});
+  const ports = player.makeSwitcher(() => player.state.epoch === 1);
+  const activation = ports.activate('delivery', '2', '1');
+  Object.assign(player.state, {epoch: 2, element: {}, generation: {generation: '9'},
+    viewing: {record: event => records.push(event), flush: async () => true}});
+  finishPause();
+  await assert.rejects(activation, /Playback ownership changed/);
+  assert.deepEqual(records, []);
 });

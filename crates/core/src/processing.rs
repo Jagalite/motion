@@ -3,6 +3,240 @@
 use crate::jobs::{self, Effect, Input, Job};
 use serde::{Deserialize, Serialize};
 
+/// DB-only restore cannot reuse disposable outputs belonging to another cache
+/// root. Keep source files and unmanaged libraries outside this authority.
+pub fn restored_output_unavailable(
+    generated: bool,
+    managed: bool,
+    root: &str,
+    current_root: &str,
+) -> bool {
+    generated && managed && root != current_root
+}
+pub fn restored_receipt_expired(
+    phase: crate::jobs::Phase,
+    generated: bool,
+    available: bool,
+) -> bool {
+    phase == crate::jobs::Phase::Completed && generated && !available
+}
+/// A held witness of unknown provenance may be a hardware encoder; reserve
+/// conservatively until its process ownership witness is released.
+pub fn recovered_hardware_required(backend: Option<&str>) -> bool {
+    backend != Some("software")
+}
+
+/// Platform support is observed by the adapter; recipe/backend compatibility
+/// is one shared policy used by both API generations.
+pub fn backend_allowed(recipe: &str, backend: &str, videotoolbox_available: bool) -> bool {
+    matches!(
+        recipe,
+        "remux_mp4" | "audio_aac" | "h264720p" | "video_profile"
+    ) && (backend == "software"
+        || (backend == "videotoolbox"
+            && videotoolbox_available
+            && matches!(recipe, "h264720p" | "video_profile")))
+}
+
+/// Technical stream observations supplied by the probe adapter. Indices are
+/// demuxer indices; returned selections are ordinals within each stream kind.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PreparationStream {
+    pub index: i64,
+    pub kind: String,
+    pub codec: String,
+}
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PreparationSelection {
+    pub audio_track: Option<String>,
+    pub subtitle_track: Option<String>,
+    pub audio_component: Option<String>,
+    pub subtitle_component: Option<String>,
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SelectedStreams {
+    pub audio: Option<u32>,
+    pub subtitle: Option<u32>,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SelectionRefusal {
+    UnknownTrack,
+    ComponentUnavailable,
+    ConflictingPins,
+    UnsupportedSubtitle,
+}
+
+pub fn preparation_selection(
+    requested: &PreparationSelection,
+    streams: &[PreparationStream],
+    components: &[crate::components::Component],
+    version: &str,
+    file: &str,
+    revision: &str,
+) -> Result<SelectedStreams, SelectionRefusal> {
+    use crate::components::{Kind, SubtitleOccurrence, embedded_track, subtitle_occurrence};
+    let ordinal = |kind: &str, index| {
+        streams
+            .iter()
+            .filter(|t| t.kind == kind)
+            .position(|t| t.index == index)
+            .map(|n| n as u32)
+    };
+    let pin = |id: &Option<String>,
+               prefix: char,
+               kind: &str|
+     -> Result<Option<u32>, SelectionRefusal> {
+        id.as_ref()
+            .map(|id| {
+                id.strip_prefix(prefix)
+                    .and_then(|n| n.parse::<u32>().ok())
+                    .filter(|n| (*n as usize) < streams.iter().filter(|t| t.kind == kind).count())
+                    .ok_or(SelectionRefusal::UnknownTrack)
+            })
+            .transpose()
+    };
+    let audio_track = pin(&requested.audio_track, 'a', "audio")?;
+    let audio_component = requested
+        .audio_component
+        .as_ref()
+        .map(|id| {
+            embedded_track(components, id, Kind::Audio, version, file, revision)
+                .and_then(|index| ordinal("audio", index))
+                .ok_or(SelectionRefusal::ComponentUnavailable)
+        })
+        .transpose()?;
+    if audio_track
+        .zip(audio_component)
+        .is_some_and(|(a, b)| a != b)
+    {
+        return Err(SelectionRefusal::ConflictingPins);
+    }
+    let subtitle_track = pin(&requested.subtitle_track, 's', "subtitle")?;
+    let subtitle_component = requested
+        .subtitle_component
+        .as_ref()
+        .map(
+            |id| match subtitle_occurrence(components, id, version, file, revision) {
+                Some(SubtitleOccurrence::Embedded(index)) => {
+                    ordinal("subtitle", index).ok_or(SelectionRefusal::ComponentUnavailable)
+                }
+                Some(SubtitleOccurrence::Sidecar(_)) => Err(SelectionRefusal::UnsupportedSubtitle),
+                None => Err(SelectionRefusal::ComponentUnavailable),
+            },
+        )
+        .transpose()?;
+    if subtitle_track
+        .zip(subtitle_component)
+        .is_some_and(|(a, b)| a != b)
+    {
+        return Err(SelectionRefusal::ConflictingPins);
+    }
+    let subtitle = subtitle_track.or(subtitle_component);
+    if subtitle.is_some_and(|n| {
+        !streams
+            .iter()
+            .filter(|t| t.kind == "subtitle")
+            .nth(n as usize)
+            .is_some_and(|t| crate::delivery::sidecar_subtitle(&t.codec))
+    }) {
+        return Err(SelectionRefusal::UnsupportedSubtitle);
+    }
+    Ok(SelectedStreams {
+        audio: audio_track.or(audio_component),
+        subtitle,
+    })
+}
+
+/// Encoder profile bounds shared by legacy and v2 submission. Argument spelling
+/// and probing remain adapter mechanics, not separate eligibility authorities.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VideoProfileFacts {
+    pub version: u32,
+    pub max_width: u32,
+    pub max_height: u32,
+    pub video_bitrate: u64,
+    pub audio_bitrate: u64,
+    pub frame_rate: Option<(u32, u32)>,
+}
+impl VideoProfileFacts {
+    pub fn valid(&self) -> bool {
+        self.version == 1
+            && (128..=3840).contains(&self.max_width)
+            && (72..=2160).contains(&self.max_height)
+            && self.max_width.is_multiple_of(2)
+            && self.max_height.is_multiple_of(2)
+            && (64_000..=80_000_000).contains(&self.video_bitrate)
+            && (32_000..=320_000).contains(&self.audio_bitrate)
+            && self.frame_rate.is_none_or(|(n, d)| {
+                n > 0
+                    && d > 0
+                    && n <= 120_000
+                    && d <= 100_000
+                    && (1.0..=120.0).contains(&(f64::from(n) / f64::from(d)))
+            })
+    }
+    pub fn admits_duration(&self, duration: f64) -> bool {
+        duration.is_finite()
+            && duration > 0.0
+            && self.frame_rate.is_none_or(|(n, d)| {
+                n > 0 && d > 0 && duration * (f64::from(n) / f64::from(d)) >= 0.5
+            })
+    }
+}
+
+/// The legacy fixed 720p recipe historically admits unprobed input; its encoder
+/// validates the actual output. The preparation API promises probe-qualified
+/// video before admission. Preserve this API compatibility difference explicitly.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SourceContract {
+    Legacy,
+    Preparation,
+}
+pub fn source_observation_required(contract: SourceContract, recipe: &str) -> bool {
+    recipe == "video_profile" || (contract == SourceContract::Preparation && recipe == "h264720p")
+}
+
+pub fn video_source_eligible(
+    contract: SourceContract,
+    recipe: &str,
+    video: Option<(Option<u32>, Option<u32>, Option<&str>)>,
+) -> bool {
+    !source_observation_required(contract, recipe)
+        || video.is_some_and(|(width, height, transfer)| {
+            width.is_some()
+                && height.is_some()
+                && !matches!(transfer, Some("smpte2084" | "arib-std-b67"))
+        })
+}
+
+/// Preserve fixed recipe receipts while binding every parameterized encoder
+/// input. `semantics` is the versioned adapter descriptor for actual FFmpeg
+/// arguments/validation; changing that contract must change its digest.
+pub fn recipe_identity(
+    id: &str,
+    semantics: &str,
+    backend: &str,
+    profile: Option<serde_json::Value>,
+    subtitle: bool,
+) -> Option<String> {
+    use sha2::{Digest, Sha256};
+    if profile.is_none() && backend == "software" && id != "video_profile" && !subtitle {
+        return Some(semantics.to_owned());
+    }
+    if (id == "video_profile") != profile.is_some() {
+        return None;
+    }
+    let mut inputs =
+        serde_json::json!({"semantics": semantics,"backend":backend,"video_profile":profile});
+    if subtitle {
+        inputs["subtitle"] = serde_json::json!("selected-text-mov_text");
+    }
+    Some(format!(
+        "sha256:{:x}",
+        Sha256::digest(serde_json::to_vec(&inputs).ok()?)
+    ))
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct State {
     pub job: Job,
@@ -265,6 +499,119 @@ pub fn queue_admits(active_jobs: i64) -> bool {
     active_jobs < 100
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RetryRefusal {
+    StaleRevision,
+    NotRetryable,
+    QueueFull,
+}
+
+/// Plan a processing retry from observations held under the writer boundary.
+/// Exact receipt replay and authorization precede this decision. The adapter
+/// must reserve the writer before counting active jobs and retain it through
+/// the phase update and any receipt write.
+pub fn retry(
+    job: &crate::jobs::Job,
+    revisions: Option<(u64, u64)>,
+    active_jobs: i64,
+) -> Result<crate::jobs::Job, RetryRefusal> {
+    if let Some((current, reviewed)) = revisions {
+        crate::jobs::admit_retry(job, current, reviewed).map_err(|reason| match reason {
+            crate::jobs::RetryRefusal::StaleRevision => RetryRefusal::StaleRevision,
+            crate::jobs::RetryRefusal::NotRetryable => RetryRefusal::NotRetryable,
+        })?;
+    } else if !job.retryable() {
+        return Err(RetryRefusal::NotRetryable);
+    }
+    if !queue_admits(active_jobs) {
+        return Err(RetryRefusal::QueueFull);
+    }
+    Ok(crate::jobs::transition(job, crate::jobs::Input::Retry).0)
+}
+
+#[cfg(test)]
+mod retry_tests {
+    use super::*;
+
+    #[test]
+    fn retry_checks_revision_phase_attempt_and_capacity_in_order() {
+        let job = Job {
+            phase: jobs::Phase::Failed,
+            attempt: 2,
+        };
+        assert_eq!(
+            retry(&job, Some((3, 2)), 100),
+            Err(RetryRefusal::StaleRevision)
+        );
+        assert_eq!(retry(&job, Some((3, 3)), 100), Err(RetryRefusal::QueueFull));
+        assert_eq!(
+            retry(&job, None, 99),
+            Ok(Job {
+                phase: jobs::Phase::Queued,
+                attempt: 2
+            })
+        );
+        let exhausted = Job {
+            attempt: u32::MAX,
+            ..job.clone()
+        };
+        assert_eq!(retry(&exhausted, None, 0), Err(RetryRefusal::NotRetryable));
+        let queued = Job {
+            phase: jobs::Phase::Queued,
+            ..job
+        };
+        assert_eq!(retry(&queued, None, 0), Err(RetryRefusal::NotRetryable));
+    }
+}
+
+/// Candidate original-version binding and the authoritative facts needed to
+/// decide whether it is the requested whole-file timeline binding.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct WholeBinding {
+    pub version: String,
+    pub timeline: String,
+    pub file: String,
+    pub file_revision: String,
+    pub origin: String,
+    pub file_edition: String,
+    pub timeline_edition: String,
+    pub part: i64,
+    pub start_ms: Option<i64>,
+    pub end_ms: Option<i64>,
+    pub part_count: i64,
+}
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct BindingEvidence {
+    pub timeline: String,
+    pub file: String,
+    pub revision: String,
+    pub candidates: Vec<WholeBinding>,
+}
+impl BindingEvidence {
+    fn whole(b: &WholeBinding) -> bool {
+        b.start_ms.is_none() && b.end_ms.is_none() && b.part_count == 1
+    }
+    fn same_file(&self, b: &WholeBinding) -> bool {
+        b.timeline == self.timeline && b.file == self.file && b.file_revision == self.revision
+    }
+    /// Preparation accepts any whole original version owned by the timeline's edition.
+    pub fn is_current(&self) -> bool {
+        self.candidates.iter().any(|b| {
+            self.same_file(b)
+                && Self::whole(b)
+                && b.origin == "original"
+                && b.file_edition == b.timeline_edition
+        })
+    }
+    /// Downloads pin a particular version and its first (only) part; generated
+    /// versions are permitted and their rendition is checked separately.
+    pub fn matches_download(&self, version: &str) -> bool {
+        self.candidates
+            .iter()
+            .any(|b| self.same_file(b) && Self::whole(b) && b.version == version && b.part == 1)
+    }
+}
+
 /// Current observations for a preparation's publication. Adapters must observe
 /// these in the same write transaction that acknowledges publication.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -272,7 +619,7 @@ pub struct PreparationFacts {
     pub requester_authorized: bool,
     pub source_enabled: bool,
     pub source_in_scope: bool,
-    pub exact_whole_timeline_binding: bool,
+    pub binding: BindingEvidence,
     pub recipe_unchanged: bool,
 }
 impl PreparationFacts {
@@ -283,7 +630,7 @@ impl PreparationFacts {
         if !self.source_enabled || !self.source_in_scope {
             return Err("preparation_source_unavailable");
         }
-        if !self.exact_whole_timeline_binding {
+        if !self.binding.is_current() {
             return Err("preparation_timeline_changed");
         }
         if !self.recipe_unchanged {
@@ -297,7 +644,7 @@ pub struct RenditionFacts {
     pub expired: bool,
     pub phase: jobs::Phase,
     pub source_current: bool,
-    pub binding_current: bool,
+    pub binding: BindingEvidence,
     pub output_current: bool,
 }
 pub fn rendition_status(facts: &RenditionFacts) -> &'static str {
@@ -305,7 +652,7 @@ pub fn rendition_status(facts: &RenditionFacts) -> &'static str {
         "expired"
     } else if matches!(facts.phase, jobs::Phase::Failed | jobs::Phase::Cancelled) {
         "failed"
-    } else if !facts.source_current || !facts.binding_current {
+    } else if !facts.source_current || !facts.binding.is_current() {
         "stale"
     } else if facts.phase == jobs::Phase::Completed {
         if facts.output_current {
@@ -333,6 +680,53 @@ pub fn finish_preparation(
 #[cfg(test)]
 mod preparation_tests {
     use super::*;
+    fn test_binding(valid: bool) -> BindingEvidence {
+        BindingEvidence {
+            timeline: "t".into(),
+            file: "f".into(),
+            revision: "r".into(),
+            candidates: if valid {
+                vec![WholeBinding {
+                    version: "v".into(),
+                    timeline: "t".into(),
+                    file: "f".into(),
+                    file_revision: "r".into(),
+                    origin: "original".into(),
+                    file_edition: "e".into(),
+                    timeline_edition: "e".into(),
+                    part: 1,
+                    start_ms: None,
+                    end_ms: None,
+                    part_count: 1,
+                }]
+            } else {
+                vec![]
+            },
+        }
+    }
+    #[test]
+    fn exact_binding_checks_all_identity_and_whole_file_facts() {
+        let valid = test_binding(true);
+        assert!(valid.is_current());
+        for variant in 0..8 {
+            let mut evidence = valid.clone();
+            let candidate = &mut evidence.candidates[0];
+            match variant {
+                0 => candidate.timeline = "other".into(),
+                1 => candidate.file = "other".into(),
+                2 => candidate.file_revision = "stale".into(),
+                3 => candidate.origin = "generated".into(),
+                4 => candidate.file_edition = "other".into(),
+                5 => candidate.start_ms = Some(0),
+                6 => candidate.end_ms = Some(10),
+                _ => candidate.part_count = 2,
+            }
+            assert!(!evidence.is_current(), "variant {variant}");
+            evidence.candidates.push(valid.candidates[0].clone());
+            assert!(evidence.is_current(), "a later valid candidate must count");
+        }
+    }
+
     #[test]
     fn a_kept_subtitle_is_explicit_and_required() {
         assert_eq!(kept_subtitle("off", false), Ok(()));
@@ -420,7 +814,7 @@ mod preparation_tests {
                 requester_authorized: mask & 1 != 0,
                 source_enabled: mask & 2 != 0,
                 source_in_scope: mask & 4 != 0,
-                exact_whole_timeline_binding: mask & 8 != 0,
+                binding: test_binding(mask & 8 != 0),
                 recipe_unchanged: mask & 16 != 0,
             };
             for phase in [
@@ -467,11 +861,199 @@ mod preparation_tests {
                     expired: false,
                     phase: jobs::Phase::Completed,
                     source_current: bits & 1 != 0,
-                    binding_current: bits & 2 != 0,
+                    binding: test_binding(bits & 2 != 0),
                     output_current: bits & 4 != 0
                 }),
                 if bits == 7 { "ready" } else { "stale" }
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod preparation_policy_tests {
+    use super::*;
+    #[test]
+    fn recovery_facts_preserve_sources_and_release_only_proven_software_capacity() {
+        for generated in [false, true] {
+            for managed in [false, true] {
+                for same in [false, true] {
+                    assert_eq!(
+                        restored_output_unavailable(
+                            generated,
+                            managed,
+                            "old",
+                            if same { "old" } else { "new" }
+                        ),
+                        generated && managed && !same
+                    );
+                }
+            }
+        }
+        for phase in [
+            crate::jobs::Phase::Queued,
+            crate::jobs::Phase::Running,
+            crate::jobs::Phase::Completed,
+            crate::jobs::Phase::Failed,
+        ] {
+            for generated in [false, true] {
+                for available in [false, true] {
+                    assert_eq!(
+                        restored_receipt_expired(phase, generated, available),
+                        phase == crate::jobs::Phase::Completed && generated && !available
+                    );
+                }
+            }
+        }
+        assert!(!recovered_hardware_required(Some("software")));
+        for backend in [None, Some("videotoolbox"), Some("unknown")] {
+            assert!(recovered_hardware_required(backend));
+        }
+        assert!(video_source_eligible(
+            SourceContract::Legacy,
+            "h264720p",
+            None
+        ));
+        assert!(!video_source_eligible(
+            SourceContract::Preparation,
+            "h264720p",
+            None
+        ));
+        assert!(!video_source_eligible(
+            SourceContract::Legacy,
+            "video_profile",
+            None
+        ));
+    }
+    #[test]
+    fn profiles_backends_and_source_bounds_are_shared() {
+        let profile = VideoProfileFacts {
+            version: 1,
+            max_width: 1280,
+            max_height: 720,
+            video_bitrate: 2_000_000,
+            audio_bitrate: 128_000,
+            frame_rate: Some((24, 1)),
+        };
+        assert!(profile.valid());
+        assert!(!profile.admits_duration(f64::NAN));
+        assert!(!profile.admits_duration(0.01));
+        assert!(profile.admits_duration(0.5 / 24.0));
+        for width in [0, 127, 129, 3841, 3842] {
+            assert!(
+                !VideoProfileFacts {
+                    max_width: width,
+                    ..profile.clone()
+                }
+                .valid()
+            );
+        }
+        for rate in [(0, 1), (1, 0), (121, 1), (120001, 100000), (1, 2)] {
+            assert!(
+                !VideoProfileFacts {
+                    frame_rate: Some(rate),
+                    ..profile.clone()
+                }
+                .valid()
+            );
+        }
+        for recipe in [
+            "remux_mp4",
+            "audio_aac",
+            "h264720p",
+            "video_profile",
+            "unknown",
+        ] {
+            assert_eq!(
+                backend_allowed(recipe, "software", false),
+                recipe != "unknown"
+            );
+            assert_eq!(
+                backend_allowed(recipe, "videotoolbox", true),
+                matches!(recipe, "h264720p" | "video_profile")
+            );
+            assert!(!backend_allowed(recipe, "videotoolbox", false));
+            for transfer in [None, Some("bt709"), Some("smpte2084"), Some("arib-std-b67")] {
+                let expected = !matches!(recipe, "h264720p" | "video_profile")
+                    || !matches!(transfer, Some("smpte2084" | "arib-std-b67"));
+                assert_eq!(
+                    video_source_eligible(
+                        SourceContract::Preparation,
+                        recipe,
+                        Some((Some(1280), Some(720), transfer))
+                    ),
+                    expected
+                );
+            }
+        }
+    }
+    #[test]
+    fn recipe_identity_binds_all_encoder_inputs_and_preserves_legacy_receipts() {
+        let base = "sha256:historical";
+        assert_eq!(
+            recipe_identity("remux_mp4", base, "software", None, false),
+            Some(base.into())
+        );
+        let original = serde_json::json!({"version":1,"codec":"h264","max_width":1280,"max_height":720,"video_bitrate":2_000_000,"audio_bitrate":128_000,"frame_rate":null});
+        let digest = recipe_identity(
+            "video_profile",
+            base,
+            "software",
+            Some(original.clone()),
+            false,
+        )
+        .unwrap();
+        for (field, value) in [
+            ("codec", serde_json::json!("hevc")),
+            ("max_width", serde_json::json!(1920)),
+            ("max_height", serde_json::json!(1080)),
+            ("video_bitrate", serde_json::json!(4_000_000)),
+            ("audio_bitrate", serde_json::json!(192_000)),
+            (
+                "frame_rate",
+                serde_json::json!({"numerator":24,"denominator":1}),
+            ),
+        ] {
+            let mut changed = original.clone();
+            changed[field] = value;
+            assert_ne!(
+                recipe_identity("video_profile", base, "software", Some(changed), false).unwrap(),
+                digest
+            );
+        }
+        assert_ne!(
+            recipe_identity(
+                "video_profile",
+                base,
+                "videotoolbox",
+                Some(original.clone()),
+                false
+            )
+            .unwrap(),
+            digest
+        );
+        assert_ne!(
+            recipe_identity(
+                "video_profile",
+                base,
+                "software",
+                Some(original.clone()),
+                true
+            )
+            .unwrap(),
+            digest
+        );
+        assert_ne!(
+            recipe_identity(
+                "video_profile",
+                "new semantics",
+                "software",
+                Some(original),
+                false
+            )
+            .unwrap(),
+            digest
+        );
+        assert!(recipe_identity("video_profile", base, "software", None, false).is_none());
     }
 }

@@ -14,6 +14,64 @@ struct Fixture {
     dir: tempfile::TempDir,
     app: App,
 }
+
+#[tokio::test]
+async fn exact_root_registration_reuses_identity_and_rejects_changed_storage() {
+    let f = Fixture::new().await;
+    let root = f.root("identity");
+    let candidate = administration::candidate_root(&f.app, root.clone())
+        .await
+        .unwrap();
+    let first = libraries::register_source(&f.app, candidate, "First", &[])
+        .await
+        .unwrap();
+    let candidate = administration::candidate_root(&f.app, root.clone())
+        .await
+        .unwrap();
+    let reused = libraries::register_source(&f.app, candidate, "Other name", &[])
+        .await
+        .unwrap();
+    assert_eq!(reused.id, first.id);
+    let candidate = administration::candidate_root(&f.app, root.clone())
+        .await
+        .unwrap();
+    let configured = administration::register_root(&f.app, candidate, Some("Configured"))
+        .await
+        .unwrap();
+    assert_eq!(configured.id, first.id);
+    let legacy = db::add_library(&f.app.db, "Legacy", &root).await.unwrap();
+    assert_eq!(legacy.id, first.id);
+    sqlx::query("UPDATE libraries SET root_identity='different-device' WHERE id=?")
+        .bind(&first.id)
+        .execute(&f.app.db)
+        .await
+        .unwrap();
+    let candidate = administration::candidate_root(&f.app, root.clone())
+        .await
+        .unwrap();
+    assert!(
+        libraries::register_source(&f.app, candidate, "Again", &[])
+            .await
+            .is_err()
+    );
+    let candidate = administration::candidate_root(&f.app, root.clone())
+        .await
+        .unwrap();
+    assert!(
+        administration::register_root(&f.app, candidate, Some("Configured"))
+            .await
+            .is_err()
+    );
+    assert!(db::add_library(&f.app.db, "Legacy", &root).await.is_err());
+    let rows: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM libraries WHERE id=? AND root_identity='different-device'",
+    )
+    .bind(&first.id)
+    .fetch_one(&f.app.db)
+    .await
+    .unwrap();
+    assert_eq!(rows, 1);
+}
 impl Fixture {
     async fn new() -> Self {
         let dir = tempfile::tempdir().unwrap();

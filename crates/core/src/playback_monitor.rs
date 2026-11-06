@@ -396,6 +396,26 @@ pub fn attribute<'a>(
     }
 }
 
+/// The timeline's explicitly recorded current session outranks newer rows.
+/// Among equal authority, use update time, revision, then exact ID. Signed
+/// observations preserve SQLite's ordering, including legacy malformed rows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ViewingAuthority<'a> {
+    pub current: bool,
+    pub updated_at: i64,
+    pub revision: i64,
+    pub id: &'a str,
+}
+
+pub fn prefer_viewing(candidate: ViewingAuthority<'_>, prior: ViewingAuthority<'_>) -> bool {
+    (
+        candidate.current,
+        candidate.updated_at,
+        candidate.revision,
+        candidate.id,
+    ) > (prior.current, prior.updated_at, prior.revision, prior.id)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

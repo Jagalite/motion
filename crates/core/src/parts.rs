@@ -170,6 +170,51 @@ pub fn joinable_subtitle(codecs: &[Option<&str>]) -> bool {
             .all(|c| c.is_some_and(crate::delivery::sidecar_subtitle))
 }
 
+/// Preserve the distinction between an absent interval endpoint and a corrupt
+/// negative stored endpoint. Adapters supply signed database observations.
+pub fn observed_part(
+    part: i64,
+    duration_ms: Option<u64>,
+    start_ms: Option<i64>,
+    end_ms: Option<i64>,
+) -> Result<BoundPart, &'static str> {
+    Ok(BoundPart {
+        part: u32::try_from(part).map_err(|_| "invalid_part")?,
+        file_duration_ms: duration_ms,
+        start_ms: start_ms
+            .map(u64::try_from)
+            .transpose()
+            .map_err(|_| "invalid_interval")?,
+        end_ms: end_ms
+            .map(u64::try_from)
+            .transpose()
+            .map_err(|_| "invalid_interval")?,
+    })
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BurnLayout {
+    Off,
+    Bitmap(u32),
+    Text,
+}
+/// A multipart burn pins one bitmap occurrence in every file; the first
+/// occurrence must be exactly the global selection. Text/libass is single-file.
+pub fn burn_layout(parts: &[PartPin], selected: BurnLayout, first_codec: Option<&str>) -> bool {
+    if parts.is_empty() {
+        return true;
+    }
+    match selected {
+        BurnLayout::Off => parts.iter().all(|p| p.burn.is_none()),
+        BurnLayout::Text => false,
+        BurnLayout::Bitmap(index) => {
+            parts.iter().all(|p| p.burn.is_some())
+                && parts[0].burn == Some(index)
+                && first_codec.is_some_and(crate::delivery::burnable_subtitle)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

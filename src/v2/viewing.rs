@@ -528,22 +528,53 @@ pub async fn next_timeline(
             .await?;
     let mut values = Vec::new();
     if let Some((Some(group), Some(position))) = placed {
-        let candidates: Vec<String> = sqlx::query_scalar(
-            // The group is one release (PR #4: order_groups.edition_id is the
-            // series release); its members are episode timelines of other
-            // works, so they are not constrained to the current edition row.
-            "SELECT id FROM timelines WHERE order_group_id=? AND order_position>? ORDER BY order_position,id LIMIT 50",
-        )
-        .bind(&group)
-        .bind(position)
-        .fetch_all(&mut *tx)
-        .await?;
-        for id in candidates {
-            let Ok(row) = readable_timeline(&mut tx, &caller.principal, &id).await else {
-                continue;
-            };
-            values.push((id, catalog::timeline_body(&mut tx, &scope, row).await?));
-            break;
+        // Keep the snapshot transaction open across pages. Keyset pagination
+        // is bounded in memory, but does not confuse a hidden page with the
+        // end of the release order.
+        let mut after_position = position;
+        let mut after_id = String::new();
+        loop {
+            let candidates: Vec<(String, i64)> = sqlx::query_as(
+                "SELECT id,order_position FROM timelines WHERE order_group_id=? AND order_position>? AND (order_position>? OR (order_position=? AND id>?)) ORDER BY order_position,id LIMIT 50",
+            )
+            .bind(&group)
+            .bind(position)
+            .bind(after_position)
+            .bind(after_position)
+            .bind(&after_id)
+            .fetch_all(&mut *tx)
+            .await?;
+            let complete = candidates.len() < 50;
+            let mut observations = Vec::with_capacity(candidates.len());
+            let mut found = None;
+            for (id, _) in &candidates {
+                let row = match readable_timeline(&mut tx, &caller.principal, id).await {
+                    Ok(row) => Some(row),
+                    Err(p) if p.status == StatusCode::NOT_FOUND => None,
+                    Err(p) => return Err(p),
+                };
+                observations.push(core::NextCandidate {
+                    timeline: id.clone(),
+                    readable: row.is_some(),
+                });
+                if row.is_some() {
+                    found = row;
+                    break;
+                }
+            }
+            match core::next_timeline(&observations, complete) {
+                core::NextTimeline::Found(id) => {
+                    let row = found.expect("core selects the observed readable timeline");
+                    values.push((id, catalog::timeline_body(&mut tx, &scope, row).await?));
+                    break;
+                }
+                core::NextTimeline::Exhausted => break,
+                core::NextTimeline::NeedMore => {
+                    let (id, position) = candidates.last().expect("an incomplete page is full");
+                    after_id.clone_from(id);
+                    after_position = *position;
+                }
+            }
         }
     }
     let value = page(&mut tx, &caller.principal, values, 1).await?;
@@ -553,15 +584,15 @@ pub async fn next_timeline(
 
 // --------------------------------------------------------- viewing sessions
 
-/// A live, unfenced v2 delivery and its owner.
-fn open_delivery(app: &App, id: &str) -> Option<(session_core::Owner, Option<u64>)> {
-    let owner = delivery::live_owner(app, id)?;
-    let view = delivery::live_view(app, id)?;
-    let fenced = matches!(
-        view.status.as_str(),
-        "closing" | "closed" | "failed" | "interrupted"
-    );
-    (!fenced).then_some((owner, view.logical_duration_ms))
+fn viewing_admission_error(error: session_core::ViewingAdmissionError) -> Problem {
+    match error {
+        session_core::ViewingAdmissionError::Unavailable => Problem::not_found(),
+        session_core::ViewingAdmissionError::DifferentContext => Problem::new(
+            StatusCode::CONFLICT,
+            "delivery_mismatch",
+            "The delivery presents another profile or timeline; create a new session",
+        ),
+    }
 }
 
 #[derive(Deserialize)]
@@ -626,12 +657,13 @@ pub async fn create_viewing(
         recordable(&mut tx, &principal, &id).await?;
         return Ok(replayed(stored));
     }
-    let (owner, duration) =
-        open_delivery(&app, &input.delivery_id).ok_or_else(Problem::not_found)?;
-    let facts = file_facts(&mut tx, &owner.file).await?;
-    if !session_core::may_view(&owner, &principal, facts.as_ref()) {
-        return Err(Problem::not_found());
-    }
+    let observation =
+        delivery::live_viewing(&app, &input.delivery_id).ok_or_else(Problem::not_found)?;
+    let facts = file_facts(&mut tx, &observation.owner.file).await?;
+    session_core::admit_viewing_delivery(&observation, &principal, facts.as_ref(), None)
+        .map_err(viewing_admission_error)?;
+    let owner = observation.owner;
+    let duration = observation.duration_ms;
     admit_view(&mut tx, &principal, &owner.profile, &owner.timeline).await?;
     let view = load_view(&mut tx, &owner.profile, &owner.timeline).await?;
     let started = core::start(
@@ -841,18 +873,16 @@ pub async fn replace_viewing_delivery(
         .await?;
     require_history_identity(&mut tx, &headers).await?;
     let row = recordable(&mut tx, &principal, &id).await?;
-    let (owner, duration) = open_delivery(&app, &delivery_id).ok_or_else(Problem::not_found)?;
-    let facts = file_facts(&mut tx, &owner.file).await?;
-    if !session_core::may_view(&owner, &principal, facts.as_ref()) {
-        return Err(Problem::not_found());
-    }
-    if owner.profile != row.profile || owner.timeline != row.timeline {
-        return Err(Problem::new(
-            StatusCode::CONFLICT,
-            "delivery_mismatch",
-            "The delivery presents another profile or timeline; create a new session",
-        ));
-    }
+    let observation = delivery::live_viewing(&app, &delivery_id).ok_or_else(Problem::not_found)?;
+    let facts = file_facts(&mut tx, &observation.owner.file).await?;
+    session_core::admit_viewing_delivery(
+        &observation,
+        &principal,
+        facts.as_ref(),
+        Some((&row.profile, &row.timeline)),
+    )
+    .map_err(viewing_admission_error)?;
+    let duration = observation.duration_ms;
     let view = load_view(&mut tx, &row.profile, &row.timeline).await?;
     let session = core::rebind(&view, &row.session, expected, delivery_id, duration)?;
     update_session(&mut tx, &row.session, &session).await?;

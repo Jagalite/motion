@@ -391,16 +391,36 @@ pub async fn register_root(
     // Source, paired library and membership commit together; an existing
     // registration is returned unchanged so restarts never undo library edits.
     let mut tx = db::begin_write(&app.db).await?;
-    let existing: Option<(String, String, String)> =
-        sqlx::query_as("SELECT id,name,root_identity FROM libraries WHERE root=?")
+    let existing: Option<(String, String, String, bool)> =
+        sqlx::query_as("SELECT id,name,root_identity,managed FROM libraries WHERE root=?")
             .bind(&candidate.root)
             .fetch_optional(&mut *tx)
             .await?;
-    if let Some((id, name, identity)) = existing {
-        anyhow::ensure!(
-            identity == candidate.identity,
-            "library root identity changed"
-        );
+    use playscale_core::sources::{self, ExistingRoot, OwnershipRequirement, Registration};
+    let observed = existing
+        .as_ref()
+        .map(|(id, _, identity, managed)| ExistingRoot {
+            id,
+            identity,
+            managed: *managed,
+        });
+    let decision = sources::registration(
+        &candidate.identity,
+        OwnershipRequirement::ExistingKind,
+        observed,
+    );
+    if decision == Registration::RelocationRequired {
+        anyhow::bail!("library root identity changed");
+    }
+    if decision == Registration::OwnershipConflict {
+        anyhow::bail!("library storage ownership changed");
+    }
+    if let Registration::Reuse { id } = decision {
+        let name = existing
+            .as_ref()
+            .expect("reuse has an existing source")
+            .1
+            .clone();
         // A source registered without a library (v2) gains its paired library
         // once; an existing library definition is never modified.
         let paired: i64 = sqlx::query_scalar("SELECT count(*) FROM catalog_libraries WHERE id=?")

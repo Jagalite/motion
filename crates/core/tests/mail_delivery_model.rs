@@ -4,7 +4,8 @@
 //! message returned by core; it does not prove SQLite atomicity or SMTP/DNS
 //! conformance, which the adapter and API tests exercise separately.
 use playscale_core::mail::{
-    self as core, Current, Decision, Error, Message, Mode, Observation, Phase, Purpose, Stage,
+    self as core, Current, Decision, Error, Message, Mode, Observation, PayloadAvailability, Phase,
+    Purpose, Stage,
 };
 use stateless::{Check, Enumerate, Model, ModelError, ModelMetadata, Transition, TransitionRef};
 
@@ -90,6 +91,7 @@ enum Input {
     ConfigChanged,
     EpochChanged,
     Disabled,
+    LosePayload,
     At(i64),
 }
 
@@ -123,8 +125,8 @@ impl Model for Delivery {
     fn metadata(&self) -> ModelMetadata {
         ModelMetadata {
             name: "motion.mail.delivery".into(),
-            model_version: 1,
-            properties_version: 1,
+            model_version: 2,
+            properties_version: 2,
             codec_version: 1,
             build: include_str!("../src/mail.rs").into(),
         }
@@ -153,7 +155,12 @@ impl Model for Delivery {
         let effect = match input {
             Input::Claim(w) => {
                 let token = format!("w{w}-{}", s.claims + 1);
-                match core::claim(&s.message, &s.current(), &token) {
+                let availability = if s.payload {
+                    PayloadAvailability::Available
+                } else {
+                    PayloadAvailability::Unavailable
+                };
+                match core::claim_with_payload(&s.message, &s.current(), &token, availability) {
                     Decision::Attempt(m) => {
                         let attempt = m.attempts;
                         next.message = m;
@@ -165,6 +172,11 @@ impl Model for Delivery {
                         Effect::Attempt { attempt }
                     }
                     Decision::Finish(m) => {
+                        let phase = m.phase;
+                        next.message = m;
+                        Effect::Finished(phase)
+                    }
+                    Decision::PayloadUnavailable(m) => {
                         let phase = m.phase;
                         next.message = m;
                         Effect::Finished(phase)
@@ -221,6 +233,10 @@ impl Model for Delivery {
             }
             Input::Disabled => {
                 next.disabled = true;
+                Effect::Observed
+            }
+            Input::LosePayload => {
+                next.payload = false;
                 Effect::Observed
             }
             Input::At(now) => {
@@ -332,6 +348,15 @@ impl Model for Delivery {
                 !b.ambiguous || a.ambiguous,
             ),
             check(
+                "mail.unavailable_payload_preserves_recovery_uncertainty",
+                !matches!(input, Input::Claim(_))
+                    || before.payload
+                    || !matches!(effect, Effect::Finished(Phase::Failed | Phase::Unknown))
+                    || (a.attempts == b.attempts
+                        && a.lease.is_none()
+                        && (!matches!(b.phase, Phase::Sending) || a.ambiguous)),
+            ),
+            check(
                 "mail.retry_waits_for_backoff",
                 !matches!(expected_record, Some(Phase::Queued))
                     || a.next_attempt == before.now + core::backoff(b.attempts),
@@ -381,6 +406,9 @@ impl Enumerate for Delivery {
         }
         if !s.disabled {
             inputs.push(Input::Disabled);
+        }
+        if s.payload && !s.message.phase.terminal() {
+            inputs.push(Input::LosePayload);
         }
         // Lease expiry, backoff boundaries and the message deadline.
         for now in [

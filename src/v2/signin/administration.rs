@@ -18,14 +18,21 @@ fn bounded(value: &str, min: usize, max: usize) -> Result<(), Problem> {
 }
 
 fn check_revision(actual: i64, expected: u64) -> Result<(), Problem> {
-    if actual < 1 || actual as u64 != expected {
+    if actual < 1 {
         return Err(AccessError::StaleRevision.into());
     }
+    playscale_core::access::revise(actual as u64, expected, false)?;
     Ok(())
 }
 
 fn next_revision(actual: i64) -> Result<i64, Problem> {
-    actual.checked_add(1).ok_or_else(unavailable)
+    let actual = u64::try_from(actual).map_err(|_| unavailable())?;
+    let playscale_core::access::Revised::Next(next) =
+        playscale_core::access::revise(actual, actual, true).map_err(|_| unavailable())?
+    else {
+        return Err(unavailable());
+    };
+    i64::try_from(next).map_err(|_| unavailable())
 }
 
 fn paged(mut items: Vec<Value>, limit: u32) -> Json<Value> {
@@ -273,7 +280,7 @@ pub async fn create_provider(
     let count: i64 = sqlx::query_scalar("SELECT count(*) FROM signin_providers")
         .fetch_one(&mut *tx)
         .await?;
-    if count >= 32 {
+    if !core::provider_capacity(count) {
         return Err(Problem::invalid(
             "provider_limit",
             "At most 32 providers are supported",
@@ -333,9 +340,52 @@ async fn preserve_methods(
     }
     let affected:Vec<String>=sqlx::query_scalar("SELECT DISTINCT i.user_id FROM signin_identities i JOIN access_users u ON u.id=i.user_id WHERE i.enabled=1 AND u.disabled=0 AND ((? IS NOT NULL AND i.provider_id=?) OR (? IS NOT NULL AND i.id=?) OR (? AND i.kind='email'))").bind(provider_id).bind(provider_id).bind(identity_id).bind(identity_id).bind(email).fetch_all(&mut *c).await?;
     for owner in affected {
-        let independent:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM devices d JOIN credentials c ON c.device_id=d.id AND c.kind='device' AND c.generation=d.generation WHERE d.user_id=? AND d.revoked=0 AND c.expires_at>? AND NOT EXISTS(SELECT 1 FROM signin_families f WHERE f.device_id=d.id))").bind(&owner).bind(now()).fetch_one(&mut *c).await?;
-        let remaining:i64=sqlx::query_scalar("SELECT count(*) FROM signin_identities i LEFT JOIN signin_providers p ON p.id=i.provider_id CROSS JOIN signin_settings s WHERE i.user_id=? AND i.enabled=1 AND (? IS NULL OR i.id!=?) AND (? IS NULL OR i.provider_id IS NULL OR i.provider_id!=?) AND NOT (? AND i.kind='email') AND ((i.kind='oidc' AND p.enabled=1) OR (i.kind='email' AND json_extract(s.email_json,'$.enabled')=1))").bind(&owner).bind(identity_id).bind(identity_id).bind(provider_id).bind(provider_id).bind(email).fetch_one(&mut *c).await?;
-        core::preserve_method(remaining as usize + usize::from(independent), false)?;
+        let observed_now = now();
+        let credentials = sqlx::query("SELECT d.user_id,d.revoked,d.generation AS device_generation,c.generation,c.kind,c.expires_at,EXISTS(SELECT 1 FROM signin_families f WHERE f.device_id=d.id) AS has_family FROM devices d JOIN credentials c ON c.device_id=d.id WHERE d.user_id=?")
+            .bind(&owner).fetch_all(&mut *c).await?;
+        let independent = credentials.iter().any(|row| {
+            core::independent_credential(
+                &core::RecoveryCredential {
+                    owner: row.get::<Option<&str>, _>("user_id"),
+                    revoked: row.get("revoked"),
+                    kind_is_device: row.get::<&str, _>("kind") == "device",
+                    generation: u64::try_from(row.get::<i64, _>("generation")).unwrap_or(0),
+                    device_generation: u64::try_from(row.get::<i64, _>("device_generation"))
+                        .unwrap_or(0),
+                    expires_at: row.get("expires_at"),
+                    has_browser_family: row.get("has_family"),
+                },
+                &owner,
+                observed_now,
+            )
+        });
+        let identities = sqlx::query("SELECT i.id,i.user_id,i.provider_id,i.kind,i.enabled,COALESCE(p.enabled,0) AS provider_enabled,COALESCE(json_extract(s.email_json,'$.enabled'),0) AS email_enabled FROM signin_identities i LEFT JOIN signin_providers p ON p.id=i.provider_id CROSS JOIN signin_settings s WHERE i.user_id=?")
+            .bind(&owner).fetch_all(&mut *c).await?;
+        let remaining = identities
+            .iter()
+            .filter(|row| {
+                core::independent_identity(
+                    &core::RecoveryIdentity {
+                        id: row.get("id"),
+                        owner: row.get("user_id"),
+                        provider: row.get("provider_id"),
+                        enabled: row.get("enabled"),
+                        kind: match row.get::<&str, _>("kind") {
+                            "oidc" => core::IdentityMethod::Oidc,
+                            "email" => core::IdentityMethod::Email,
+                            _ => core::IdentityMethod::Unknown,
+                        },
+                        provider_enabled: row.get("provider_enabled"),
+                        email_enabled: row.get("email_enabled"),
+                    },
+                    &owner,
+                    identity_id,
+                    provider_id,
+                    email,
+                )
+            })
+            .count();
+        core::preserve_method(remaining + usize::from(independent), false)?;
     }
     Ok(())
 }
@@ -355,8 +405,21 @@ async fn cancel_transactions(
     identity_id: Option<&str>,
     email: bool,
 ) -> Result<(), Problem> {
-    sqlx::query("UPDATE signin_transactions SET state_json=json_set(state_json,'$.phase','failed'),verifier=NULL,nonce=NULL,code_hash=NULL,result='method_changed' WHERE (? IS NOT NULL AND provider_id=?) OR (? IS NOT NULL AND identity_id=?) OR (? AND address IS NOT NULL)").bind(provider_id).bind(provider_id).bind(identity_id).bind(identity_id).bind(email).execute(&mut *c).await?;
-    sqlx::query("UPDATE signin_outbox SET payload=NULL,phase='cancelled' WHERE phase='queued' AND transaction_id IN (SELECT id FROM signin_transactions WHERE result='method_changed')").execute(c).await?;
+    let rows = sqlx::query("SELECT id,state_json FROM signin_transactions WHERE (? IS NOT NULL AND provider_id=?) OR (? IS NOT NULL AND identity_id=?) OR (? AND address IS NOT NULL)")
+        .bind(provider_id).bind(provider_id).bind(identity_id).bind(identity_id).bind(email).fetch_all(&mut *c).await?;
+    for row in rows {
+        let id: String = row.get("id");
+        let mut state: core::Transaction =
+            serde_json::from_str(row.get("state_json")).map_err(Problem::internal)?;
+        let next = core::invalidated_phase(state.phase, core::Invalidation::MethodChanged);
+        let invalidated = next != state.phase;
+        state.phase = next;
+        sqlx::query("UPDATE signin_transactions SET state_json=?,verifier=NULL,nonce=NULL,code_hash=NULL,result=CASE WHEN ? THEN 'method_changed' ELSE result END WHERE id=?")
+            .bind(serde_json::to_string(&state).map_err(Problem::internal)?).bind(invalidated).bind(&id).execute(&mut *c).await?;
+        // Terminal receipts are immutable, but queued code payloads are not
+        // historical authority and must still be withdrawn on method change.
+        outbox::cancel_owner(c, &id).await?;
+    }
     Ok(())
 }
 
@@ -396,7 +459,7 @@ pub async fn replace_provider(
         .bind(&id)
         .fetch_one(&mut *tx)
         .await?;
-        if linked {
+        if !core::issuer_edit_allowed(true, linked, false) {
             return Err(Problem::invalid(
                 "issuer_has_identities",
                 "Create a new provider to change an issuer with linked identities",
@@ -409,7 +472,7 @@ pub async fn replace_provider(
         .bind(&id)
         .fetch_one(&mut *tx)
         .await?;
-        if duplicate {
+        if !core::issuer_edit_allowed(true, false, duplicate) {
             return Err(Problem::new(
                 StatusCode::CONFLICT,
                 "issuer_exists",
@@ -417,29 +480,38 @@ pub async fn replace_provider(
             ));
         }
     }
-    if input.enabled
-        && (changed
-            || row.get::<Option<bool>, _>("test_ok") != Some(true)
-            || row.get::<Option<i64>, _>("login_test_at").is_none()
-            || hold(&mut tx).await?)
-    {
-        return Err(Problem::invalid(
+    let effects = core::change_method(&core::MethodChange {
+        kind: core::MethodKind::Provider,
+        enabled: row.get("enabled"),
+        requested_enabled: input.enabled,
+        configuration_changed: changed,
+        configuration_tested: row.get::<Option<bool>, _>("test_ok") == Some(true),
+        browser_tested: row.get::<Option<i64>, _>("login_test_at").is_some(),
+        restore_hold: hold(&mut tx).await?,
+        apply_untested: false,
+    })
+    .map_err(|_| {
+        Problem::invalid(
             "provider_test_required",
             "Save a disabled draft, pass configuration and browser tests, then enable it",
-        ));
-    }
-    if changed || input.enabled != row.get::<bool, _>("enabled") {
-        if !input.enabled && row.get::<bool, _>("enabled") {
+        )
+    })?;
+    if effects.update {
+        if effects.preserve_independent_method {
             preserve_methods(&mut tx, &caller, Some(&id), None, false).await?;
         }
-        let families = method_families(&mut tx, Some(&id), None, false).await?;
-        revoke_families(&mut tx, &families, &caller.principal.id).await?;
-        cancel_transactions(&mut tx, Some(&id), None, false).await?;
+        if effects.revoke_families {
+            let families = method_families(&mut tx, Some(&id), None, false).await?;
+            revoke_families(&mut tx, &families, &caller.principal.id).await?;
+        }
+        if effects.invalidate_transactions {
+            cancel_transactions(&mut tx, Some(&id), None, false).await?;
+        }
         let secret =
             input
                 .client_secret
                 .apply(&app, &format!("provider:{id}"), row.get("secret"))?;
-        sqlx::query("UPDATE signin_providers SET revision=?,name=?,issuer=?,client_id=?,destinations=?,secret=?,enabled=?,test_at=CASE WHEN ? THEN NULL ELSE test_at END,test_ok=CASE WHEN ? THEN NULL ELSE test_ok END,login_test_at=CASE WHEN ? THEN NULL ELSE login_test_at END WHERE id=?").bind(next_revision(revision)?).bind(input.name).bind(input.issuer).bind(input.client_id).bind(jsonstr(&input.destinations)).bind(secret).bind(input.enabled).bind(changed).bind(changed).bind(changed).bind(&id).execute(&mut *tx).await?;
+        sqlx::query("UPDATE signin_providers SET revision=?,name=?,issuer=?,client_id=?,destinations=?,secret=?,enabled=?,test_at=CASE WHEN ? THEN NULL ELSE test_at END,test_ok=CASE WHEN ? THEN NULL ELSE test_ok END,login_test_at=CASE WHEN ? THEN NULL ELSE login_test_at END WHERE id=?").bind(next_revision(revision)?).bind(input.name).bind(input.issuer).bind(input.client_id).bind(jsonstr(&input.destinations)).bind(secret).bind(input.enabled).bind(effects.erase_test_evidence).bind(effects.erase_test_evidence).bind(effects.erase_test_evidence).bind(&id).execute(&mut *tx).await?;
         audit(&mut tx, &caller.principal.id, &id, "provider.write", "ok").await?;
     }
     let row = sqlx::query("SELECT * FROM signin_providers WHERE id=?")
@@ -866,34 +938,35 @@ pub async fn replace_email(
         ));
     }
     let held = hold(&mut tx).await?;
-    let confirmed_change = old.enabled && changed && input.apply_untested && !held;
-    if config.enabled
-        && !confirmed_change
-        && (changed || row.get::<Option<bool>, _>("email_test_ok") != Some(true) || held)
-    {
-        return Err(Problem::invalid(
-            "email_test_required",
-            "Save disabled delivery settings and successfully send an explicit test before enabling email sign-in",
-        ));
-    }
+    let effects = core::change_method(&core::MethodChange {
+        kind: core::MethodKind::Email, enabled: old.enabled, requested_enabled: config.enabled,
+        configuration_changed: changed, configuration_tested: row.get::<Option<bool>, _>("email_test_ok") == Some(true),
+        browser_tested: false, restore_hold: held, apply_untested: input.apply_untested,
+    }).map_err(|_| Problem::invalid("email_test_required", "Save disabled delivery settings and successfully send an explicit test before enabling email sign-in"))?;
     let _ = from;
-    if changed || config.enabled != old.enabled {
-        if old.enabled && !config.enabled {
+    if effects.update {
+        if effects.preserve_independent_method {
             preserve_methods(&mut tx, &caller, None, None, true).await?;
         }
-        let families = method_families(&mut tx, None, None, true).await?;
-        revoke_families(&mut tx, &families, &caller.principal.id).await?;
-        cancel_transactions(&mut tx, None, None, true).await?;
-        super::outbox::cancel_all(&mut tx).await?;
+        if effects.revoke_families {
+            let families = method_families(&mut tx, None, None, true).await?;
+            revoke_families(&mut tx, &families, &caller.principal.id).await?;
+        }
+        if effects.invalidate_transactions {
+            cancel_transactions(&mut tx, None, None, true).await?;
+        }
+        if effects.cancel_all_queued_mail {
+            super::outbox::cancel_all(&mut tx).await?;
+        }
         sqlx::query("UPDATE signin_settings SET email_json=?,email_secret=?,dkim_secret=?,dkim_public=?,email_revision=?,revision=revision+1,email_test_at=CASE WHEN ? THEN NULL ELSE email_test_at END,email_test_ok=CASE WHEN ? THEN NULL ELSE email_test_ok END,email_receipt_at=CASE WHEN ? THEN NULL ELSE email_receipt_at END")
             .bind(jsonstr(&config))
             .bind(secret)
             .bind(dkim_secret)
             .bind(dkim_public)
             .bind(next_revision(revision)?)
-            .bind(changed)
-            .bind(changed)
-            .bind(changed)
+            .bind(effects.erase_test_evidence)
+            .bind(effects.erase_test_evidence)
+            .bind(effects.erase_test_evidence)
             .execute(&mut *tx)
             .await?;
         audit(&mut tx, &caller.principal.id, "email", "email.write", "ok").await?;
@@ -1031,33 +1104,49 @@ pub async fn confirm_email_test(
         .fetch_optional(&mut *tx)
         .await?
         .ok_or_else(Problem::not_found)?;
+    let observed_now = now();
     let attempts: i64 = row.get("attempts");
     let hash: Option<String> = row.get("code_hash");
-    if row.get::<i64, _>("expires_at") <= now() || attempts >= i64::from(core::CODE_ATTEMPTS) {
-        return Err(problem(core::Error::Expired));
-    }
-    let Some(hash) = hash else {
-        return Ok(Json(
-            json!({"confirmed": true, "confirmed_at": row.get::<Option<i64>,_>("confirmed_at")}),
-        ));
+    let confirmed_at: Option<i64> = row.get("confirmed_at");
+    let matches = hash.as_ref().is_some_and(|hash| {
+        body.value.code.len() == 8
+            && body.value.code.bytes().all(|b| b.is_ascii_digit())
+            && verify_keyed(&app, &format!("mail-test:{id}"), &body.value.code, hash)
+    });
+    let (next_attempts, confirmed) = match core::confirm_mail_test(
+        confirmed_at.is_some(),
+        hash.is_some(),
+        u32::try_from(attempts).unwrap_or(u32::MAX),
+        row.get("expires_at"),
+        observed_now,
+        matches,
+    ) {
+        core::TestConfirmationDecision::Replay => {
+            return Ok(Json(
+                json!({"confirmed": true, "confirmed_at": confirmed_at}),
+            ));
+        }
+        core::TestConfirmationDecision::Reject => return Err(problem(core::Error::Expired)),
+        core::TestConfirmationDecision::Record {
+            attempts,
+            confirmed,
+        } => (attempts, confirmed),
     };
-    let matches = body.value.code.len() == 8
-        && body.value.code.bytes().all(|b| b.is_ascii_digit())
-        && verify_keyed(&app, &format!("mail-test:{id}"), &body.value.code, &hash);
-    sqlx::query("UPDATE signin_mail_tests SET attempts=attempts+1,code_hash=CASE WHEN ? THEN NULL ELSE code_hash END,confirmed_at=CASE WHEN ? THEN ? ELSE confirmed_at END WHERE id=?")
-        .bind(matches)
-        .bind(matches)
-        .bind(now())
+    sqlx::query("UPDATE signin_mail_tests SET attempts=?,code_hash=CASE WHEN ? THEN NULL ELSE code_hash END,confirmed_at=CASE WHEN ? THEN ? ELSE confirmed_at END WHERE id=?")
+        .bind(i64::from(next_attempts))
+        .bind(confirmed)
+        .bind(confirmed)
+        .bind(observed_now)
         .bind(&id)
         .execute(&mut *tx)
         .await?;
-    if !matches {
+    if !confirmed {
         tx.commit().await?;
         return Err(problem(core::Error::InvalidCode));
     }
     // Receipt proves only this configuration revision.
     sqlx::query("UPDATE signin_settings SET email_receipt_at=? WHERE email_revision=?")
-        .bind(now())
+        .bind(observed_now)
         .bind(row.get::<i64, _>("config_revision"))
         .execute(&mut *tx)
         .await?;
@@ -1070,7 +1159,9 @@ pub async fn confirm_email_test(
     )
     .await?;
     tx.commit().await?;
-    Ok(Json(json!({"confirmed": true, "confirmed_at": now()})))
+    Ok(Json(
+        json!({"confirmed": true, "confirmed_at": observed_now}),
+    ))
 }
 
 #[derive(Deserialize, Default)]
@@ -1288,6 +1379,34 @@ pub struct RequestApproval {
     recovery: bool,
 }
 
+fn request_transition(
+    row: &SqliteRow,
+    expected: u64,
+    action: core::RequestAction,
+    recovery: bool,
+    method_current: bool,
+    at: i64,
+) -> Result<i64, Problem> {
+    let observed = core::RequestObservation {
+        pending: row.get::<String, _>("status") == "pending",
+        revision: u64::try_from(row.get::<i64, _>("revision")).unwrap_or(u64::MAX),
+        expires_at: row.get("expires_at"),
+        method_current,
+    };
+    core::decide_request(&observed, expected, action, recovery, at)
+        .map(|revision| revision as i64)
+        .map_err(|error| match error {
+            core::RequestError::StaleRevision => AccessError::StaleRevision.into(),
+            core::RequestError::Expired => problem(core::Error::Expired),
+            core::RequestError::MethodChanged => problem(core::Error::Stale),
+            core::RequestError::RecoveryRequired => Problem::invalid(
+                "recovery_confirmation_required",
+                "Explicit recovery confirmation is required",
+            ),
+            core::RequestError::RevisionExhausted => unavailable(),
+        })
+}
+
 pub async fn approve_request(
     State(app): State<App>,
     caller: Caller,
@@ -1320,31 +1439,31 @@ pub async fn approve_request(
         .ok_or_else(Problem::not_found)?;
     let revision: i64 = request.get("revision");
     check_revision(revision, expected)?;
-    if request.get::<String, _>("status") != "pending"
-        || request.get::<i64, _>("expires_at") <= now()
-    {
-        return Err(problem(core::Error::Expired));
-    }
+    let at = now();
     let email = request.get::<String, _>("kind") == "email";
-    if email {
-        // The email method must still be enabled under the same restore epoch.
-        if !mail(&mut tx, &app).await?.cfg.enabled {
-            return Err(problem(core::Error::Stale));
-        }
+    let method_current = if email {
+        mail(&mut tx, &app).await?.cfg.enabled
     } else {
         let provider_id: String = request.get("provider_id");
         let provider =
             sqlx::query("SELECT issuer,revision,enabled FROM signin_providers WHERE id=?")
                 .bind(&provider_id)
-                .fetch_one(&mut *tx)
+                .fetch_optional(&mut *tx)
                 .await?;
-        if !provider.get::<bool, _>("enabled")
-            || provider.get::<i64, _>("revision") != request.get::<i64, _>("provider_revision")
-            || provider.get::<String, _>("issuer") != request.get::<String, _>("issuer")
-        {
-            return Err(problem(core::Error::Stale));
-        }
-    }
+        provider.is_some_and(|provider| {
+            provider.get::<bool, _>("enabled")
+                && provider.get::<i64, _>("revision") == request.get::<i64, _>("provider_revision")
+                && provider.get::<String, _>("issuer") == request.get::<String, _>("issuer")
+        })
+    };
+    let next = request_transition(
+        &request,
+        expected,
+        core::RequestAction::Approve,
+        input.recovery,
+        method_current,
+        at,
+    )?;
     let user = access_management::load_user(&mut tx, &input.user_id)
         .await?
         .ok_or_else(Problem::not_found)?;
@@ -1385,7 +1504,6 @@ pub async fn approve_request(
         )
         .await?
     };
-    let next = next_revision(revision)?;
     sqlx::query("UPDATE signin_requests SET status='approved',user_id=?,revision=? WHERE id=?")
         .bind(&user.id)
         .bind(next)
@@ -1434,10 +1552,14 @@ pub async fn deny_request(
         .ok_or_else(Problem::not_found)?;
     let revision: i64 = row.get("revision");
     check_revision(revision, expected)?;
-    if row.get::<String, _>("status") != "pending" || row.get::<i64, _>("expires_at") <= now() {
-        return Err(problem(core::Error::Expired));
-    }
-    let next = next_revision(revision)?;
+    let next = request_transition(
+        &row,
+        expected,
+        core::RequestAction::Deny,
+        false,
+        true,
+        now(),
+    )?;
     sqlx::query("UPDATE signin_requests SET status='denied',revision=? WHERE id=?")
         .bind(next)
         .bind(&id)
@@ -1554,17 +1676,21 @@ pub async fn create_proof(
 }
 
 fn proof_value(row: &SqliteRow, current_epoch: &str) -> Value {
-    let status = if row.get::<bool, _>("consumed") {
-        "consumed"
-    } else if row.get::<String, _>("epoch") != current_epoch {
-        "invalidated"
-    } else if row.get::<i64, _>("expires_at") <= now() {
-        "expired"
-    } else if row.get::<Option<String>, _>("approved_by").is_some() {
-        "approved"
-    } else {
-        "pending"
+    let actor: String = row.get("actor_id");
+    let action: String = row.get("action");
+    let target: String = row.get("target");
+    let epoch: String = row.get("epoch");
+    let approver: Option<String> = row.get("approved_by");
+    let proof = core::Proof {
+        actor: &actor,
+        action: &action,
+        target: &target,
+        epoch: &epoch,
+        expires_at: row.get("expires_at"),
+        approved_by: approver.as_deref(),
+        consumed: row.get("consumed"),
     };
+    let status = core::proof_status(&proof, current_epoch, now());
     json!({"id":row.get::<String,_>("id"),"actor":row.get::<String,_>("actor_id"),"action":row.get::<String,_>("action"),"target":row.get::<String,_>("target"),"status":status,"expires_at":row.get::<i64,_>("expires_at"),"created_at":row.get::<i64,_>("created_at")})
 }
 
@@ -1677,11 +1803,18 @@ pub async fn approve_proof(
     if !caller.is_local_operator() && caller.credential().is_none() {
         return Err(Problem::not_found());
     }
-    if row.get::<bool, _>("consumed")
-        || row.get::<Option<String>, _>("approved_by").is_some()
-        || row.get::<i64, _>("expires_at") <= now()
-        || row.get::<String, _>("epoch") != epoch(&mut tx).await?
-    {
+    let proof_epoch: String = row.get("epoch");
+    let approved_by: Option<String> = row.get("approved_by");
+    let proof = core::Proof {
+        actor: &actor,
+        action: "",
+        target: "",
+        epoch: &proof_epoch,
+        expires_at: row.get("expires_at"),
+        approved_by: approved_by.as_deref(),
+        consumed: row.get("consumed"),
+    };
+    if !core::proof_pending(&proof, &epoch(&mut tx).await?, now()) {
         return Err(problem(core::Error::Expired));
     }
     let expected: String = row.get("code_hash");
@@ -1974,4 +2107,110 @@ pub async fn list_audit(
         .await?;
     let items=rows.iter().map(|row|json!({"id":row.get::<i64,_>("id").to_string(),"actor":row.get::<String,_>("actor"),"target":row.get::<String,_>("target"),"action":row.get::<String,_>("action"),"outcome":row.get::<String,_>("outcome"),"at":row.get::<i64,_>("at")})).collect();
     Ok(paged(items, limit))
+}
+
+#[cfg(test)]
+mod invalidation_tests {
+    use super::*;
+    use sqlx::Connection;
+
+    #[tokio::test]
+    async fn method_change_preserves_terminal_receipts_and_erases_all_secrets() {
+        let mut connection = sqlx::SqliteConnection::connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::query("CREATE TABLE signin_transactions(id TEXT PRIMARY KEY,state_json TEXT,provider_id TEXT,identity_id TEXT,address TEXT,verifier TEXT,nonce TEXT,code_hash TEXT,result TEXT)")
+            .execute(&mut connection).await.unwrap();
+        sqlx::query(
+            "CREATE TABLE signin_outbox(owner_id TEXT,phase TEXT,payload TEXT,updated_at INTEGER)",
+        )
+        .execute(&mut connection)
+        .await
+        .unwrap();
+        for phase in [
+            core::Phase::Pending,
+            core::Phase::Exchanging,
+            core::Phase::Consumed,
+            core::Phase::Failed,
+        ] {
+            let id = format!("{phase:?}");
+            let transaction = core::Transaction {
+                id: id.clone(),
+                purpose: core::Purpose::Login,
+                browser_hash: "browser".into(),
+                epoch: "epoch".into(),
+                server_epoch: "server".into(),
+                provider_revision: 1,
+                user_id: None,
+                user_revision: None,
+                identity_revision: None,
+                actor_revision: None,
+                expires_at: 100,
+                phase,
+                attempts: 0,
+                registration: None,
+            };
+            sqlx::query("INSERT INTO signin_transactions VALUES (?,?, 'provider', NULL,NULL,'verifier','nonce','hash','historical')")
+                .bind(&id).bind(serde_json::to_string(&transaction).unwrap()).execute(&mut connection).await.unwrap();
+            for mail in ["queued", "sending"] {
+                sqlx::query("INSERT INTO signin_outbox VALUES (?,?,'payload',0)")
+                    .bind(&id)
+                    .bind(mail)
+                    .execute(&mut connection)
+                    .await
+                    .unwrap();
+            }
+        }
+        cancel_transactions(&mut connection, Some("provider"), None, false)
+            .await
+            .unwrap();
+        for phase in [
+            core::Phase::Pending,
+            core::Phase::Exchanging,
+            core::Phase::Consumed,
+            core::Phase::Failed,
+        ] {
+            let id = format!("{phase:?}");
+            let row = sqlx::query("SELECT * FROM signin_transactions WHERE id=?")
+                .bind(&id)
+                .fetch_one(&mut connection)
+                .await
+                .unwrap();
+            let state: core::Transaction = serde_json::from_str(row.get("state_json")).unwrap();
+            let unfinished = matches!(phase, core::Phase::Pending | core::Phase::Exchanging);
+            assert_eq!(
+                state.phase,
+                if unfinished {
+                    core::Phase::Failed
+                } else {
+                    phase
+                }
+            );
+            assert_eq!(
+                row.get::<String, _>("result"),
+                if unfinished {
+                    "method_changed"
+                } else {
+                    "historical"
+                }
+            );
+            for field in ["verifier", "nonce", "code_hash"] {
+                assert!(row.get::<Option<String>, _>(field).is_none());
+            }
+            let rows: Vec<(String, Option<String>)> = sqlx::query_as(
+                "SELECT phase,payload FROM signin_outbox WHERE owner_id=? ORDER BY phase",
+            )
+            .bind(&id)
+            .fetch_all(&mut connection)
+            .await
+            .unwrap();
+            assert_eq!(
+                rows,
+                vec![
+                    ("cancelled".into(), None),
+                    ("sending".into(), Some("payload".into()))
+                ]
+            );
+        }
+    }
 }

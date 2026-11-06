@@ -38,3 +38,36 @@ pub fn available(
 ) -> bool {
     output_available && output_revision == registered_output && source_revision == registered_source
 }
+
+/// One source membership observed through a rendition registration. Missing
+/// source rows are represented by absent current revision, never by a trusted
+/// pre-filtered authorization bit.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LineageMembership {
+    pub registered_output_revision: String,
+    pub registered_source_revision: String,
+    pub current_source_revision: Option<String>,
+    pub source_generated: Option<bool>,
+    pub library: Option<String>,
+}
+
+pub fn library_scope(
+    generated: bool,
+    output_revision: &str,
+    direct_memberships: impl IntoIterator<Item = String>,
+    lineage: &[LineageMembership],
+) -> std::collections::BTreeSet<String> {
+    if !generated {
+        return direct_memberships.into_iter().collect();
+    }
+    lineage
+        .iter()
+        .filter(|m| {
+            m.registered_output_revision == output_revision
+                && m.current_source_revision.as_deref()
+                    == Some(m.registered_source_revision.as_str())
+                && m.source_generated == Some(false)
+        })
+        .filter_map(|m| m.library.clone())
+        .collect()
+}

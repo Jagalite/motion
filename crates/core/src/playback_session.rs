@@ -481,6 +481,65 @@ pub struct Claims {
     pub expires_at: i64,
 }
 
+/// Exact ordered binding observations, not a pre-decided validity flag.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BoundFile {
+    pub file: String,
+    pub binding_revision: String,
+    pub current_revision: String,
+    pub library: String,
+    pub duration_ms: Option<u64>,
+    pub part: i64,
+    pub start_ms: Option<i64>,
+    pub end_ms: Option<i64>,
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlaybackBinding {
+    pub version: String,
+    pub timeline: String,
+    pub files: Vec<BoundFile>,
+}
+impl PlaybackBinding {
+    pub fn matches(&self, claims: &Claims) -> bool {
+        if self.version != claims.version || self.timeline != claims.timeline {
+            return false;
+        }
+        let parts: Result<Vec<_>, _> = self
+            .files
+            .iter()
+            .map(|f| crate::parts::observed_part(f.part, f.duration_ms, f.start_ms, f.end_ms))
+            .collect();
+        let Ok(parts) = parts else { return false };
+        let Ok(layout) = crate::parts::layout(&parts) else {
+            return false;
+        };
+        if claims.parts.is_empty() {
+            let [file] = self.files.as_slice() else {
+                return false;
+            };
+            file.file == claims.file
+                && file.binding_revision == claims.file_revision
+                && match layout {
+                    crate::parts::Layout::Whole => claims.clip.is_none(),
+                    crate::parts::Layout::Interval(clip) => claims.clip == Some(clip),
+                    _ => false,
+                }
+        } else {
+            claims.clip.is_none()
+                && matches!(layout, crate::parts::Layout::Parts(_))
+                && self.files.len() == claims.parts.len()
+                && claims.parts.first().is_some_and(|p| p.file == claims.file)
+                && self.files.iter().zip(&claims.parts).all(|(file, pin)| {
+                    file.file == pin.file
+                        && file.binding_revision == pin.revision
+                        && file.current_revision == pin.revision
+                        && file.library == self.files[0].library
+                        && file.duration_ms == Some(pin.duration_ms)
+                })
+        }
+    }
+}
+
 /// Current facts observed inside the admission transaction.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Observed<'a> {
@@ -490,7 +549,7 @@ pub struct Observed<'a> {
     /// is missing or unavailable.
     pub file: Option<&'a FileFacts>,
     /// The pinned version still binds the pinned file to the pinned timeline.
-    pub bound: bool,
+    pub binding: PlaybackBinding,
     pub now: i64,
 }
 
@@ -542,7 +601,7 @@ pub fn reauthorize(claims: &Claims, observed: &Observed<'_>) -> Result<(), PlanE
     if !observed.principal.may_use_profile(&claims.profile) {
         return Err(PlanError::ProfileForbidden);
     }
-    if !observed.bound || !readable(observed.principal, observed.file) {
+    if !observed.binding.matches(claims) || !readable(observed.principal, observed.file) {
         return Err(PlanError::NotFound);
     }
     if observed
@@ -562,6 +621,42 @@ pub struct Owner {
     pub timeline: String,
     pub file: String,
     pub file_revision: String,
+}
+
+/// One atomic observation of the delivery's owner and reducer state. The
+/// adapter reads this under the live delivery lock instead of deriving phase
+/// eligibility from a serialized response string.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ViewingDelivery {
+    pub owner: Owner,
+    pub status: crate::delivery::Status,
+    pub duration_ms: Option<u64>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ViewingAdmissionError {
+    Unavailable,
+    DifferentContext,
+}
+
+/// Creation supplies no existing context; a rebind names the viewing session's
+/// exact profile and timeline. Authorization is checked before mismatch so a
+/// foreign delivery cannot disclose its context through a distinct error.
+pub fn admit_viewing_delivery(
+    delivery: &ViewingDelivery,
+    principal: &Principal,
+    file: Option<&FileFacts>,
+    existing: Option<(&str, &str)>,
+) -> Result<(), ViewingAdmissionError> {
+    if delivery.status.fenced() || !may_view(&delivery.owner, principal, file) {
+        return Err(ViewingAdmissionError::Unavailable);
+    }
+    if existing.is_some_and(|(profile, timeline)| {
+        delivery.owner.profile != profile || delivery.owner.timeline != timeline
+    }) {
+        return Err(ViewingAdmissionError::DifferentContext);
+    }
+    Ok(())
 }
 
 /// Observe or control a delivery: only its admitting principal, while that
@@ -632,6 +727,166 @@ pub fn may_record(principal: &Principal, profile: &str, timeline_readable: bool)
     principal.allows(Permission::ViewingWrite)
         && principal.may_use_profile(profile)
         && timeline_readable
+}
+
+/// Explicit compatibility policies: v1 retains its ten-language limit and
+/// legacy completion/bitrate behavior; v2 admits forced subtitles and caps.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PreferenceApi {
+    Legacy,
+    V2,
+}
+
+pub struct PreferenceInput<'a> {
+    pub subtitle_mode: &'a str,
+    pub quality: &'a str,
+    pub conversion_recipe: &'a str,
+    pub completion_percent: f64,
+    pub max_bitrate_bps: Option<u64>,
+    pub audio_languages: &'a [String],
+    pub subtitle_languages: &'a [String],
+}
+
+pub fn valid_recipe(value: &str) -> bool {
+    matches!(value, "remux_mp4" | "audio_aac" | "h264720p")
+}
+
+/// Validate the full replacement and return canonical language lists. No
+/// mutation is published if either list or another preference is invalid.
+pub fn normalize_preferences(
+    api: PreferenceApi,
+    p: PreferenceInput<'_>,
+) -> Result<[Vec<String>; 2], &'static str> {
+    let v2 = api == PreferenceApi::V2;
+    if !(matches!(p.subtitle_mode, "off" | "always" | "foreign_audio")
+        || v2 && p.subtitle_mode == "forced")
+        || !matches!(p.quality, "auto" | "original" | "convert")
+        || (!v2 && !valid_recipe(p.conversion_recipe))
+        || p.max_bitrate_bps == Some(0)
+        || (v2
+            && (!(50.0..=100.0).contains(&p.completion_percent)
+                || p.max_bitrate_bps
+                    .is_some_and(|b| rate_cap(b, 3_000).is_none())
+                || p.quality == "original" && p.max_bitrate_bps.is_some()))
+    {
+        return Err("Invalid preference mode, completion, or streaming limit");
+    }
+    let mut result = [Vec::new(), Vec::new()];
+    for (out, values) in result
+        .iter_mut()
+        .zip([p.audio_languages, p.subtitle_languages])
+    {
+        if values.len() > if v2 { 16 } else { 10 }
+            || values.iter().any(|v| !crate::viewing::valid_language(v))
+        {
+            return Err("Expected bounded language tags within the API limit");
+        }
+        *out = values.iter().map(|v| v.to_ascii_lowercase()).collect();
+        if out.iter().collect::<std::collections::BTreeSet<_>>().len() != out.len() {
+            return Err("Language tags must be unique");
+        }
+    }
+    Ok(result)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TrackCompositionError {
+    UnavailableComponent,
+    Conflict,
+}
+/// A component and a stream ID are two names for one selection, not competing
+/// priorities. A sidecar cannot also name an embedded subtitle stream.
+pub fn compose_tracks(
+    audio_component_requested: bool,
+    subtitle_component_requested: bool,
+    component_audio: Option<u32>,
+    component_subtitle: Option<u32>,
+    sidecar: bool,
+    audio_track: Option<u32>,
+    subtitle_track: Option<u32>,
+    default_audio: Option<u32>,
+) -> Result<(Option<u32>, Option<u32>), TrackCompositionError> {
+    if audio_component_requested && component_audio.is_none()
+        || subtitle_component_requested && component_subtitle.is_none() && !sidecar
+    {
+        return Err(TrackCompositionError::UnavailableComponent);
+    }
+    if audio_track
+        .zip(component_audio)
+        .is_some_and(|(a, b)| a != b)
+        || subtitle_track
+            .zip(component_subtitle)
+            .is_some_and(|(a, b)| a != b)
+        || subtitle_track.is_some() && sidecar
+    {
+        return Err(TrackCompositionError::Conflict);
+    }
+    Ok((
+        component_audio.or(audio_track).or(default_audio),
+        component_subtitle.or(subtitle_track),
+    ))
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct SelectionConstraints {
+    pub operation: Operation,
+    pub interval: bool,
+    pub multipart: bool,
+    pub cap_bps: Option<u64>,
+    pub adaptive: bool,
+    pub adaptive_enabled: bool,
+    pub hardware: bool,
+    pub burned_subtitle: bool,
+}
+/// Shared by signed planning, admission and replanning. Returns the effective
+/// cap (including the adaptive main rung) only for an admissible composition.
+pub fn validate_selection(s: SelectionConstraints) -> Result<Option<u64>, &'static str> {
+    if (s.interval || s.multipart) && s.operation != Operation::VideoTranscode {
+        return Err("An interval of a file is delivered only by a conversion");
+    }
+    if s.adaptive
+        && (!s.adaptive_enabled
+            || s.operation != Operation::VideoTranscode
+            || s.hardware
+            || s.burned_subtitle
+            || s.multipart
+            || s.cap_bps.is_some())
+    {
+        return Err("An adaptive ladder is a software conversion of one file");
+    }
+    let cap = s.cap_bps.or(s.adaptive.then_some(ADAPTIVE_MAIN_BPS));
+    if cap.is_some_and(|b| s.operation != Operation::VideoTranscode || rate_cap(b, 3_000).is_none())
+    {
+        return Err("A bitrate cap is kept only by a conversion with room for its video");
+    }
+    Ok(cap)
+}
+
+/// A selected embedded text stream may trigger one conversion replan when
+/// the chosen route cannot present external text but observed libass can burn.
+pub fn retry_with_burn(
+    route: Route,
+    multipart: bool,
+    sidecar: bool,
+    burned: bool,
+    live_text: bool,
+    accepts_burned: bool,
+    libass: bool,
+) -> bool {
+    !multipart
+        && !sidecar
+        && !burned
+        && !presents_subtitle(route, false, live_text, true)
+        && accepts_burned
+        && libass
+}
+pub fn resolve_optional_subtitle(
+    automatic: bool,
+    required: bool,
+    route: Route,
+    burn_resolved: bool,
+) -> bool {
+    automatic && !required && route != Route::Prepared && !burn_resolved
 }
 
 #[cfg(test)]
@@ -815,7 +1070,24 @@ mod tests {
         let observed = |p, file, bound, now| Observed {
             principal: p,
             file,
-            bound,
+            binding: PlaybackBinding {
+                version: "v".into(),
+                timeline: "t".into(),
+                files: if bound {
+                    vec![BoundFile {
+                        file: "f".into(),
+                        binding_revision: "r1".into(),
+                        current_revision: "r1".into(),
+                        library: "lib".into(),
+                        duration_ms: None,
+                        part: 1,
+                        start_ms: None,
+                        end_ms: None,
+                    }]
+                } else {
+                    vec![]
+                },
+            },
             now,
         };
         assert_eq!(

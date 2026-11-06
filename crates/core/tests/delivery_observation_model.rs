@@ -154,6 +154,7 @@ impl Enumerate for Observations {
         ];
         if s.delivery.last_generation == 1 {
             result.push(Input::Change {
+                expected_selection: None,
                 expected_generation: 1,
                 position_ms: 0,
                 replan: None,

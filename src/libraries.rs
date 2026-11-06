@@ -178,21 +178,31 @@ pub(crate) async fn register_source_in(
     if let Some(other) = core::overlapping(&candidate.root, &refs) {
         return Err(LibraryError::Overlaps(other.into()));
     }
-    let existing: Option<(String, String)> =
-        sqlx::query_as("SELECT id,root_identity FROM libraries WHERE root=?")
+    let existing: Option<(String, String, bool)> =
+        sqlx::query_as("SELECT id,root_identity,managed FROM libraries WHERE root=?")
             .bind(&candidate.root)
             .fetch_optional(&mut *tx)
             .await?;
-    let id = match existing {
-        // Re-registering the same root with a different volume is a rebind,
-        // which needs the relocation workflow, never a silent acceptance.
-        Some((_, identity)) if identity != candidate.identity => {
+    let facts = existing
+        .as_ref()
+        .map(|(id, identity, managed)| core::ExistingRoot {
+            id,
+            identity,
+            managed: *managed,
+        });
+    let id = match core::registration(
+        &candidate.identity,
+        core::OwnershipRequirement::ExistingKind,
+        facts,
+    ) {
+        core::Registration::RelocationRequired => {
             return Err(LibraryError::Storage(anyhow::anyhow!(
                 "registered root now has a different volume identity"
             )));
         }
-        Some((id, _)) => id,
-        None => {
+        core::Registration::OwnershipConflict => unreachable!("existing ownership is accepted"),
+        core::Registration::Reuse { id } => id,
+        core::Registration::Create => {
             let id = new_id();
             sqlx::query("INSERT INTO libraries (id,name,root,root_identity,exclusions_json) VALUES (?,?,?,?,?)")
                 .bind(&id)
@@ -230,7 +240,7 @@ pub async fn set_exclusions(
     .bind(id)
     .fetch_one(&mut *tx)
     .await?;
-    if active > 0 {
+    if !core::source_scope_mutable(active > 0) {
         return Err(LibraryError::Busy);
     }
     sqlx::query("UPDATE libraries SET exclusions_json=?,revision=? WHERE id=?")
@@ -419,7 +429,7 @@ pub(crate) async fn delete_library_in(
     .bind(id)
     .fetch_one(&mut *tx)
     .await?;
-    if pending > 0 {
+    if !core::library_removable(pending > 0) {
         return Err(LibraryError::Busy);
     }
     sqlx::query("DELETE FROM scan_requests WHERE library_id=?")
@@ -480,10 +490,11 @@ pub(crate) async fn delete_source_in(
     .bind(id)
     .fetch_one(&mut *tx)
     .await?;
-    if members > 0 || active > 0 {
+    let decision = core::source_removal(members > 0, active > 0, files > 0, demands > 0);
+    if decision == core::Removal::Busy {
         return Err(LibraryError::Busy);
     }
-    let outcome = if files == 0 && demands == 0 {
+    let outcome = if decision == core::Removal::Delete {
         sqlx::query("DELETE FROM scan_schedules WHERE library_id=?")
             .bind(id)
             .execute(&mut *tx)
@@ -569,7 +580,9 @@ pub async fn preview_relocation(
         .partition(|(_, path, _, _)| !core::excluded(path, &scope));
     let required: Vec<(String, String, String)> = in_scope
         .into_iter()
-        .filter(|(_, _, _, available)| !enabled || *available)
+        .filter(|(_, path, _, available)| {
+            core::relocation_file_required(enabled, *available, path, &scope)
+        })
         .map(|(id, path, revision, _)| (id, path, revision))
         .collect();
     let root = candidate.root.clone();
@@ -699,6 +712,22 @@ pub(crate) async fn commit_relocation_in(
             .bind(&plan.source)
             .fetch_one(&mut *tx)
             .await?;
+    let (enabled, exclusions): (bool, String) =
+        sqlx::query_as("SELECT enabled,exclusions_json FROM sources WHERE id=?")
+            .bind(&plan.source)
+            .fetch_one(&mut *tx)
+            .await?;
+    let exclusions: Vec<String> = serde_json::from_str(&exclusions).map_err(anyhow::Error::from)?;
+    let paths: Vec<(String, String, bool)> =
+        sqlx::query_as("SELECT id,relative_path,available FROM media_files WHERE library_id=?")
+            .bind(&plan.source)
+            .fetch_all(&mut *tx)
+            .await?;
+    if !core::relocation_complete(plan, enabled, &paths, &exclusions) {
+        return Err(RelocationError::Conflict(
+            core::RelocationConflict::SourceChanged,
+        ));
+    }
     let catalog: Vec<(String, String, bool)> = sqlx::query_as(
         "SELECT id,revision,available FROM media_files WHERE library_id=? ORDER BY id",
     )

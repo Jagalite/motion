@@ -113,6 +113,15 @@ impl Fixture {
     /// Pair a device with `permissions` and a policy over `libraries`;
     /// returns its bearer header value.
     async fn device(&self, permissions: &[&str], libraries: &[&str]) -> String {
+        self.device_with_profiles(permissions, libraries, &[]).await
+    }
+
+    async fn device_with_profiles(
+        &self,
+        permissions: &[&str],
+        libraries: &[&str],
+        profiles: &[&str],
+    ) -> String {
         let operator = bearer(OPERATOR);
         let pairing = self
             .call(
@@ -128,7 +137,7 @@ impl Fixture {
             .call(
                 "POST",
                 &format!("/api/v2/auth/pairings/{id}/approve"),
-                Some(json!({"user_code":pairing.body["user_code"],"profile_ids":[],"permissions":permissions})),
+                Some(json!({"user_code":pairing.body["user_code"],"profile_ids":profiles,"permissions":permissions})),
                 &[("authorization", &operator), ("idempotency-key", &key)],
             )
             .await;
@@ -1915,6 +1924,22 @@ async fn source_relocation_preview_commit_and_retry_are_fenced() {
         f.call("POST", &path, Some(input), &h).await.body,
         preview.body
     );
+    let wrong_source = f
+        .call(
+            "POST",
+            &format!("/api/v2/sources/{}/relocation", f.b),
+            Some(json!({"plan_token":preview.body["plan_token"]})),
+            &[
+                ("authorization", &auth),
+                ("idempotency-key", "relocation-wrong-source"),
+            ],
+        )
+        .await;
+    problem(
+        &wrong_source,
+        StatusCode::PRECONDITION_FAILED,
+        "precondition_failed",
+    );
     let path = format!("/api/v2/sources/{}/relocation", f.a);
     let input = json!({"plan_token":preview.body["plan_token"]});
     let h = [
@@ -2968,4 +2993,350 @@ async fn later_manual_marker_correction_supersedes_earlier_value() {
     assert_eq!(ids(&page), [second.body["id"].as_str().unwrap()]);
     let all = f.call("GET", path, None, &[("authorization", &op)]).await;
     assert_eq!(all.body["items"].as_array().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn next_timeline_searches_past_hidden_pages_without_crossing_groups() {
+    let f = Fixture::new().await;
+    f.item("page-start", "Start", &[(&f.a, "start")]).await;
+    f.item("page-visible", "Visible", &[(&f.a, "visible")])
+        .await;
+    f.item("page-other", "Other group", &[(&f.a, "other")])
+        .await;
+    sqlx::query("INSERT INTO order_groups(id,edition_id,name,kind) VALUES ('page-order','page-start-ed','Release','custom'),('other-order','page-other-ed','Other','custom')")
+        .execute(&f.app.db).await.unwrap();
+    sqlx::query("UPDATE timelines SET order_group_id='page-order',order_position=0 WHERE id='page-start-ed'")
+        .execute(&f.app.db).await.unwrap();
+    sqlx::query("UPDATE timelines SET order_group_id='other-order',order_position=1 WHERE id='page-other-ed'")
+        .execute(&f.app.db).await.unwrap();
+    for n in 1..=51 {
+        let id = format!("page-hidden-{n:02}");
+        f.item(&id, "Hidden", &[(&f.b, "hidden")]).await;
+        sqlx::query("UPDATE timelines SET order_group_id='page-order',order_position=? WHERE id=?")
+            .bind(n * 2)
+            .bind(format!("{id}-ed"))
+            .execute(&f.app.db)
+            .await
+            .unwrap();
+    }
+    let scoped = f
+        .device_with_profiles(&["catalog:read"], &[&f.a], &["default"])
+        .await;
+    for hidden in [49, 50, 51] {
+        sqlx::query("UPDATE timelines SET order_group_id='page-order',order_position=? WHERE id='page-visible-ed'")
+            .bind(hidden * 2 + 1).execute(&f.app.db).await.unwrap();
+        let next = f
+            .call(
+                "GET",
+                "/api/v2/profiles/default/timelines/page-start-ed/next",
+                None,
+                &[("authorization", &scoped)],
+            )
+            .await;
+        assert_eq!(next.status, StatusCode::OK, "{}", next.body);
+        assert_eq!(next.body["items"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            next.body["items"][0]["id"], "page-visible-ed",
+            "after {hidden} hidden candidates: {}",
+            next.body
+        );
+    }
+    // Exhaustion concerns this group only, not another readable release.
+    sqlx::query(
+        "UPDATE timelines SET order_group_id=NULL,order_position=NULL WHERE id='page-visible-ed'",
+    )
+    .execute(&f.app.db)
+    .await
+    .unwrap();
+    let exhausted = f
+        .call(
+            "GET",
+            "/api/v2/profiles/default/timelines/page-start-ed/next",
+            None,
+            &[("authorization", &scoped)],
+        )
+        .await;
+    assert_eq!(exhausted.status, StatusCode::OK, "{}", exhausted.body);
+    assert_eq!(exhausted.body["items"], json!([]));
+}
+
+#[tokio::test]
+async fn large_split_plan_reference_fences_actor_inventory_and_expiry() {
+    let f = Fixture::new().await;
+    let files: Vec<_> = (0..120)
+        .map(|i| (f.a.as_str(), if i == 0 { "keep" } else { "move" }))
+        .collect();
+    f.item("large", "Large", &files).await;
+    let writer = f.device(&["catalog:read", "catalog:write"], &[&f.a]).await;
+    let other = f.device(&["catalog:read", "catalog:write"], &[&f.a]).await;
+    let preview = |revision: String| json!({"version_ids":["large-f1"],"new_title":"Split", "expected_revision":revision});
+    let plan = f
+        .call(
+            "POST",
+            "/api/v2/catalog/items/large/split-plans",
+            Some(preview(revision(&f, "large").await)),
+            &[
+                ("authorization", &writer),
+                ("idempotency-key", "large-preview-01"),
+            ],
+        )
+        .await;
+    assert_eq!(plan.status, StatusCode::OK, "{:?}", plan.body);
+    let token = plan.body["plan_token"].as_str().unwrap().to_owned();
+    assert!(token.starts_with("mcr_"));
+    assert!(token.len() < 256);
+    let denied = f
+        .call(
+            "POST",
+            "/api/v2/catalog/reconciliations",
+            Some(json!({"plan_token":token})),
+            &[
+                ("authorization", &other),
+                ("idempotency-key", "large-wrong-actor"),
+            ],
+        )
+        .await;
+    problem(
+        &denied,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "invalid_plan_token",
+    );
+    // Exact reviewed inventory is checked before any transfer.
+    sqlx::query("UPDATE media_files SET revision='different' WHERE id='large-f2'")
+        .execute(&f.app.db)
+        .await
+        .unwrap();
+    let stale = f
+        .call(
+            "POST",
+            "/api/v2/catalog/reconciliations",
+            Some(json!({"plan_token":token})),
+            &[
+                ("authorization", &writer),
+                ("idempotency-key", "large-stale-0001"),
+            ],
+        )
+        .await;
+    problem(&stale, StatusCode::CONFLICT, "revision_conflict");
+    sqlx::query("UPDATE media_files SET revision='move' WHERE id='large-f2'")
+        .execute(&f.app.db)
+        .await
+        .unwrap();
+    let fresh = f
+        .call(
+            "POST",
+            "/api/v2/catalog/items/large/split-plans",
+            Some(preview(revision(&f, "large").await)),
+            &[
+                ("authorization", &writer),
+                ("idempotency-key", "large-preview-02"),
+            ],
+        )
+        .await;
+    assert_eq!(fresh.status, StatusCode::OK, "{:?}", fresh.body);
+    let committed = f
+        .call(
+            "POST",
+            "/api/v2/catalog/reconciliations",
+            Some(json!({"plan_token":fresh.body["plan_token"]})),
+            &[
+                ("authorization", &writer),
+                ("idempotency-key", "large-commit-001"),
+            ],
+        )
+        .await;
+    assert_eq!(committed.status, StatusCode::OK, "{:?}", committed.body);
+    let moved: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM media_files f JOIN editions e ON e.id=f.edition_id WHERE e.item_id=?",
+    )
+    .bind(committed.body["id"].as_str().unwrap())
+    .fetch_one(&f.app.db)
+    .await
+    .unwrap();
+    assert_eq!(moved, 119);
+    // Expired proposal cleanup does not touch immutable committed receipts.
+    sqlx::query("UPDATE catalog_review_plans SET expires_at=0,document_json=json_set(document_json,'$.expires_at',0)").execute(&f.app.db).await.unwrap();
+    let expired = f
+        .call(
+            "POST",
+            "/api/v2/catalog/reconciliations",
+            Some(json!({"plan_token":token})),
+            &[
+                ("authorization", &writer),
+                ("idempotency-key", "large-expired-01"),
+            ],
+        )
+        .await;
+    problem(&expired, StatusCode::CONFLICT, "plan_expired");
+    f.item("cleanup", "Cleanup", &[(&f.a, "one"), (&f.a, "two")])
+        .await;
+    let cleanup = f.call("POST", "/api/v2/catalog/items/cleanup/split-plans",
+        Some(json!({"version_ids":["cleanup-f1"],"new_title":"Cleanup split","expected_revision":revision(&f, "cleanup").await})),
+        &[("authorization", &writer), ("idempotency-key", "cleanup-preview-01")]).await;
+    assert_eq!(cleanup.status, StatusCode::OK, "{:?}", cleanup.body);
+    let missing_id = token
+        .strip_prefix("mcr_")
+        .unwrap()
+        .split('.')
+        .next()
+        .unwrap();
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM catalog_review_plans WHERE id=?")
+            .bind(missing_id)
+            .fetch_one(&f.app.db)
+            .await
+            .unwrap(),
+        0
+    );
+    let missing = f
+        .call(
+            "POST",
+            "/api/v2/catalog/reconciliations",
+            Some(json!({"plan_token":token})),
+            &[
+                ("authorization", &writer),
+                ("idempotency-key", "large-missing-01"),
+            ],
+        )
+        .await;
+    problem(
+        &missing,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "invalid_plan_token",
+    );
+    let receipts: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM catalog_receipts WHERE kind='catalog:split'")
+            .fetch_one(&f.app.db)
+            .await
+            .unwrap();
+    assert_eq!(receipts, 1);
+}
+
+#[tokio::test]
+async fn split_authorizes_prior_order_owner_before_invalidating_membership() {
+    let f = Fixture::new().await;
+    f.item("split-source", "Source", &[(&f.a, "one"), (&f.a, "two")])
+        .await;
+    f.item("hidden-owner", "Hidden", &[(&f.b, "three")]).await;
+    for sql in [
+        "INSERT INTO timelines(id,edition_id) VALUES ('retained-timeline','split-source-ed')",
+        "UPDATE media_versions SET timeline_id='retained-timeline' WHERE id='split-source-f0'",
+        "INSERT INTO order_groups(id,edition_id,name,kind) VALUES ('hidden-order','hidden-owner-ed','Private','custom')",
+        "UPDATE timelines SET order_group_id='hidden-order',order_position=1 WHERE id='split-source-ed'",
+    ] {
+        sqlx::query(sql).execute(&f.app.db).await.unwrap();
+    }
+    let scoped = f.device(&["catalog:read", "catalog:write"], &[&f.a]).await;
+    let plan = f.call("POST", "/api/v2/catalog/items/split-source/split-plans",
+        Some(json!({"version_ids":["split-source-f1"],"new_title":"Split","expected_revision":revision(&f, "split-source").await})),
+        &[("authorization", &scoped), ("idempotency-key", "split-hidden-owner")]).await;
+    assert_eq!(plan.status, StatusCode::NOT_FOUND, "{:?}", plan.body);
+    let membership: String =
+        sqlx::query_scalar("SELECT order_group_id FROM timelines WHERE id='split-source-ed'")
+            .fetch_one(&f.app.db)
+            .await
+            .unwrap();
+    assert_eq!(membership, "hidden-order");
+}
+
+#[tokio::test]
+async fn reviewed_catalog_and_relocation_tokens_reject_a_new_restore_history() {
+    let f = Fixture::new().await;
+    let operator = bearer(OPERATOR);
+    f.item("inline", "Inline", &[(&f.a, "one"), (&f.a, "two")])
+        .await;
+    let files: Vec<_> = (0..120)
+        .map(|i| (f.a.as_str(), if i == 0 { "one" } else { "two" }))
+        .collect();
+    f.item("referenced", "Referenced", &files).await;
+    let mut tokens = Vec::new();
+    for (id, key, prefix) in [
+        ("inline", "history-inline-preview", "mcp_"),
+        ("referenced", "history-reference-preview", "mcr_"),
+    ] {
+        let plan = f.call("POST", &format!("/api/v2/catalog/items/{id}/split-plans"),
+            Some(json!({"version_ids":[format!("{id}-f1")],"new_title":"Split","expected_revision":revision(&f, id).await})),
+            &[("authorization", &operator), ("idempotency-key", key)]).await;
+        assert_eq!(plan.status, StatusCode::OK, "{}", plan.body);
+        let token = plan.body["plan_token"].as_str().unwrap().to_owned();
+        assert!(token.starts_with(prefix));
+        tokens.push(token);
+    }
+    // An empty source provides a real relocation plan without media hashing.
+    let source = f
+        .call(
+            "GET",
+            &format!("/api/v2/sources/{}", f.b),
+            None,
+            &[("authorization", &operator)],
+        )
+        .await;
+    let candidate = f._dir.path().join("history-relocation");
+    std::fs::create_dir(&candidate).unwrap();
+    let relocation = f
+        .call(
+            "POST",
+            &format!("/api/v2/sources/{}/relocation-plans", f.b),
+            Some(json!({"new_root_path":candidate})),
+            &[
+                ("authorization", &operator),
+                ("if-match", source.headers["etag"].to_str().unwrap()),
+                ("idempotency-key", "history-relocation-preview"),
+            ],
+        )
+        .await;
+    assert_eq!(relocation.status, StatusCode::OK, "{}", relocation.body);
+    let before: i64 = sqlx::query_scalar("SELECT count(*) FROM items")
+        .fetch_one(&f.app.db)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE server_identity SET restore_epoch='restored-history'")
+        .execute(&f.app.db)
+        .await
+        .unwrap();
+    for (i, token) in tokens.into_iter().enumerate() {
+        let key = format!("history-rejected-{i}");
+        let rejected = f
+            .call(
+                "POST",
+                "/api/v2/catalog/reconciliations",
+                Some(json!({"plan_token":token})),
+                &[("authorization", &operator), ("idempotency-key", &key)],
+            )
+            .await;
+        problem(
+            &rejected,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "invalid_plan_token",
+        );
+    }
+    let rejected = f
+        .call(
+            "POST",
+            &format!("/api/v2/sources/{}/relocation", f.b),
+            Some(json!({"plan_token":relocation.body["plan_token"]})),
+            &[
+                ("authorization", &operator),
+                ("idempotency-key", "history-relocation-rejected"),
+            ],
+        )
+        .await;
+    problem(&rejected, StatusCode::UNPROCESSABLE_ENTITY, "invalid_plan");
+    let after: i64 = sqlx::query_scalar("SELECT count(*) FROM items")
+        .fetch_one(&f.app.db)
+        .await
+        .unwrap();
+    assert_eq!(before, after);
+    let source_after = f
+        .call(
+            "GET",
+            &format!("/api/v2/sources/{}", f.b),
+            None,
+            &[("authorization", &operator)],
+        )
+        .await;
+    assert_eq!(
+        source_after.body, source.body,
+        "rejected relocation leaves registration unchanged"
+    );
 }

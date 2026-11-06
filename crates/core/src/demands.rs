@@ -9,10 +9,67 @@
 //! demands; cancelling one demand never cancels an attempt another live
 //! demand still needs. Per source there is at most one running attempt and at
 //! most one queued follow-up.
-use crate::jobs::Phase;
+use crate::jobs::{self, Job, Phase};
 use serde::{Deserialize, Serialize};
 
 pub type Id = String;
+
+/// A source membership observed under the request's writer transaction.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RequestMember {
+    pub source: Id,
+    pub enabled: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RequestEffect {
+    Admit { source: Id },
+    FailDisabled { source: Id },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RequestError {
+    NoSources,
+    UnknownSource(Id),
+}
+
+/// Select membership and decide the per-source demand outcome before any
+/// request is persisted. Explicit selections preserve their order and repeats;
+/// API-specific shape and size limits belong at the transport boundary.
+pub fn initialize_request(
+    members: &[RequestMember],
+    selected: Option<&[Id]>,
+) -> Result<Vec<RequestEffect>, RequestError> {
+    let chosen: Vec<&RequestMember> = match selected {
+        None => members.iter().collect(),
+        Some(ids) => ids
+            .iter()
+            .map(|id| {
+                members
+                    .iter()
+                    .find(|m| &m.source == id)
+                    .ok_or_else(|| RequestError::UnknownSource(id.clone()))
+            })
+            .collect::<Result<_, _>>()?,
+    };
+    if chosen.is_empty() {
+        return Err(RequestError::NoSources);
+    }
+    Ok(chosen
+        .into_iter()
+        .map(|m| {
+            if m.enabled {
+                RequestEffect::Admit {
+                    source: m.source.clone(),
+                }
+            } else {
+                RequestEffect::FailDisabled {
+                    source: m.source.clone(),
+                }
+            }
+        })
+        .collect())
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -43,6 +100,52 @@ pub struct Attempt {
     /// Admitted by a requester outside the demand ledger (v1 API, schedule,
     /// configured root). No demand cancellation may stop it.
     pub direct: bool,
+}
+
+/// Ordered writes for recovery of one source. Apply the entire plan and
+/// reconcile pending demands in the same reserved writer transaction. A failed
+/// write rolls back all effects; no worker may start before recovery commits.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RecoveryEffect {
+    /// Keep the existing queued job's identity, attempt counter and barrier,
+    /// while inheriting the interrupted request's mode and direct ownership.
+    MergeQueued { job: Id, verify: bool, direct: bool },
+    /// Set the interrupted job's phase and clear its started barrier. Its
+    /// attempt counter and all other history remain unchanged.
+    ResetInterrupted { job: Id, phase: Phase },
+}
+
+/// Recover attempts observed for one source under its writer boundary.
+///
+/// The snapshot has at most one running/cancelling job and one queued job
+/// (enforced by the adapter's unique constraints); each Attempt phase agrees
+/// with its Job. Only a retryable running job donates work to a queued
+/// follow-up. Cancellation and attempt exhaustion retain their normal job
+/// outcomes. Recovery itself never answers a demand: reconciliation uses the
+/// resulting attempts and the unchanged pending demands via [`follow_up`].
+pub fn recover(attempts: &[(Attempt, Job)]) -> Vec<RecoveryEffect> {
+    let mut effects = Vec::new();
+    for (attempt, job) in attempts {
+        if !matches!(job.phase, Phase::Running | Phase::Cancelling) {
+            continue;
+        }
+        let (mut recovered, _) = jobs::transition(job, jobs::Input::Recover);
+        if recovered.phase == Phase::Queued
+            && let Some((queued, _)) = attempts.iter().find(|(_, j)| j.phase == Phase::Queued)
+        {
+            effects.push(RecoveryEffect::MergeQueued {
+                job: queued.job.clone(),
+                verify: queued.verify || attempt.verify,
+                direct: queued.direct || attempt.direct,
+            });
+            recovered = jobs::transition(&recovered, jobs::Input::Cancel).0;
+        }
+        effects.push(RecoveryEffect::ResetInterrupted {
+            job: attempt.job.clone(),
+            phase: recovered.phase,
+        });
+    }
+    effects
 }
 
 fn active(a: &Attempt) -> bool {
@@ -257,5 +360,158 @@ mod retention_tests {
             prunable_requests(&requests, 0, &"ancient"),
             vec!["new", "older", "oldest"]
         );
+    }
+}
+
+#[cfg(test)]
+mod recovery_tests {
+    use super::*;
+
+    fn interrupted(phase: Phase, counter: u32, verify: bool, direct: bool) -> (Attempt, Job) {
+        (
+            Attempt {
+                job: "interrupted".into(),
+                phase,
+                verify,
+                started_barrier: Some(7),
+                direct,
+            },
+            Job {
+                phase,
+                attempt: counter,
+            },
+        )
+    }
+
+    #[test]
+    fn recovery_preserves_the_follow_up_and_only_absorbs_retryable_work() {
+        for phase in [Phase::Running, Phase::Cancelling] {
+            for counter in [0, 1, u32::MAX - 1, u32::MAX] {
+                for verify in [false, true] {
+                    for direct in [false, true] {
+                        for queued_verify in [false, true] {
+                            for queued_direct in [false, true] {
+                                let old = interrupted(phase, counter, verify, direct);
+                                let queued = (
+                                    Attempt {
+                                        job: "follow-up".into(),
+                                        phase: Phase::Queued,
+                                        verify: queued_verify,
+                                        direct: queued_direct,
+                                        started_barrier: None,
+                                    },
+                                    Job {
+                                        phase: Phase::Queued,
+                                        attempt: 5,
+                                    },
+                                );
+                                let expected = if phase == Phase::Running && counter < u32::MAX {
+                                    vec![
+                                        RecoveryEffect::MergeQueued {
+                                            job: "follow-up".into(),
+                                            verify: verify || queued_verify,
+                                            direct: direct || queued_direct,
+                                        },
+                                        RecoveryEffect::ResetInterrupted {
+                                            job: "interrupted".into(),
+                                            phase: Phase::Cancelled,
+                                        },
+                                    ]
+                                } else {
+                                    vec![RecoveryEffect::ResetInterrupted {
+                                        job: "interrupted".into(),
+                                        phase: if phase == Phase::Cancelling {
+                                            Phase::Cancelled
+                                        } else {
+                                            Phase::Failed
+                                        },
+                                    }]
+                                };
+                                assert_eq!(recover(&[old.clone(), queued.clone()]), expected);
+                                assert_eq!(
+                                    recover(&[queued, old]),
+                                    expected,
+                                    "input order must not choose the survivor"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn recovery_without_a_follow_up_keeps_the_interrupted_identity() {
+        for phase in [Phase::Running, Phase::Cancelling] {
+            for counter in [1, u32::MAX] {
+                assert_eq!(
+                    recover(&[interrupted(phase, counter, true, true)]),
+                    vec![RecoveryEffect::ResetInterrupted {
+                        job: "interrupted".into(),
+                        phase: match (phase, counter) {
+                            (Phase::Cancelling, _) => Phase::Cancelled,
+                            (_, u32::MAX) => Phase::Failed,
+                            _ => Phase::Queued,
+                        },
+                    },]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn queued_and_terminal_jobs_need_no_recovery_writes() {
+        assert!(recover(&[]).is_empty());
+        for phase in [
+            Phase::Queued,
+            Phase::Completed,
+            Phase::Failed,
+            Phase::Cancelled,
+        ] {
+            assert!(recover(&[interrupted(phase, 2, true, true)]).is_empty());
+        }
+    }
+}
+
+#[cfg(test)]
+mod request_initialization_tests {
+    use super::*;
+    #[test]
+    fn selection_and_disabled_sources_have_exact_ordered_outcomes() {
+        let members = vec![
+            RequestMember {
+                source: "a".into(),
+                enabled: true,
+            },
+            RequestMember {
+                source: "b".into(),
+                enabled: false,
+            },
+        ];
+        assert_eq!(
+            initialize_request(&members, None),
+            Ok(vec![
+                RequestEffect::Admit { source: "a".into() },
+                RequestEffect::FailDisabled { source: "b".into() }
+            ])
+        );
+        assert_eq!(
+            initialize_request(&members, Some(&["b".into(), "a".into(), "b".into()])),
+            Ok(vec![
+                RequestEffect::FailDisabled { source: "b".into() },
+                RequestEffect::Admit { source: "a".into() },
+                RequestEffect::FailDisabled { source: "b".into() }
+            ])
+        );
+        assert_eq!(
+            initialize_request(&members, Some(&["a".into(), "missing".into()])),
+            Err(RequestError::UnknownSource("missing".into()))
+        );
+        assert_eq!(
+            initialize_request(&members, Some(&[])),
+            Err(RequestError::NoSources)
+        );
+        assert_eq!(initialize_request(&[], None), Err(RequestError::NoSources));
     }
 }

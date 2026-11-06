@@ -120,11 +120,7 @@ async fn sessions(State(app): State<App>, caller: Caller) -> Result<Response, Pr
             .await?;
         // A delivery admitted this instant may not be readable yet.
         let Some(row) = row else { continue };
-        let viewing: Option<(String, i64, String, i64, i64)> =
-            sqlx::query_as(crate::playback_monitor::AUTHORITATIVE_VIEWING)
-                .bind(&session.id)
-                .fetch_optional(&mut *tx)
-                .await?;
+        let viewing = crate::playback_monitor::authoritative_viewing(&mut tx, &session.id).await?;
         let viewing = viewing.map(|(id, ..)| id);
         let r = session.telemetry.read();
         let mut m = identity(&row);

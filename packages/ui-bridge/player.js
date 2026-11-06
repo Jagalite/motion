@@ -10,7 +10,7 @@
 const host = document.getElementById('motion-player');
 const csrf = document.querySelector('meta[name="motion-csrf"]')?.content ?? '';
 
-const state = {epoch: 0, deliveryId: null, element: null, closing: null, stopLease: null, viewing: null, stopObserving: null, viewingOwner: null, generation: null, delivery: null, replace: null, planInput: null, changing: false};
+const state = {epoch: 0, deliveryId: null, element: null, closing: null, stopLease: null, viewing: null, stopObserving: null, viewingOwner: null, generation: null, delivery: null, replace: null, planInput: null, changing: false, changeOwner: null};
 
 function status(message, kind = 'status') {
   let panel = host.querySelector('.status-panel');
@@ -398,6 +398,13 @@ function rememberAudio(observation) {
   try { if (localStorage.getItem(AUDIO_KEY) !== value) localStorage.setItem(AUDIO_KEY, value); } catch { /* not remembered */ }
 }
 
+// An operation fence ends when the change promise settles. Installed playback
+// callbacks instead live until their exact page/delivery/generation/player retires.
+function playbackOwner(epoch, deliveryId, element, generation) {
+  return () => state.epoch === epoch && state.deliveryId === deliveryId &&
+    state.element === element && state.generation?.generation === generation;
+}
+
 function observeViewing(element, generation, writer, current) {
   let last = 0;
   let previous;
@@ -641,13 +648,18 @@ function makeSwitcher(current) {
     activate: async (id, generation, expected_active_generation) => {
       state.stopObserving?.();
       state.stopObserving = null;
-      await state.element?.pause();
-      if (state.viewing && state.element) {
-        const observation = state.element.player.state;
-        state.viewing.record({position_ms: Math.max(0, Math.round(observation.currentTime * 1000 + state.generation.media_time_origin_ms)),
-          status: 'paused', delivery_generation: state.generation.generation});
-        if (!await state.viewing.flush()) throw Object.assign(new Error('Save pending progress before changing playback.'), {status: 409});
+      const element = state.element;
+      const writer = state.viewing;
+      const active = state.generation;
+      await element?.pause();
+      if (!current() || state.element !== element || state.generation !== active) throw new Error('Playback ownership changed.');
+      if (writer && element) {
+        const observation = element.player.state;
+        writer.record({position_ms: Math.max(0, Math.round(observation.currentTime * 1000 + active.media_time_origin_ms)),
+          status: 'paused', delivery_generation: active.generation});
+        if (!await writer.flush()) throw Object.assign(new Error('Save pending progress before changing playback.'), {status: 409});
       }
+      if (!current()) throw new Error('Playback ownership changed.');
       state.stopLease?.();
       state.stopLease = null;
       return retryCommand(`/api/v2/playback/delivery-sessions/${encodeURIComponent(id)}/generations/${encodeURIComponent(generation)}/activate`,
@@ -658,8 +670,9 @@ function makeSwitcher(current) {
       state.element = candidate.element;
       state.generation = candidate.generation;
       state.delivery = confirmed;
-      renewLease(confirmed, candidate.generation, current);
-      state.stopObserving = observeViewing(candidate.element, candidate.generation, state.viewing, current);
+      const owner = playbackOwner(state.epoch, confirmed.id, candidate.element, candidate.generation.generation);
+      renewLease(confirmed, candidate.generation, owner);
+      state.stopObserving = observeViewing(candidate.element, candidate.generation, state.viewing, owner);
       status('');
     },
     dispose: disposePlayer,
@@ -678,29 +691,35 @@ async function changePlayback(change) {
   if (!state.replace || !state.element || !state.generation || state.changing) return false;
   state.changing = true;
   const epoch = state.epoch;
-  const current = () => epoch === state.epoch;
+  const operation = key();
+  state.changeOwner = operation;
+  const current = () => epoch === state.epoch && state.changeOwner === operation;
+  const writer = state.viewing;
+  const replace = state.replace;
   const old = {deliveryId: state.deliveryId, generation: state.generation.generation, element: state.element};
   const playing = state.element.player.state.status === 'playing';
   try {
-    if (state.viewing) {
-      state.viewing.record({position_ms: Math.max(0, Math.round(state.element.player.state.currentTime * 1000 + state.generation.media_time_origin_ms)),
+    if (writer) {
+      writer.record({position_ms: Math.max(0, Math.round(state.element.player.state.currentTime * 1000 + state.generation.media_time_origin_ms)),
         status: playing ? 'playing' : 'paused', delivery_generation: state.generation.generation});
-      if (!await state.viewing.flush()) throw new Error('Progress is still pending; retry the playback change when connected.');
+      if (!await writer.flush()) throw new Error('Progress is still pending; retry the playback change when connected.');
     }
-    const changed = await state.replace(old, change);
+    if (!current()) return false;
+    const changed = await replace(old, change);
     if (changed && current() && playing) await state.element.play();
     return changed;
   } catch (error) {
     if (!current()) return;
     status(`Playback change failed: ${error.message}`, 'alert');
     if (state.element === old.element) {
-      renewLease(state.delivery, state.generation, current);
+      const owner = playbackOwner(epoch, old.deliveryId, old.element, old.generation);
+      renewLease(state.delivery, state.generation, owner);
       state.stopObserving?.();
-      state.stopObserving = observeViewing(state.element, state.generation, state.viewing, current);
+      state.stopObserving = observeViewing(old.element, state.generation, writer, owner);
       if (playing) await state.element.play();
     }
     return false;
-  } finally { state.changing = false; }
+  } finally { if (current()) { state.changing = false; state.changeOwner = null; } }
 }
 
 /**
@@ -717,7 +736,10 @@ async function switchDelivery(plan) {
   if (!state.element || !state.generation || state.changing) return false;
   state.changing = true;
   const epoch = state.epoch;
-  const current = () => epoch === state.epoch;
+  const operation = key();
+  state.changeOwner = operation;
+  const current = () => epoch === state.epoch && state.changeOwner === operation;
+  const writer = state.viewing;
   const old = {id: state.deliveryId, element: state.element, generation: state.generation, delivery: state.delivery};
   const wasPlaying = old.element.player.state.status === 'playing';
   let replacement = null;
@@ -725,8 +747,12 @@ async function switchDelivery(plan) {
   let stopReplacementLease = null;
   let latestLease = null;
   let leaseFailure = null;
-  let rebindCommitted = false;
-  let swapped = false;
+  let replacementState = deliveryReplacement(operation, old.id, Boolean(writer));
+  const advance = input => {
+    const result = advanceDeliveryReplacement(replacementState, {operation, ...input});
+    replacementState = result.state;
+    return result.effects;
+  };
   // Freeze the current player and save its exact position. It stays fenced
   // (no page or native controls) until a rejection restores it or the
   // replacement is installed; state.changing fences the page controls.
@@ -735,6 +761,7 @@ async function switchDelivery(plan) {
   old.element.controls = false;
   old.element.inert = true; // Also blocks the player's keyboard shortcuts.
   await old.element.pause().catch(() => {});
+  if (!current()) return false;
   const observed = old.element.player.state;
   const position = Math.max(0, Math.round(observed.currentTime * 1000 + old.generation.media_time_origin_ms));
   const preferences = {volume: observed.volume, muted: observed.muted, rate: observed.playbackRate};
@@ -742,17 +769,20 @@ async function switchDelivery(plan) {
     if (!current()) return;
     old.element.controls = nativeControls;
     old.element.inert = false;
-    state.stopObserving = observeViewing(old.element, old.generation, state.viewing, current);
+    const owner = playbackOwner(epoch, old.id, old.element, old.generation.generation);
+    renewLease(state.delivery ?? old.delivery, old.generation, owner);
+    state.stopObserving = observeViewing(old.element, old.generation, writer, owner);
     if (wasPlaying) await old.element.play().catch(() => {});
   };
   try {
     status('Preparing the selected version…');
-    if (state.viewing) {
-      state.viewing.record({position_ms: position, status: 'paused', delivery_generation: old.generation.generation});
-      if (!await state.viewing.flush()) throw new Error('Progress is still pending; retry when connected.');
+    if (writer) {
+      writer.record({position_ms: position, status: 'paused', delivery_generation: old.generation.generation});
+      if (!await writer.flush()) throw new Error('Progress is still pending; retry when connected.');
     }
     if (!current()) throw new Error('Playback ownership changed.');
     replacement = await retryCommand('/api/v2/playback/delivery-sessions', {plan_token: plan.plan_token, start_ms: position}, key(), current);
+    advance({type: 'Admitted', delivery: replacement.id});
     const ready = await firstGeneration(replacement, current);
     const generation = ready?.active;
     if (!current() || !generation) throw new Error('The selected version could not be prepared.');
@@ -765,12 +795,13 @@ async function switchDelivery(plan) {
         latestLease = renewed;
         return renewed;
       },
-      failed: error => { leaseFailure = error; }});
+      failed: error => { leaseFailure = error; advance({type: 'LeaseFailed'}); }});
     element = await preparePlayer(generation, position, current, preferences, {inert: true, source: ready.source});
     if (!current()) throw new Error('Playback ownership changed.');
+    advance({type: 'Prepared', delivery: replacement.id});
     if (leaseFailure) throw leaseFailure;
-    if (state.viewing) {
-      const session = state.viewing.session;
+    if (writer) {
+      const session = writer.session;
       const path = `/api/v2/playback/viewing-sessions/${encodeURIComponent(session.id)}`;
       let rebound;
       try {
@@ -778,19 +809,23 @@ async function switchDelivery(plan) {
           {'If-Match': `"r-${session.revision}"`});
       } catch (error) {
         if (error.status && error.status < 500 && ![408, 425, 429].includes(error.status)) throw error;
+        advance({type: 'RebindUnknown'});
         // Unknown outcome. A read-back showing the replacement proves the
         // commit; anything else is not proof of failure (the PUT may still
         // commit later), so neither binding may be resumed: playback stops.
         const unresolved = () => Object.assign(new Error('The viewing session could not be confirmed. Reload to continue.'), {unresolved: true});
         rebound = await api('GET', path, undefined, undefined, AbortSignal.timeout(10000)).catch(() => { throw unresolved(); });
-        if (rebound?.delivery_id !== replacement.id) throw unresolved();
+        advance({type: 'ReadBack', delivery: rebound?.delivery_id});
+        if (replacementState.binding !== 'new') throw unresolved();
       }
-      rebindCommitted = true;
+      advance({type: 'RebindAcknowledged', delivery: rebound?.delivery_id});
+      if (replacementState.binding !== 'new') throw Object.assign(new Error('Invalid viewing rebind acknowledgement.'), {unresolved: true});
       if (!current()) throw new Error('Playback ownership changed.');
-      state.viewing.rebind(rebound);
+      writer.rebind(rebound);
     }
     if (leaseFailure) throw leaseFailure;
-    swapped = true;
+    const swap = advance({type: 'Swap'});
+    if (!swap.some(effect => effect.type === 'Install')) throw new Error('Replacement cannot own playback.');
     // Swap: the replacement owns the page from here on.
     state.stopLease?.(); state.stopLease = null;
     stopReplacementLease(); stopReplacementLease = null;
@@ -799,8 +834,9 @@ async function switchDelivery(plan) {
     state.generation = generation;
     state.element = element;
     element.inert = false;
-    renewLease(latestLease ?? ready, generation, current);
-    state.stopObserving = observeViewing(element, generation, state.viewing, current);
+    const owner = playbackOwner(epoch, replacement.id, element, generation.generation);
+    renewLease(latestLease ?? ready, generation, owner);
+    state.stopObserving = observeViewing(element, generation, writer, owner);
     element = null;
     await disposePlayer(old.element);
     void retire(old.id);
@@ -812,23 +848,24 @@ async function switchDelivery(plan) {
     }
     return true;
   } catch (error) {
-    if (swapped) { if (current()) status(`Playback change completed with an error: ${error.message}`, 'alert'); return true; }
+    if (replacementState.swapped) { if (current()) status(`Playback change completed with an error: ${error.message}`, 'alert'); return true; }
     stopReplacementLease?.();
     if (element) await disposePlayer(element);
-    // Any replacement not swapped in is retired by this function, including
-    // one whose rebind committed after this page lost ownership (teardown
-    // retires only the delivery the page still holds).
-    if (replacement && !swapped) void retire(replacement.id);
-    if (error.unresolved || (rebindCommitted && current())) {
-      // The session may be bound to a delivery that is gone; do not resume
-      // the old binding. Stop cleanly and let a reload start fresh.
-      if (current()) { status(`Playback stopped: ${error.message}`, 'alert'); host.dataset.state = 'failed'; await close(); }
-      return false;
+    if (!current()) advance({type: 'PageRetired'});
+    // Malformed acknowledgements are uncertain as well as lost ones.
+    if (error.unresolved && replacementState.binding === 'old') advance({type: 'RebindUnknown'});
+    const failure = advance({type: 'Failed'});
+    for (const effect of failure) {
+      if (effect.type === 'Retire') void retire(effect.delivery);
+      else if (effect.type === 'Stop') {
+        status(`Playback stopped: ${error.message}`, 'alert');
+        host.dataset.state = 'failed';
+        await close();
+      } else if (effect.type === 'Resume') await restore();
     }
-    if (!rebindCommitted) await restore();
     if (current()) status(`Version change failed: ${error.message}`, 'alert');
     return false;
-  } finally { state.changing = false; }
+  } finally { if (current()) { state.changing = false; state.changeOwner = null; } }
 }
 
 async function start() {
@@ -925,7 +962,7 @@ async function start() {
       state.viewing = makeViewingWriter(session, viewingStorage(data), state.viewingOwner);
 
     }
-    state.stopObserving = observeViewing(element, generation, state.viewing, current);
+    state.stopObserving = observeViewing(element, generation, state.viewing, playbackOwner(epoch, delivery.id, element, generation.generation));
     state.replace = makeSwitcher(current);
     status('');
     host.dataset.state = 'ready';
@@ -967,6 +1004,8 @@ function close({unloading = false} = {}) {
       } catch { /* The last successfully queued observation remains durable. */ }
     }
     state.epoch++;
+    state.changing = false;
+    state.changeOwner = null;
     playheadSequences.clear();
     state.stopLease?.();
     state.stopLease = null;

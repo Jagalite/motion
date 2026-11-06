@@ -46,33 +46,24 @@ pub struct VideoProfile {
     pub frame_rate: Option<FrameRate>,
 }
 impl VideoProfile {
-    pub fn validate(&self) -> Result<(), &'static str> {
-        if self.version != 1
-            || !(128..=3840).contains(&self.max_width)
-            || !(72..=2160).contains(&self.max_height)
-            || !self.max_width.is_multiple_of(2)
-            || !self.max_height.is_multiple_of(2)
-            || !(64_000..=80_000_000).contains(&self.video_bitrate)
-            || !(32_000..=320_000).contains(&self.audio_bitrate)
-            || self.frame_rate.as_ref().is_some_and(|r| {
-                r.value().is_none_or(|v| !(1.0..=120.0).contains(&v))
-                    || r.numerator > 120_000
-                    || r.denominator > 100_000
-            })
-        {
-            return Err(
-                "Invalid video profile: version 1, even dimensions 128..3840 x 72..2160, video 64000..80000000 bps, audio 32000..320000 bps, fps 1..120",
-            );
-        }
-        Ok(())
-    }
-    pub fn admits_duration(&self, duration: f64) -> bool {
-        duration.is_finite()
-            && duration > 0.0
-            && self
+    pub(crate) fn facts(&self) -> playscale_core::processing::VideoProfileFacts {
+        playscale_core::processing::VideoProfileFacts {
+            version: self.version,
+            max_width: self.max_width,
+            max_height: self.max_height,
+            video_bitrate: self.video_bitrate,
+            audio_bitrate: self.audio_bitrate,
+            frame_rate: self
                 .frame_rate
                 .as_ref()
-                .is_none_or(|rate| rate.value().is_some_and(|fps| duration * fps >= 0.5))
+                .map(|r| (r.numerator, r.denominator)),
+        }
+    }
+    pub fn validate(&self) -> Result<(), &'static str> {
+        self.facts().valid().then_some(()).ok_or("Invalid video profile: version 1, even dimensions 128..3840 x 72..2160, video 64000..80000000 bps, audio 32000..320000 bps, fps 1..120")
+    }
+    pub fn admits_duration(&self, duration: f64) -> bool {
+        self.facts().admits_duration(duration)
     }
     pub fn codec_name(&self) -> &'static str {
         match self.codec {

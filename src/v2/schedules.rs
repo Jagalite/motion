@@ -280,7 +280,18 @@ pub(crate) async fn tick(app: &App) -> anyhow::Result<()> {
         )
         .await;
         let p = match p {
-            Ok(p) if access::catalog_scope(&p).library(&row.library_id) => p,
+            Ok(p)
+                if playscale_core::maintenance::schedule_admitted(
+                    &row.task,
+                    true,
+                    access::catalog_scope(&p).library(&row.library_id),
+                    p.allows(Permission::SourcesManage),
+                    p.allows(Permission::CatalogWrite),
+                    p.allows(Permission::ProcessingRequest),
+                ) =>
+            {
+                p
+            }
             _ => {
                 sqlx::query("UPDATE api_schedules SET enabled=0,revision=revision+1 WHERE id=?")
                     .bind(&row.id)
@@ -323,7 +334,7 @@ pub(crate) async fn tick(app: &App) -> anyhow::Result<()> {
                 let mut items:Vec<String>=sqlx::query_scalar("SELECT DISTINCT e.item_id FROM editions e JOIN media_files f ON f.edition_id=e.id JOIN library_sources ls ON ls.source_id=f.library_id WHERE ls.library_id=? AND f.available=1 AND f.generated=0 AND e.item_id>? ORDER BY e.item_id LIMIT 201").bind(&row.library_id).bind(after.unwrap_or_default()).fetch_all(&mut *tx).await?;
                 more = items.len() > 200;
                 items.truncate(200);
-                let last = items.last().cloned();
+                let mut batch = playscale_core::maintenance::DispatchBatch::new(more);
                 for item in items {
                     // Shared-item mutation requires every containing library.
                     if super::catalog::curatable_item(
@@ -335,18 +346,32 @@ pub(crate) async fn tick(app: &App) -> anyhow::Result<()> {
                     .await
                     .is_err()
                     {
+                        batch
+                            .candidate(&item, playscale_core::maintenance::DispatchCandidate::Skip);
+                        continue;
+                    }
+                    let active: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM metadata_jobs WHERE item_id=? AND phase IN ('queued','running','cancelling'))")
+                        .bind(&item).fetch_one(&mut *tx).await?;
+                    if !batch.candidate(
+                        &item,
+                        if active {
+                            playscale_core::maintenance::DispatchCandidate::Skip
+                        } else {
+                            playscale_core::maintenance::DispatchCandidate::Queue
+                        },
+                    ) {
                         continue;
                     }
                     sqlx::query("INSERT INTO metadata_jobs(id,item_id,requester_id,credential_hash,ingress_id,phase,created_at) SELECT ?,?,?,?,?,'queued',? WHERE NOT EXISTS(SELECT 1 FROM metadata_jobs WHERE item_id=? AND phase IN ('queued','running','cancelling'))").bind(crate::new_id()).bind(&item).bind(&p.id).bind(&row.credential_hash).bind(&row.ingress_id).bind(crate::now()).bind(&item).execute(&mut *tx).await?;
                 }
-                if more {
-                    sqlx::query("INSERT INTO schedule_dispatch_progress(schedule_id,after_item) VALUES (?,?) ON CONFLICT(schedule_id) DO UPDATE SET after_item=excluded.after_item").bind(&row.id).bind(last).execute(&mut *tx).await?;
-                } else {
-                    sqlx::query("DELETE FROM schedule_dispatch_progress WHERE schedule_id=?")
-                        .bind(&row.id)
-                        .execute(&mut *tx)
-                        .await?;
-                }
+                apply_cursor(
+                    &mut tx,
+                    &row.id,
+                    row.revision,
+                    batch.more,
+                    batch.last.as_deref(),
+                )
+                .await?;
             }
             // Previews of the library's originals that have none: bounded
             // per tick and by the preview queue, never duplicated (an active
@@ -376,8 +401,8 @@ pub(crate) async fn tick(app: &App) -> anyhow::Result<()> {
                 .await?;
                 more = files.len() > 200;
                 files.truncate(200);
-                let mut last = files.last().map(|f| f.0.clone());
-                for (n, (file, revision, seconds, tracks)) in files.iter().enumerate() {
+                let mut batch = playscale_core::maintenance::DispatchBatch::new(more);
+                for (file, revision, seconds, tracks) in &files {
                     if !playscale_core::playback_session::readable(
                         &p,
                         super::content::file_facts(&mut tx, file)
@@ -385,11 +410,13 @@ pub(crate) async fn tick(app: &App) -> anyhow::Result<()> {
                             .map_err(|e| anyhow::anyhow!("{e:?}"))?
                             .as_ref(),
                     ) {
+                        batch.candidate(file, playscale_core::maintenance::DispatchCandidate::Skip);
                         continue;
                     }
                     let tracks: Vec<crate::db::Track> =
                         serde_json::from_str(tracks).unwrap_or_default();
                     let Some(video) = tracks.iter().find(|t| t.kind == "video") else {
+                        batch.candidate(file, playscale_core::maintenance::DispatchCandidate::Skip);
                         continue;
                     };
                     let duration = seconds
@@ -405,43 +432,52 @@ pub(crate) async fn tick(app: &App) -> anyhow::Result<()> {
                         })
                         .is_none()
                     {
+                        batch.candidate(file, playscale_core::maintenance::DispatchCandidate::Skip);
                         continue;
                     }
                     let Some(identity) =
                         super::previews::layout_identity(&mut tx, file, revision).await?
                     else {
+                        batch.candidate(file, playscale_core::maintenance::DispatchCandidate::Skip);
                         continue;
                     };
-                    match super::previews::admission(&mut tx, &p, file, revision, &identity, "")
-                        .await
-                        .map_err(|e| anyhow::anyhow!("{e:?}"))?
+                    let observation = match super::previews::admission(
+                        &mut tx, &p, file, revision, &identity, "",
+                    )
+                    .await
+                    .map_err(|e| anyhow::anyhow!("{e:?}"))?
                     {
-                        playscale_core::previews::Admission::Enqueue => {}
+                        playscale_core::previews::Admission::Enqueue => {
+                            playscale_core::maintenance::DispatchCandidate::Queue
+                        }
                         playscale_core::previews::Admission::Existing
-                        | playscale_core::previews::Admission::Invalid => continue,
+                        | playscale_core::previews::Admission::Invalid => {
+                            playscale_core::maintenance::DispatchCandidate::Skip
+                        }
                         playscale_core::previews::Admission::Full => {
-                            more = true;
-                            blocked = true;
-                            last = n.checked_sub(1).map(|p| files[p].0.clone());
+                            playscale_core::maintenance::DispatchCandidate::Full
+                        }
+                    };
+                    if !batch.candidate(file, observation) {
+                        if batch.blocked {
                             break;
                         }
+                        continue;
                     }
                     sqlx::query("INSERT INTO preview_jobs(id,file_id,file_revision,layout_identity,requester_id,credential_hash,ingress_id,created_at) VALUES (?,?,?,?,?,?,?,?)")
                         .bind(crate::new_id()).bind(file).bind(revision).bind(identity).bind(&p.id)
                         .bind(&row.credential_hash).bind(&row.ingress_id).bind(crate::now()).execute(&mut *tx).await?;
                 }
-                match (more, last) {
-                    (true, Some(last)) => {
-                        sqlx::query("INSERT INTO schedule_dispatch_progress(schedule_id,after_item) VALUES (?,?) ON CONFLICT(schedule_id) DO UPDATE SET after_item=excluded.after_item").bind(&row.id).bind(last).execute(&mut *tx).await?;
-                    }
-                    (true, None) => {}
-                    (false, _) => {
-                        sqlx::query("DELETE FROM schedule_dispatch_progress WHERE schedule_id=?")
-                            .bind(&row.id)
-                            .execute(&mut *tx)
-                            .await?;
-                    }
-                }
+                more = batch.more;
+                blocked = batch.blocked;
+                apply_cursor(
+                    &mut tx,
+                    &row.id,
+                    row.revision,
+                    batch.more,
+                    batch.last.as_deref(),
+                )
+                .await?;
             }
             _ => {
                 sqlx::query("UPDATE api_schedules SET enabled=0,revision=revision+1 WHERE id=?")
@@ -465,6 +501,37 @@ pub(crate) async fn tick(app: &App) -> anyhow::Result<()> {
             .execute(&mut *tx)
             .await?;
         tx.commit().await?;
+    }
+    Ok(())
+}
+
+/// Jobs and cursor advancement share the caller's transaction; a changed
+/// revision cannot commit progress from a prior schedule definition.
+async fn apply_cursor(
+    conn: &mut sqlx::SqliteConnection,
+    id: &str,
+    revision: i64,
+    more: bool,
+    last: Option<&str>,
+) -> anyhow::Result<()> {
+    use playscale_core::maintenance::{CursorUpdate, dispatch_cursor};
+    let current: i64 = sqlx::query_scalar("SELECT revision FROM api_schedules WHERE id=?")
+        .bind(id)
+        .fetch_one(&mut *conn)
+        .await?;
+    match dispatch_cursor(revision, current, more, last)
+        .ok_or_else(|| anyhow::anyhow!("schedule revision changed during dispatch"))?
+    {
+        CursorUpdate::Preserve => {}
+        CursorUpdate::Clear => {
+            sqlx::query("DELETE FROM schedule_dispatch_progress WHERE schedule_id=?")
+                .bind(id)
+                .execute(&mut *conn)
+                .await?;
+        }
+        CursorUpdate::Advance(last) => {
+            sqlx::query("INSERT INTO schedule_dispatch_progress(schedule_id,after_item) VALUES (?,?) ON CONFLICT(schedule_id) DO UPDATE SET after_item=excluded.after_item").bind(id).bind(last).execute(&mut *conn).await?;
+        }
     }
     Ok(())
 }

@@ -314,6 +314,7 @@ async fn shell(cx: &Cx, slot: Slot<'_>) -> Result<impl View> {
                 if let Some(who) = &who {
                     <meta name="motion-csrf" content=(who.csrf_token.as_str())>
                     <meta name="motion-server-epoch" content=(who.server_epoch.as_str())>
+                    <meta name="motion-principal-id" content=(who.principal_id.as_str())>
                 }
                 <title>"Motion"</title>
                 <link rel="stylesheet" href=(assets::STYLESHEET.url())>

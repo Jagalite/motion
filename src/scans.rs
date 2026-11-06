@@ -48,7 +48,7 @@ fn status_name(status: DemandStatus) -> &'static str {
     }
 }
 
-async fn attempts(
+pub(crate) async fn attempts(
     conn: &mut SqliteConnection,
     source: &str,
 ) -> anyhow::Result<Vec<(Attempt, Job)>> {
@@ -192,22 +192,14 @@ pub(crate) async fn request_in(
     if exists == 0 {
         return Err(ScanError::NotFound);
     }
-    let selected: Vec<(String, bool)> = match sources {
-        None => members,
-        Some(ids) => {
-            let mut out = Vec::new();
-            for id in ids {
-                match members.iter().find(|(m, _)| m == id) {
-                    Some(m) => out.push(m.clone()),
-                    None => return Err(ScanError::UnknownSource(id.clone())),
-                }
-            }
-            out
-        }
-    };
-    if selected.is_empty() {
-        return Err(ScanError::NoSources);
-    }
+    let members: Vec<core::RequestMember> = members
+        .into_iter()
+        .map(|(source, enabled)| core::RequestMember { source, enabled })
+        .collect();
+    let selected = core::initialize_request(&members, sources).map_err(|error| match error {
+        core::RequestError::NoSources => ScanError::NoSources,
+        core::RequestError::UnknownSource(id) => ScanError::UnknownSource(id),
+    })?;
     let id = new_id();
     sqlx::query(
         "INSERT INTO scan_requests(id,library_id,require_complete,created_at) VALUES (?,?,?,?)",
@@ -218,13 +210,16 @@ pub(crate) async fn request_in(
     .bind(now())
     .execute(&mut *tx)
     .await?;
-    for (source, enabled) in selected {
+    for effect in selected {
         let demand_id = new_id();
-        if !enabled {
-            sqlx::query("INSERT INTO scan_demands (id,request_id,source_id,barrier,verify,status,error) VALUES (?,?,?,0,?,'failed','source_disabled')")
+        let source = match effect {
+            core::RequestEffect::Admit { source } => source,
+            core::RequestEffect::FailDisabled { source } => {
+                sqlx::query("INSERT INTO scan_demands (id,request_id,source_id,barrier,verify,status,error) VALUES (?,?,?,0,?,'failed','source_disabled')")
                 .bind(&demand_id).bind(&id).bind(&source).bind(verify).execute(&mut *tx).await?;
-            continue;
-        }
+                continue;
+            }
+        };
         let barrier: i64 = sqlx::query_scalar(
             "UPDATE libraries SET scan_barrier=scan_barrier+1 WHERE id=? RETURNING scan_barrier",
         )
